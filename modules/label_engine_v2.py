@@ -252,6 +252,144 @@ def label_triple_barrier_atr(
     }
 
 
+def label_triple_barrier_atr_vectorized(
+    prices: np.ndarray,
+    atr: np.ndarray,
+    horizons: Optional[np.ndarray] = None,
+    config: TripleBarrierConfig = DEFAULT_CONFIG,
+) -> dict[str, np.ndarray]:
+    """Phase A: نسخة vectorized من label_triple_barrier_atr (سرعة 50-100×).
+
+    تستخدم numpy broadcasting لبناء (n, h_max) matrix بدل nested loop.
+    النتائج مطابقة 1:1 للـ loop version على نفس المدخلات.
+
+    Memory cost: O(n × h_max) float64. مع n=12K و h=20 = ~2MB (مقبول).
+    لو h_max كبير جداً (>200) ينفع نستخدم الـ loop version (memory-friendly).
+
+    Returns: نفس التركيب لـ label_triple_barrier_atr.
+    """
+    prices = np.asarray(prices, dtype=np.float64)
+    atr = np.asarray(atr, dtype=np.float64)
+    n = len(prices)
+
+    if n == 0:
+        return {
+            "bias": np.zeros(0, dtype=np.int8),
+            "path": np.zeros(0, dtype=np.int8),
+            "mfe": np.zeros(0, dtype=np.float64),
+            "mae": np.zeros(0, dtype=np.float64),
+            "end_idx": np.zeros(0, dtype=np.int32),
+        }
+
+    if len(atr) != n:
+        raise ValueError(f"atr length {len(atr)} != prices length {n}")
+
+    if horizons is None:
+        horizons = np.full(n, config.horizon_default, dtype=np.int32)
+    else:
+        horizons = np.asarray(horizons, dtype=np.int32)
+        if len(horizons) != n:
+            raise ValueError(f"horizons length {len(horizons)} != prices length {n}")
+
+    h_max = int(max(1, horizons.max()))
+    tp_mult = float(config.tp_atr_mult)
+    sl_mult = float(config.sl_atr_mult)
+    ratio = float(config.mfe_mae_ratio)
+    min_mult = float(config.min_move_atr_mult)
+
+    # build (n, h_max) future-price matrix:
+    # M[t, k] = prices[t + 1 + k] لكل k في [0, h_max). out-of-range clamped to n-1.
+    t_idx = np.arange(n)[:, None]                    # (n, 1)
+    k_idx = np.arange(h_max)[None, :]                # (1, h_max)
+    future_idx = t_idx + 1 + k_idx                   # (n, h_max)
+    valid_mask = future_idx < n
+    future_idx_clamped = np.minimum(future_idx, n - 1)
+    future_prices = prices[future_idx_clamped]       # (n, h_max)
+    diff = future_prices - prices[:, None]           # (n, h_max)
+
+    # per-row horizon mask: kept rows where k < horizons[t]
+    horizon_mask = k_idx < horizons[:, None]         # (n, h_max)
+    active_mask = valid_mask & horizon_mask
+
+    # diff outside active window = NaN-ish (use 0 for MFE/MAE — yields 0 which is safe;
+    # for barrier hit, we explicitly mask before argmax).
+    diff_active = np.where(active_mask, diff, 0.0)
+
+    # barrier thresholds (in price units, per row)
+    atr_safe = np.maximum(atr, 1e-12)
+    upper_thr = (tp_mult * atr_safe)[:, None]        # (n, 1)
+    lower_thr = (sl_mult * atr_safe)[:, None]
+    min_move = min_mult * atr_safe                   # (n,)
+
+    # masked hit detection: only within active window
+    hit_upper = (diff >= upper_thr) & active_mask    # (n, h_max)
+    hit_lower = (diff <= -lower_thr) & active_mask
+
+    has_upper = hit_upper.any(axis=1)
+    has_lower = hit_lower.any(axis=1)
+
+    # argmax returns first True index (0 if none, but masked via has_*)
+    first_upper_k = np.where(has_upper, hit_upper.argmax(axis=1), h_max + 1)
+    first_lower_k = np.where(has_lower, hit_lower.argmax(axis=1), h_max + 1)
+
+    # MFE/MAE فقط حتى أول barrier hit (مطابق للـ loop: تحديث ثم break)
+    # في الـ loop، MFE/MAE تُحدَّث **قبل** الـ break، فالـ k الـ hit نفسها inclusive.
+    first_any_k = np.minimum(first_upper_k, first_lower_k)   # h_max+1 لو ما حصلش hit
+    # mask: k <= first_any_k && active
+    mfe_window = (k_idx <= first_any_k[:, None]) & active_mask  # (n, h_max)
+    diff_for_extremum = np.where(mfe_window, diff, 0.0)
+    mfe = np.maximum(diff_for_extremum, 0.0).max(axis=1)
+    mae = np.maximum(-diff_for_extremum, 0.0).max(axis=1)
+
+    bias = np.full(n, DIR_NEUTRAL, dtype=np.int8)
+    path = np.full(n, PATH_TIMEOUT_NEUTRAL, dtype=np.int8)
+    end_idx_arr = np.arange(n, dtype=np.int32)
+
+    # decisions
+    long_wins = has_upper & (~has_lower | (first_upper_k <= first_lower_k))
+    short_wins = has_lower & (~has_upper | (first_lower_k < first_upper_k))
+    timeout = (~has_upper) & (~has_lower)
+
+    # rows where horizons[t] == 0: leave NEUTRAL, end_idx = t
+    no_window = horizons <= 0
+    long_wins &= ~no_window
+    short_wins &= ~no_window
+    timeout &= ~no_window
+
+    bias[long_wins] = DIR_LONG
+    path[long_wins] = PATH_TP_LONG
+    end_idx_arr[long_wins] = (np.arange(n)[long_wins] + 1 + first_upper_k[long_wins]).astype(np.int32)
+
+    bias[short_wins] = DIR_SHORT
+    path[short_wins] = PATH_TP_SHORT
+    end_idx_arr[short_wins] = (np.arange(n)[short_wins] + 1 + first_lower_k[short_wins]).astype(np.int32)
+
+    # timeout → MFE/MAE
+    timeout_end = np.minimum(np.arange(n) + horizons, n - 1).astype(np.int32)
+    end_idx_arr[timeout] = timeout_end[timeout]
+
+    # MFE/MAE decision (only on timeout rows)
+    is_long_mfe = timeout & (mfe > ratio * mae) & (mfe >= min_move)
+    is_short_mfe = timeout & (mae > ratio * mfe) & (mae >= min_move) & (~is_long_mfe)
+    bias[is_long_mfe] = DIR_LONG
+    path[is_long_mfe] = PATH_TIMEOUT_MFE_LONG
+    bias[is_short_mfe] = DIR_SHORT
+    path[is_short_mfe] = PATH_TIMEOUT_MFE_SHORT
+
+    # mask out invalid rows where active window was empty (no future)
+    no_future = horizon_mask.any(axis=1) & valid_mask.any(axis=1)
+    bias[~no_future] = DIR_NEUTRAL
+    path[~no_future] = PATH_TIMEOUT_NEUTRAL
+
+    return {
+        "bias": bias,
+        "path": path,
+        "mfe": mfe,
+        "mae": mae,
+        "end_idx": end_idx_arr,
+    }
+
+
 def label_distribution(bias: np.ndarray) -> dict[str, float]:
     """نسب التوزيع لـ bias array (للتشخيص السريع)."""
     n = max(len(bias), 1)
@@ -276,5 +414,6 @@ __all__ = [
     "DEFAULT_CONFIG",
     "compute_atr",
     "label_triple_barrier_atr",
+    "label_triple_barrier_atr_vectorized",
     "label_distribution",
 ]

@@ -27,6 +27,7 @@ from modules.label_engine_v2 import (
     compute_atr,
     label_distribution,
     label_triple_barrier_atr,
+    label_triple_barrier_atr_vectorized,
 )
 
 
@@ -168,13 +169,34 @@ def main():
     print(f"   PATH_TIMEOUT_MFE_SHORT: {(paths == PATH_TIMEOUT_MFE_SHORT).sum():>5,} ({(paths == PATH_TIMEOUT_MFE_SHORT).mean():>6.1%})")
     print(f"   PATH_TIMEOUT_NEUTRAL  : {(paths == PATH_TIMEOUT_NEUTRAL).sum():>5,} ({(paths == PATH_TIMEOUT_NEUTRAL).mean():>6.1%})")
 
-    print("\n💡 الخلاصة:")
+    print("\n💡 الخلاصة (Phase 2):")
     legacy_neutral = label_distribution(legacy_bias)["neutral"]
     v2_neutral = label_distribution(result["bias"])["neutral"]
     print(f"   NEUTRAL %: legacy={legacy_neutral:.1%}  →  v2={v2_neutral:.1%}")
     if legacy_neutral > 0 and v2_neutral > 0:
         reduction = (legacy_neutral - v2_neutral) / legacy_neutral
         print(f"   تقليل NEUTRAL: {reduction:.1%}")
+
+    # ── Phase A: Vectorization speedup ────────────────────────────────────────
+    print("\n⚡ Phase A: Loop vs Vectorized")
+    import time
+
+    for n_size in (1_000, 5_000, 12_000, 25_000):
+        rng = np.random.RandomState(0)
+        p = 100.0 + np.cumsum(rng.randn(n_size) * 0.3)
+        a = np.full(n_size, 0.5)
+
+        t0 = time.perf_counter()
+        r_loop = label_triple_barrier_atr(p, a, config=cfg)
+        t_loop = (time.perf_counter() - t0) * 1000
+
+        t0 = time.perf_counter()
+        r_vec = label_triple_barrier_atr_vectorized(p, a, config=cfg)
+        t_vec = (time.perf_counter() - t0) * 1000
+
+        assert (r_loop["bias"] == r_vec["bias"]).all(), "parity mismatch!"
+        speedup = t_loop / max(t_vec, 1e-9)
+        print(f"   n={n_size:>6,}  loop={t_loop:>7.1f}ms  vec={t_vec:>7.1f}ms  speedup={speedup:>5.1f}×")
 
     print("═" * 78)
 

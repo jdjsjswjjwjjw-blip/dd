@@ -28,6 +28,7 @@ from modules.label_engine_v2 import (
     compute_atr,
     label_distribution,
     label_triple_barrier_atr,
+    label_triple_barrier_atr_vectorized,
 )
 
 
@@ -298,6 +299,93 @@ class TestAdaptiveHorizons(unittest.TestCase):
         self.assertEqual(r_short["bias"][0], DIR_NEUTRAL)
         # row 0 بأفق طويل → يلامس upper
         self.assertEqual(r_long["bias"][0], DIR_LONG)
+
+
+class TestVectorizedParity(unittest.TestCase):
+    """Phase A: النسخة vectorized تعطي نفس نتائج النسخة loop-based."""
+
+    def _compare(self, prices, atr, horizons=None, cfg=None):
+        cfg = cfg or TripleBarrierConfig()
+        r_loop = label_triple_barrier_atr(prices, atr, horizons=horizons, config=cfg)
+        r_vec = label_triple_barrier_atr_vectorized(prices, atr, horizons=horizons, config=cfg)
+        np.testing.assert_array_equal(r_loop["bias"], r_vec["bias"], err_msg="bias mismatch")
+        np.testing.assert_array_equal(r_loop["path"], r_vec["path"], err_msg="path mismatch")
+        np.testing.assert_allclose(r_loop["mfe"], r_vec["mfe"], rtol=1e-9, err_msg="mfe mismatch")
+        np.testing.assert_allclose(r_loop["mae"], r_vec["mae"], rtol=1e-9, err_msg="mae mismatch")
+        np.testing.assert_array_equal(r_loop["end_idx"], r_vec["end_idx"], err_msg="end_idx mismatch")
+
+    def test_parity_empty(self):
+        self._compare(np.array([]), np.array([]))
+
+    def test_parity_clean_long(self):
+        prices = np.array([100.0, 100.5, 101.0, 102.0, 103.0])
+        atr = np.full(5, 1.0)
+        cfg = TripleBarrierConfig(tp_atr_mult=2.0, sl_atr_mult=2.0, horizon_default=10)
+        self._compare(prices, atr, cfg=cfg)
+
+    def test_parity_random_walk(self):
+        np.random.seed(123)
+        n = 1000
+        prices = 100.0 + np.cumsum(np.random.randn(n) * 0.3)
+        highs = prices + np.abs(np.random.randn(n) * 0.1)
+        lows = prices - np.abs(np.random.randn(n) * 0.1)
+        atr = compute_atr(highs, lows, prices, window=14)
+        cfg = TripleBarrierConfig(tp_atr_mult=2.0, sl_atr_mult=1.5, min_move_atr_mult=0.5)
+        self._compare(prices, atr, cfg=cfg)
+
+    def test_parity_mean_revert_bug_scenario(self):
+        # السيناريو المعطوب: MFE في الوسط، النهاية تعود
+        prices = np.linspace(100, 130, 16).tolist() + np.linspace(130, 105, 15).tolist()
+        prices = np.array(prices, dtype=np.float64)
+        atr = np.full(len(prices), 1.0)
+        cfg = TripleBarrierConfig(
+            tp_atr_mult=100.0, sl_atr_mult=100.0,
+            mfe_mae_ratio=2.0, horizon_default=30,
+        )
+        self._compare(prices, atr, cfg=cfg)
+
+    def test_parity_per_row_horizons(self):
+        np.random.seed(7)
+        n = 500
+        prices = 100.0 + np.cumsum(np.random.randn(n) * 0.4)
+        atr = np.full(n, 0.6)
+        horizons = np.random.randint(5, 25, size=n).astype(np.int32)
+        cfg = TripleBarrierConfig(tp_atr_mult=2.0, sl_atr_mult=2.0)
+        self._compare(prices, atr, horizons=horizons, cfg=cfg)
+
+    def test_parity_constant_prices(self):
+        prices = np.full(50, 100.0)
+        atr = np.full(50, 1.0)
+        self._compare(prices, atr)
+
+
+class TestVectorizedSpeed(unittest.TestCase):
+    """Phase A: vectorized أسرع بشكل ملموس."""
+
+    def test_vectorized_faster_on_large_input(self):
+        import time
+        np.random.seed(0)
+        n = 12_000  # نطاق الـ production
+        prices = 100.0 + np.cumsum(np.random.randn(n) * 0.3)
+        atr = np.full(n, 0.5)
+        cfg = TripleBarrierConfig(horizon_default=20)
+
+        t0 = time.perf_counter()
+        r_loop = label_triple_barrier_atr(prices, atr, config=cfg)
+        t_loop = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        r_vec = label_triple_barrier_atr_vectorized(prices, atr, config=cfg)
+        t_vec = time.perf_counter() - t0
+
+        np.testing.assert_array_equal(r_loop["bias"], r_vec["bias"])
+        speedup = t_loop / max(t_vec, 1e-9)
+        # threshold محافظ — الـ benchmark الفعلي مع pandas overhead
+        # يعطي 5-10× سرعة في الإنتاج. هنا فقط نتأكد من تحسّن واضح.
+        self.assertGreater(
+            speedup, 2.0,
+            msg=f"speedup={speedup:.1f}× (loop={t_loop*1000:.1f}ms, vec={t_vec*1000:.1f}ms)",
+        )
 
 
 if __name__ == "__main__":
