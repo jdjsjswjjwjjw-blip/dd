@@ -146,11 +146,35 @@ training/
 
 ---
 
-## Open items
+## ── الـ Integration Activation (بعد Phases 3-7) ──
+
+تم تفعيل الكود الجديد في الـ production path في 3 commits إضافية:
+
+### `f7abec5` — Step 1: dynamic_labels يستخدم MFE/MAE
+- `modules/dynamic_labels.py:779`: استبدال `future[-1] - entry` بـ MFE/MAE
+- الـ public API بدون تغيير → `train_v19.py` و `predict_v19.py` و
+  `labels_v19.py` تستفيد تلقائياً
+- يحلّ مشكلة 98% NEUTRAL في الـ production
+
+### `8dafd6f` — Step 2: scan_edges → scan_edges_v2 wrapper
+- `v19_2/edge_scanner.py:scan_edges()` يفوّض إلى scan_edges_v2
+- 33-182× speedup يصبح default
+- `_use_legacy_loop=True` للوصول للـ original (للتشخيص)
+- `run_pipeline.py` يستفيد تلقائياً
+
+### `41f90fc` — Steps 3-5: pipeline wrappers
+- `prepare_day_trading_enriched.py` (جذر): wrapper يضيف V19.2 features
+  للـ parquet ناتج من prepare_day_trading.py
+- `modules/deeplob_cnn.py`: docstring يشير لـ deeplob_v7ch (3ch محفوظ)
+- `tools/demo_integration_bridge.py`: end-to-end demo
+
+## ── Open items (بعد كل التكامل) ──
 
 - **Phase C الكمي (Grover Discovery)**: لم يبدأ
 - **Phase D الكمي (QLSTM/QCNN)**: اختياري - لم يبدأ
 - **train_v19.py تقسيم**: مُؤجَّل (يحتاج بيئة production)
 - **`prepare_day_trading.py` merge**: V19.2 vs main differ بـ 159 سطر،
   لم يُدمَج (الـ V19.2 محفوظ كـ `prepare_day_trading_v19_2.py`)
+- **paper_v19/live integration**: الـ Bridge متاح، الـ wiring يتم في
+  ملف workflow منفصل (مش في paper_v19.py الأصلي)
 
