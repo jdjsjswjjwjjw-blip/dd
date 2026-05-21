@@ -3052,10 +3052,17 @@ def run_day_trading_refinery(
     fwd_ret_clean_bars: int | None = None,
     sanitize_max_bar_return_pct: float | None = None,
     sanitize_input_ticks: bool = True,
+    enrich_v19_2: bool = False,
+    enrich_v19_2_skip_missing: bool = True,
 ) -> str:
     """
     Pipeline كاملة: MBO → Day Trading Dataset
     المخرج جاهز مباشرة لـ train_v19.py
+
+    enrich_v19_2 (Phase 3 من تقرير الدمج): لو True، يطبّق
+    modules.feature_enrichment.enrich_features على الـ output النهائي
+    لإضافة ~21 feature (sim_*, bp_*, zone_full, ghz_*). الـ default = False
+    للحفاظ على backward compat.
 
     مع رن كامل (بدون preflight_parquet): افتراضيًا يُحفظ checkpoint ما قبل Event Gate
     (save_preflight=True) لتجارب عتبات لاحقة عبر --preflight-parquet.
@@ -3411,6 +3418,28 @@ def run_day_trading_refinery(
     )
 
     df_out = finalize_daytrade_parquet_export(df_out)
+
+    # Phase 3 (تقرير الدمج): V19.2 feature enrichment.
+    # يضيف sim_* (18) + bp_* (9) + zone_full + level_distance + ghz_*.
+    if enrich_v19_2:
+        try:
+            from modules.feature_enrichment import enrich_features, EnrichmentConfig
+            print("\n🔮 Phase 3 enrichment (V19.2 features)...")
+            n_before = len(df_out.columns)
+            cfg = EnrichmentConfig(
+                add_simulators=True,
+                add_wall_depth=False,  # يحتاج MBP منفصل
+                add_iceberg=False,     # يحتاج MBO منفصل
+                add_session_mapping=True,
+                add_bell_pairs=True,
+                skip_missing_cols=enrich_v19_2_skip_missing,
+                verbose=False,
+            )
+            df_out = enrich_features(df_out, config=cfg)
+            n_added = len(df_out.columns) - n_before
+            print(f"   ✅ {n_added} عمود مُضاف ({n_before} → {len(df_out.columns)})")
+        except Exception as exc:
+            print(f"   ⚠️ enrichment تخطّي ({type(exc).__name__}: {exc})")
 
     out_path = os.path.join(output_dir, features_fn)
     df_out.to_parquet(out_path, index=False)
@@ -3842,6 +3871,15 @@ if __name__ == '__main__':
             'وإسقاط BBO المتقاطع على MBP). الافتراضي: التنظيف مفعّل.'
         ),
     )
+    p.add_argument(
+        '--enrich-v19-2',
+        action='store_true',
+        help=(
+            'Phase 3 من تقرير الدمج: يضيف V19.2 features '
+            '(sim_*, bp_*, zone_full, ghz_*) على الـ output النهائي. '
+            'الافتراضي: معطّل (backward compat).'
+        ),
+    )
     args = p.parse_args()
 
     if args.inspect_parquet:
@@ -3898,4 +3936,5 @@ if __name__ == '__main__':
         fwd_ret_clean_bars=args.fwd_ret_clean_bars,
         sanitize_max_bar_return_pct=args.sanitize_max_bar_return,
         sanitize_input_ticks=(not args.no_sanitize_input_ticks),
+        enrich_v19_2=args.enrich_v19_2,
     )
