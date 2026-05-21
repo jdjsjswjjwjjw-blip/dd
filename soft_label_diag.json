@@ -1,0 +1,54 @@
+{
+  "parquet": "E:\\QuantSystem-master (3) (2)\\QuantSystem-master\\pipeline_mbo2_refinery_latest\\daytrade_run\\day_trading_features_mbo2_refinery_latest.parquet",
+  "manifest": "E:\\QuantSystem-master (3) (2)\\QuantSystem-master\\pipeline_mbo2_refinery_latest\\daytrade_run\\day_trading_manifest_mbo2_refinery_latest.json",
+  "freq_used": "5min",
+  "structural_unsorted": {
+    "rows": 144,
+    "ts_monotonic_increasing": true,
+    "duplicate_ts_event": 0,
+    "neutral_share": 0.9722222222222222,
+    "neutral_rows_soft_is_exactly_05_share": 1.0,
+    "directional_soft_label_min": 0.0,
+    "directional_soft_label_max": 1.0,
+    "directional_soft_label_median": 0.7800000011920929,
+    "directional_long_share_soft_below_half": 0.0,
+    "directional_short_share_soft_above_half": 0.6666666666666666,
+    "dynamic_threshold_source_ok": true
+  },
+  "structural_sorted": {
+    "rows": 144,
+    "ts_monotonic_increasing": true,
+    "duplicate_ts_event": 0,
+    "neutral_share": 0.9722222222222222,
+    "neutral_rows_soft_is_exactly_05_share": 1.0,
+    "directional_soft_label_min": 0.0,
+    "directional_soft_label_max": 1.0,
+    "directional_soft_label_median": 0.7800000011920929,
+    "directional_long_share_soft_below_half": 0.0,
+    "directional_short_share_soft_above_half": 0.6666666666666666,
+    "dynamic_threshold_source_ok": true
+  },
+  "mc_replay": {
+    "replay_ran": true,
+    "config": {
+      "n_scenarios": 50,
+      "horizon_std": 0.3,
+      "tp_std": 0.2,
+      "sl_std": 0.2,
+      "random_seed": 42
+    },
+    "max_abs_diff_directional": 0.0,
+    "mean_abs_diff_directional": 0.0,
+    "max_abs_diff_neutral": 0.0,
+    "replay_matches_parquet": true
+  },
+  "tick_density": {
+    "available": true,
+    "mbo_rows_used": 448481,
+    "bars_zero_ticks": 0,
+    "bars_zero_ticks_share": 0.0,
+    "tick_count_mean": 3114.4513888888887,
+    "tick_count_directional_mean": 6062.0,
+    "spearman_ticks_vs_abs_soft_minus_half": 0.1775582623792876
+  }
+}
