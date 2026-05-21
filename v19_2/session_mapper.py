@@ -248,9 +248,12 @@ def _add_level_distances_and_events(
     close = pd.to_numeric(out["close"], errors="coerce")
     high  = pd.to_numeric(out["high"],  errors="coerce")
     low   = pd.to_numeric(out["low"],   errors="coerce")
-    atr   = pd.to_numeric(out.get("atr_14", np.nan), errors="coerce")
-    if atr.isna().all():
-        # بديل: ATR تقريبي من المدى
+    # ATR fallback: لو atr_14 موجود استخدمه، وإلا احسب من المدى
+    if "atr_14" in out.columns:
+        atr = pd.to_numeric(out["atr_14"], errors="coerce")
+        if atr.isna().all():
+            atr = (high - low).rolling(14, min_periods=1).mean()
+    else:
         atr = (high - low).rolling(14, min_periods=1).mean()
     atr = atr.clip(lower=1e-9)
 
