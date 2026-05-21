@@ -178,3 +178,32 @@ training/
 - **paper_v19/live integration**: الـ Bridge متاح، الـ wiring يتم في
   ملف workflow منفصل (مش في paper_v19.py الأصلي)
 
+## ── Sprint 1: Cleanup + Production Wiring Verification ──
+
+### الأهداف
+- توثيق إن الـ integration الفعلي شغّال على مستوى production paths
+- إضافة tests تحرس الـ wiring (تكسر لو حدث rollback غير متعمد)
+
+### `tests/test_production_integration.py` (جديد)
+يحتوي 11 tests يحرسون:
+- **TestDynamicLabelsMFE**: السيناريو 98% NEUTRAL محلول
+  (mean-revert prices ينتج LONG/SHORT signals الآن، 0 سابقاً)
+- **TestEdgeScannerWrapper**: scan_edges يفوّض إلى scan_edges_v2
+- **TestDeepLOB7ChannelSupport**: DeepLOBCNN(channels=7) يعمل
+- **TestLabelsV19TripleBarrier**: labels_v19 يستخدم Triple Barrier
+- **TestEnrichmentWrapper**: prepare_day_trading_enriched يضيف features
+- **TestProductionPipelineSmoke**: AlphaSet + IntegrationBridge interop
+
+### Cleanup audit
+- ✅ `tools/diagnostics/`: 13 ملف diagnose_* منقولة (تم مسبقاً)
+- ✅ `modules/*`: لا duplicates (dynamic_labels2, catboost_brain2/3 غير موجودة)
+- ⏸️ `online_learning`: shim chain شغّال بدون كسر، لا يُلمس
+- ⏸️ `prepare_training_data.py` (188 KB legacy): يبقى للـ backward compat
+- ⏸️ `train_v19.py` (199 KB) splitting: يحتاج بيئة production للـ verification
+
+### النتيجة
+- **129 + 11 = 140 tests pass** على الـ branch
+- الـ production paths مؤمَّنة ضد rollback غير متعمد
+- التقرير الأصلي phases 1, 2, 3, 4, 5, 6, A, B = ✅
+- التقرير phases C, D = ❌ للـ sprints القادمة
+
