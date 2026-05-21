@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import os, sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 from pathlib import Path
 from runpy import run_path
 import sys
