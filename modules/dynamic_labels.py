@@ -776,13 +776,38 @@ def label_with_forward_scan(
         if len(future) == 0:
             continue
 
+        # ── Triple Barrier / MFE-MAE logic (label_engine_v2 integration) ──
+        # القديم (المعطوب):
+        #   future_return = float(future[-1] - entry)
+        #   → يضيع MFE الربحية في الـ mean-revert (السيناريو 98% NEUTRAL).
+        # الجديد:
+        #   نحسب MFE/MAE على كل الـ future window، نقرّر بناءً عليهم.
+        # المرجع: modules/label_engine_v2.py (Phase 2 of integration plan).
+        diff_arr = future - entry
+        mfe = float(diff_arr.max()) if len(diff_arr) else 0.0
+        mae = float(-diff_arr.min()) if len(diff_arr) else 0.0
+        if mfe < 0.0:
+            mfe = 0.0
+        if mae < 0.0:
+            mae = 0.0
+
+        threshold = max(float(tick_size or 0.0), 1e-9) * float(direction_threshold_ticks)
+        # MFE/MAE-based direction:
+        # - mfe يجب أن يكون ضعف mae على الأقل و >= threshold
+        # - mae يجب أن يكون ضعف mfe على الأقل و >= threshold
+        # - وإلا NEUTRAL (mean-revert/uncertain).
+        mfe_mae_ratio = 2.0
+        if mfe > mfe_mae_ratio * mae and mfe >= threshold:
+            direction = DIR_LONG
+        elif mae > mfe_mae_ratio * mfe and mae >= threshold:
+            direction = DIR_SHORT
+        else:
+            direction = DIR_NEUTRAL
+
+        # backward-compat: نحتفظ بـ future_return = future[-1] - entry للتشخيص
         future_return = float(future[-1] - entry)
-        direction = _direction_from_future_return(
-            future_return,
-            tick_size=tick_size,
-            threshold_ticks=direction_threshold_ticks,
-        )
-        move_strength = abs(future_return)
+        # move_strength = max(mfe, mae) بدل abs(future_return) للـ quality
+        move_strength = max(mfe, mae)
         future_returns[t] = future_return
         move_strengths[t] = move_strength
 
