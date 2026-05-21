@@ -39,6 +39,13 @@ N_PRICE_LEVELS = 20    # 10 bid + 10 ask → 20 مستوى سعري
 N_CHANNELS     = 3     # Depth + Buy_FP + Sell_FP
 VISUAL_EMB_DIM = 8     # بُعد الـ Visual Embeddings
 
+# Phase 5 integration: 7-channel variant متاح في modules.deeplob_v7ch.
+# يضيف 4 channels: iceberg_strength, wall_persist, informed_prob, depth_imbalance.
+# للاستخدام:
+#   from modules.deeplob_v7ch import build_7ch_tensor
+#   tensor = build_7ch_tensor(df_with_sim_cols, time_steps=50)
+# الـ LOBTensorBuilder أدناه يبقى 3-channel للـ backward compatibility.
+
 
 # ══════════════════════════════════════════════════════════════════
 # 1. TensorBuilder — يبني الـ 3D Tensor tick-by-tick
