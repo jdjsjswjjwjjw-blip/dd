@@ -101,7 +101,7 @@ class TestScanEdgesParity(unittest.TestCase):
 
     def test_scan_parity_small(self):
         df = _make_synthetic_df(n=1500, seed=7)
-        r1 = scan_edges(df, horizons=[3, 6], run_permutation=False, verbose=False)
+        r1 = scan_edges(df, horizons=[3, 6], run_permutation=False, verbose=False, _use_legacy_loop=True)
         r2 = scan_edges_v2(df, horizons=[3, 6], run_permutation=False, verbose=False)
         self.assertEqual(
             r1["diagnostics"]["cells_scanned"],
@@ -119,7 +119,7 @@ class TestScanEdgesParity(unittest.TestCase):
 
     def test_scan_parity_candidate_keys(self):
         df = _make_synthetic_df(n=1500, seed=11)
-        r1 = scan_edges(df, horizons=[3, 6], run_permutation=False, verbose=False)
+        r1 = scan_edges(df, horizons=[3, 6], run_permutation=False, verbose=False, _use_legacy_loop=True)
         r2 = scan_edges_v2(df, horizons=[3, 6], run_permutation=False, verbose=False)
         keys1 = sorted([(c["zone"], c["level"], c["event"], c["combo"], c["horizon"])
                         for c in r1["candidates"]])
@@ -135,7 +135,7 @@ class TestScanEdgesSpeed(unittest.TestCase):
         df = _make_synthetic_df(n=3000, seed=42)
 
         t0 = time.perf_counter()
-        r1 = scan_edges(df, horizons=[3, 6, 12], run_permutation=False, verbose=False)
+        r1 = scan_edges(df, horizons=[3, 6, 12], run_permutation=False, verbose=False, _use_legacy_loop=True)
         t_v1 = time.perf_counter() - t0
 
         t0 = time.perf_counter()

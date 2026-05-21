@@ -129,6 +129,53 @@ def scan_edges(
     run_permutation: bool = True,
     n_permutations: int = 1000,
     verbose: bool = True,
+    _use_legacy_loop: bool = False,
+) -> dict:
+    """
+    البحث الكامل عن edges مع كل الحمايات.
+
+    Pipeline:
+      ① مسح train → جمع كل المرشّحات بـ p-values
+      ② FDR (Benjamini-Hochberg) → تحكّم بـ false discovery rate
+      ③ Permutation test → تأكيد إحصائي بدون افتراض توزيع
+      ④ Validation set → فلترة (ضبط مسموح)
+      ⑤ Holdout → اختبار نهائي (لمسة واحدة)
+
+    منذ Phase A integration: scan_edges يفوّض إلى scan_edges_v2
+    (vectorized, 33-182× أسرع). النتائج مطابقة 1:1 (مُتحقَّق منه
+    عبر 5 parity tests في tests/test_edge_scanner_v2.py).
+
+    للتراجع إلى الـ loop الأصلي (للتشخيص فقط):
+        scan_edges(..., _use_legacy_loop=True)
+    """
+    if not _use_legacy_loop:
+        from edge_scanner_v2 import scan_edges_v2
+        return scan_edges_v2(
+            df,
+            horizons=horizons,
+            symbol=symbol,
+            confidence=confidence,
+            run_permutation=run_permutation,
+            n_permutations=n_permutations,
+            verbose=verbose,
+        )
+
+    # ── Legacy loop-based implementation (للتشخيص فقط) ─────────────────
+    return _scan_edges_legacy(
+        df, horizons=horizons, symbol=symbol, confidence=confidence,
+        run_permutation=run_permutation, n_permutations=n_permutations,
+        verbose=verbose,
+    )
+
+
+def _scan_edges_legacy(
+    df: pd.DataFrame,
+    horizons: list[int] = [3, 6, 12],
+    symbol: str = "6B",
+    confidence: str = "medium",
+    run_permutation: bool = True,
+    n_permutations: int = 1000,
+    verbose: bool = True,
 ) -> dict:
     """
     البحث الكامل عن edges مع كل الحمايات.
