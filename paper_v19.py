@@ -62,7 +62,16 @@ def run_paper(
     visual_npy: str | None = None,
     config: dict | None = None,
     run_mode: str = 'paper',
+    use_bridge: bool = False,
+    alpha_set_path: str | None = None,
 ) -> dict:
+    """Paper/rollout runner.
+
+    Phase 6 integration (تقرير الدمج):
+        use_bridge=True يفعّل IntegrationBridge كـ secondary signal.
+        كل row → bridge decision يُسجَّل في paper_bridge.jsonl
+        (لا يؤثر على entry logic — مراقبة فقط).
+    """
     os.makedirs(output_dir, exist_ok=True)
     cfg = config or load_v19_config()
     paper_cfg = cfg.get('paper', {})
@@ -110,6 +119,28 @@ def run_paper(
     equity = float(cfg.get('backtest', {}).get('starting_equity', 100000.0))
     engine.loss_guard.update_equity(equity)
 
+    # ── Phase 6 integration: IntegrationBridge (مراقبة موازية) ─────────
+    bridge = None
+    bridge_writer = None
+    if use_bridge:
+        try:
+            from modules.integration_bridge import IntegrationBridge, BridgeConfig
+            from modules.statistical_validation_layer import AlphaSet
+            if alpha_set_path and os.path.exists(alpha_set_path):
+                with open(alpha_set_path) as f:
+                    alphas_data = json.load(f)
+                alpha_set = AlphaSet(candidates=alphas_data.get('candidates', []))
+            else:
+                # Empty alpha set → bridge يعمل HOLD-only (للـ baseline)
+                alpha_set = AlphaSet(candidates=[])
+            bridge = IntegrationBridge(alpha_set, config=BridgeConfig())
+            bridge_path = os.path.join(output_dir, 'paper_bridge.jsonl')
+            bridge_writer = EventLogWriter(bridge_path)
+            print(f"[Bridge] Phase 6 activated — decisions → {bridge_path}")
+        except Exception as exc:
+            print(f"[Bridge] ⚠️ تخطّي ({type(exc).__name__}: {exc})")
+            bridge = None
+
     for i, (_, row) in enumerate(canonical_df.iterrows()):
         ts = row.get('ts_event', None)
         spread_pips = _spread_pips(row, tick_size)
@@ -119,6 +150,28 @@ def run_paper(
             ts=ts,
             already_scaled=True,
         )
+
+        # ── Phase 6: bridge decision (مراقبة بدون تأثير على entry) ─────
+        if bridge is not None and bridge_writer is not None:
+            try:
+                # استخراج DL proba من pred dict (إن أمكن)
+                p_long = float(pred.get('p_long', pred.get('long_prob', 0.0)) or 0.0)
+                p_short = float(pred.get('p_short', pred.get('short_prob', 0.0)) or 0.0)
+                p_neutral = max(0.0, 1.0 - p_long - p_short)
+                dl_proba = np.array([p_long, p_short, p_neutral], dtype=np.float64)
+                decision = bridge.evaluate_row(row.to_dict(), dl_proba)
+                bridge_writer.write({
+                    'ts': str(ts),
+                    'idx': int(i),
+                    'action': decision.action.name,
+                    'confidence': float(decision.confidence),
+                    'reason': decision.reason,
+                    'engine_pred': {
+                        'p_long': p_long, 'p_short': p_short, 'p_neutral': p_neutral,
+                    },
+                })
+            except Exception:
+                pass  # silent — مراقبة فقط
 
         health = evaluate_system_health(
             models_dir=models_dir,
@@ -430,6 +483,10 @@ def main():
     p.add_argument('--input_scaled', action='store_true')
     p.add_argument('--config', default=None)
     p.add_argument('--mode', choices=['paper', 'rollout'], default='paper')
+    p.add_argument('--use-bridge', action='store_true',
+                   help='Phase 6: تفعيل IntegrationBridge (مراقبة موازية، يكتب paper_bridge.jsonl)')
+    p.add_argument('--alpha-set', default=None,
+                   help='مسار JSON يحوي candidates للـ AlphaSet (للـ Bridge)')
     args = p.parse_args()
 
     cfg = load_v19_config(args.config)
@@ -441,6 +498,8 @@ def main():
         visual_npy=args.visual_npy,
         config=cfg,
         run_mode=args.mode,
+        use_bridge=args.use_bridge,
+        alpha_set_path=args.alpha_set,
     )
     print(json.dumps(summary, indent=2))
 

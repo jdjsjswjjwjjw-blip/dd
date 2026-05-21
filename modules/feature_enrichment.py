@@ -78,6 +78,8 @@ class EnrichmentConfig:
     add_iceberg: bool = True         # 5 iceberg_*
     add_session_mapping: bool = True # zones + 12 levels
     add_bell_pairs: bool = True      # 9 bp_*
+    add_regime_session: bool = True  # Sprint 12: regime_session interaction
+    regime_session_min_support: int | None = None  # auto: max(200, 0.5%)
     skip_missing_cols: bool = True
     verbose: bool = False
 
@@ -183,6 +185,26 @@ def enrich_features(
                 raise
             if config.verbose:
                 print(f"   ⚠️  bell_pairs تخطّي: {e}")
+
+    if config.add_regime_session:
+        # Sprint 12: regime × session_zone interaction
+        # (Regime Analysis Report v2, التعديل ②)
+        if config.verbose:
+            print("🧠 إضافة regime_session interaction...")
+        try:
+            from modules.regime_session_interaction import enrich_with_regime_session
+            out, regime_session_diag = enrich_with_regime_session(out, verbose=config.verbose)
+            if config.verbose and regime_session_diag.get("statistics"):
+                stats = regime_session_diag["statistics"]
+                if "cramers_v" in stats:
+                    print(f"   χ²={stats['chi_square']:.2f}, "
+                          f"V={stats['cramers_v']:.3f} "
+                          f"({stats.get('effect_size_class', 'n/a')})")
+        except (KeyError, ImportError, ValueError) as e:
+            if not config.skip_missing_cols:
+                raise
+            if config.verbose:
+                print(f"   ⚠️  regime_session تخطّي: {e}")
 
     if config.verbose:
         added = len(out.columns) - len(df.columns)

@@ -1,0 +1,6 @@
+# Dependencies للـ documentation generation
+# تشغيل: pip install -r requirements-docs.txt
+
+reportlab>=4.0.0
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
