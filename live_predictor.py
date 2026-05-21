@@ -94,6 +94,7 @@ def predict_live(
     event_score    : float,
     models         : dict,
     ensemble       : object | None = None,
+    bridge         : object | None = None,
 ) -> tuple[str, float, dict]:
     """
     Pipeline كامل للتنبؤ الحي — 5 خطوات.
@@ -105,6 +106,9 @@ def predict_live(
     event_score    : float      — من detect_microstructure_events [0,1]
     models         : dict       — {regime: CatBoostClassifier}
     ensemble       : RegimeConditionalEnsemble | None — Online Learning (اختياري)
+    bridge         : IntegrationBridge | None — Phase 6 (تقرير الدمج).
+                     لو متاح: debug['bridge_decision'] = action/confidence/reason.
+                     مراقبة موازية بدون كسر الـ pipeline الموجود.
 
     Returns
     -------
@@ -171,6 +175,21 @@ def predict_live(
 
     debug['long_prob']  = round(long_p,  4)
     debug['short_prob'] = round(short_p, 4)
+
+    # ── Phase 6: bridge decision (مراقبة، لا يكسر الـ pipeline) ────────────
+    if bridge is not None:
+        try:
+            import numpy as np
+            neutral_p = max(0.0, 1.0 - long_p - short_p)
+            dl_proba = np.array([long_p, short_p, neutral_p], dtype=np.float64)
+            decision = bridge.evaluate_row(bar_features.to_dict(), dl_proba)
+            debug['bridge_decision'] = {
+                'action': decision.action.name,
+                'confidence': round(float(decision.confidence), 4),
+                'reason': decision.reason,
+            }
+        except Exception as exc:
+            debug['bridge_decision'] = {'error': f"{type(exc).__name__}: {exc}"}
 
     # ── Step 5: Confidence Threshold (Regime-Aware) ─────────────────────────
     min_conf = REGIME_PRED_THRESHOLD.get(current_regime, 0.60)
