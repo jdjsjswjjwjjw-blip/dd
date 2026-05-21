@@ -107,6 +107,135 @@ def discover_alphas(
     return AlphaSet.from_scan_result(result)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Sprint 13: Per-Regime Discovery (Regime Analysis Report v2 ③)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def discover_alphas_by_regime(
+    df: pd.DataFrame,
+    regimes: list[str] | None = None,
+    regime_col: str = "regime_label",
+    symbol: str = "6B",
+    confidence: str = "medium",
+    horizons: list[int] | None = None,
+    run_permutation: bool = True,
+    min_samples_per_regime: int = 1000,
+    use_vectorized: bool = True,
+    verbose: bool = False,
+):
+    """يبحث عن alphas منفصلة لكل regime.
+
+    الفكرة الذهبية (Regime Analysis Report v2، ص 12-14):
+        alpha في trending ≠ alpha في ranging.
+        البحث الكلي يخفي alphas ذهبية تحت المتوسط.
+
+    Algorithm:
+        1. تقسيم df حسب regime_col
+        2. تشغيل scan_edges_v2 على كل subset منفصلاً
+        3. تجميع النتائج في RegimeAlphaLibrary
+
+    Statistical guarantees:
+        - كل regime يحصل على full FDR + permutation independently
+        - لا cross-contamination بين regimes
+        - skip regimes بـ samples < min_samples_per_regime (avoid noise)
+
+    Parameters
+    ----------
+    df : DataFrame مع regime_col + enrichment columns
+    regimes : list of regime values to scan (default: ["trending", "ranging", "volatile"])
+    regime_col : اسم العمود الذي يحدد الـ regime
+    min_samples_per_regime : الحد الأدنى للـ samples قبل تشغيل scan (default 1000)
+    ... (باقي params كما في discover_alphas)
+
+    Returns
+    -------
+    RegimeAlphaLibrary مع per-regime candidates.
+
+    Examples
+    --------
+    >>> from modules.statistical_validation_layer import discover_alphas_by_regime
+    >>> library = discover_alphas_by_regime(df, verbose=True)
+    >>> library.summary()
+    {
+      'total_alphas': 12,
+      'per_regime_counts': {'trending': 8, 'ranging': 4, 'volatile': 0},
+      ...
+    }
+    """
+    from modules.regime_alpha_library import RegimeAlphaLibrary, DEFAULT_REGIMES
+
+    if regimes is None:
+        regimes = list(DEFAULT_REGIMES)
+    if horizons is None:
+        horizons = [3, 6, 12]
+
+    if regime_col not in df.columns:
+        raise KeyError(
+            f"regime_col '{regime_col}' غير موجود. "
+            f"تأكد إن prepare_day_trading أنشأ regime labels."
+        )
+
+    library = RegimeAlphaLibrary(
+        metadata={
+            "n_total_samples": int(len(df)),
+            "regimes_scanned": list(regimes),
+            "min_samples_per_regime": int(min_samples_per_regime),
+            "confidence": confidence,
+            "horizons": list(horizons),
+        },
+    )
+
+    # lazy import (edge_scanner_v2 يحتاج v19_2)
+    if use_vectorized:
+        from edge_scanner_v2 import scan_edges_v2
+        scanner = scan_edges_v2
+    else:
+        from v19_2.edge_scanner import scan_edges as _v1
+        scanner = _v1
+
+    for regime in regimes:
+        # subset for this regime
+        mask = df[regime_col] == regime
+        n_regime = int(mask.sum())
+
+        if n_regime < min_samples_per_regime:
+            if verbose:
+                print(f"   ⚠ {regime}: skip ({n_regime} < {min_samples_per_regime} min)")
+            library.metadata.setdefault("skipped", {})[regime] = {
+                "reason": "insufficient_samples",
+                "n_samples": n_regime,
+                "min_required": min_samples_per_regime,
+            }
+            continue
+
+        if verbose:
+            print(f"   🔍 {regime}: scanning {n_regime} samples...")
+
+        df_subset = df.loc[mask].reset_index(drop=True)
+        try:
+            result = scanner(
+                df_subset,
+                horizons=horizons,
+                symbol=symbol,
+                confidence=confidence,
+                run_permutation=run_permutation,
+                verbose=False,
+            )
+            n_added = library.add_from_scan_result(regime, result)
+            if verbose:
+                print(f"      ✓ {regime}: {n_added} alphas added")
+        except (KeyError, ValueError, RuntimeError) as exc:
+            library.metadata.setdefault("errors", {})[regime] = str(exc)
+            if verbose:
+                print(f"      ✗ {regime}: error ({type(exc).__name__}: {exc})")
+
+    if verbose:
+        print(f"\n📊 Total: {library.total_alphas()} alphas across {len(regimes)} regimes")
+
+    return library
+
+
 def apply_alpha_filter(
     df: pd.DataFrame,
     alpha_set: AlphaSet,
@@ -204,6 +333,7 @@ def signal_to_noise_estimate(
 __all__ = [
     "AlphaSet",
     "discover_alphas",
+    "discover_alphas_by_regime",  # Sprint 13
     "apply_alpha_filter",
     "signal_to_noise_estimate",
 ]

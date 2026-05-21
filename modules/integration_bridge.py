@@ -84,9 +84,38 @@ class IntegrationBridge:
         self,
         alpha_set,
         config: BridgeConfig = BridgeConfig(),
+        regime_library=None,
     ):
+        """
+        Parameters
+        ----------
+        alpha_set : AlphaSet (legacy, global alphas)
+        config : BridgeConfig
+        regime_library : RegimeAlphaLibrary | None (Sprint 13)
+            لو مُمرَّر، الـ Bridge يفلتر alphas حسب row['regime_label']
+            بدل استخدام alpha_set الموحد. الفكرة الذهبية من
+            Regime Analysis Report v2 (③).
+        """
         self.alpha_set = alpha_set
         self.config = config
+        self.regime_library = regime_library
+
+    def _alphas_for_row(self, row: pd.Series) -> list[dict]:
+        """يُرجع candidates relevant لـ row الحالي.
+
+        - لو regime_library متاح: يفلتر حسب row['regime_label']
+        - وإلا: يستخدم alpha_set.candidates (السلوك القديم)
+        """
+        if self.regime_library is not None:
+            regime = row.get("regime_label")
+            if regime is None:
+                # fallback: نستخدم all alphas من كل الـ regimes
+                all_a = []
+                for r in self.regime_library.regimes():
+                    all_a.extend(self.regime_library.get(r))
+                return all_a
+            return self.regime_library.get(regime)
+        return list(self.alpha_set.candidates)
 
     def _row_matches_alpha(self, row: pd.Series, alpha: dict) -> bool:
         """يفحص لو row يطابق alpha specs (zone + level event + combo filters)."""
@@ -151,8 +180,11 @@ class IntegrationBridge:
                 )
 
         # ── 2. Alpha match + DL confirm ───────────────────────────────────
+        # Sprint 13: لو regime_library مُمرَّر، الـ candidates مفلترة حسب
+        # row['regime_label'] (الفكرة الذهبية من التقرير ③).
+        candidates = self._alphas_for_row(row)
         matched = None
-        for alpha in self.alpha_set.candidates:
+        for alpha in candidates:
             if self._row_matches_alpha(row, alpha):
                 matched = alpha
                 break
