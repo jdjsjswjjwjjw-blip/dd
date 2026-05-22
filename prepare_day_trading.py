@@ -2099,6 +2099,9 @@ def label_by_outcome(
     sl_to_opposite: bool = False,
     include_weak_directional_in_train: bool = False,
     use_event_score_tier_labels: bool | None = None,
+    timeout_mfe_mae: bool = True,
+    timeout_mfe_mae_ratio: float = 2.0,
+    timeout_mfe_min_move_atr: float = 1.0,
 ) -> pd.DataFrame:
     """
     يلصق الليبل بناءً على أول حاجز يُضرب (First Barrier Hit).
@@ -2316,46 +2319,86 @@ def label_by_outcome(
                 break
 
         # ── تعيين الليبل ─────────────────────────────────────────────────────
+        # دالة قرار MFE/MAE — تُستدعى في كل حالة لا تنتهي بـ TP صريح.
+        # المشكلة القديمة: timeout → NEUTRAL، و *_sl → NEUTRAL تلقائياً.
+        #   في 5min/6B الـ TP barrier نادراً يُضرب، وفي trend صاعد الـ sl_short
+        #   (فوق entry) يُضرب قبل tp_long → يُصنَّف short_sl → NEUTRAL.
+        #   النتيجة: ≈99% NEUTRAL، train_pool ≈ 10 صفوف.
+        # الإصلاح (مطابق منطق modules.label_engine_v2.label_triple_barrier_atr):
+        #   في كل حالة non-TP، نفحص MFE/MAE على نافذة [i+1, sess_end]؛
+        #   الفائز إن كان ضِعف الخاسر (ratio) و>=min_move يحدد الاتجاه.
+        #   يحترم allow_long/allow_short (فيتو اتجاه الحدث + Kalman).
+        def _mfe_mae_decide(end_idx: int) -> int:
+            if (not timeout_mfe_mae) or end_idx <= i:
+                return 2
+            win = close[i + 1: end_idx + 1]
+            if win.size == 0:
+                return 2
+            d = win - entry
+            mfe = max(0.0, float(np.max(d)))
+            mae = max(0.0, float(-np.min(d)))
+            min_move = float(timeout_mfe_min_move_atr) * atr_i
+            ratio = float(timeout_mfe_mae_ratio)
+            if allow_long and mfe > ratio * mae and mfe >= min_move:
+                return 0
+            if allow_short and mae > ratio * mfe and mae >= min_move:
+                return 1
+            return 2
+
         if first_ev is None:
-            # Timeout = نهاية الجلسة بدون حسم
-            bias_label[i]     = 2
-            path_outcome[i]   = 4
+            # Timeout — لم يُضرب أي barrier → قرار MFE/MAE على كامل النافذة.
             trade_duration[i] = max(0, sess_end - i)
-            if (not allow_long) or (not allow_short):
-                neutral_reason[i] = NEUTRAL_REASON_KALMAN
+            decided = _mfe_mae_decide(sess_end)
+            bias_label[i]   = decided
+            path_outcome[i] = 4  # 4 = timeout
+            if decided == 2:
+                if (not allow_long) or (not allow_short):
+                    neutral_reason[i] = NEUTRAL_REASON_KALMAN
+                else:
+                    neutral_reason[i] = NEUTRAL_REASON_TIMEOUT
             else:
-                neutral_reason[i] = NEUTRAL_REASON_TIMEOUT
+                signal_quality[i] = 2 if london_ok[i] else 1
+                neutral_reason[i] = NEUTRAL_REASON_NONE
         else:
             ev_type, ev_j = first_ev
             trade_duration[i] = ev_j - i
             sq = 2 if london_ok[i] else 1
 
             if ev_type == 'long_tp':
-                bias_label[i]   = 0   # LONG ✅
+                bias_label[i]   = 0   # LONG ✅ (TP صريح)
                 path_outcome[i] = 0
                 signal_quality[i] = sq
             elif ev_type == 'short_tp':
-                bias_label[i]   = 1   # SHORT ✅
+                bias_label[i]   = 1   # SHORT ✅ (TP صريح)
                 path_outcome[i] = 1
                 signal_quality[i] = sq
             elif ev_type == 'long_sl':
+                path_outcome[i] = 2
                 if sl_to_opposite:
-                    bias_label[i] = 1  # map loss to opposite direction (optional aggressive mode)
+                    bias_label[i] = 1  # وضع aggressive: SL → الاتجاه المعاكس
                     signal_quality[i] = 1
                 else:
-                    bias_label[i] = 2   # NEUTRAL (SL = إشارة خاطئة)
-                path_outcome[i] = 2
-                if bias_label[i] == 2:
-                    neutral_reason[i] = NEUTRAL_REASON_LONG_SL
+                    # كان NEUTRAL تلقائياً → الآن MFE/MAE على كامل النافذة
+                    decided = _mfe_mae_decide(sess_end)
+                    bias_label[i] = decided
+                    if decided == 2:
+                        neutral_reason[i] = NEUTRAL_REASON_LONG_SL
+                    else:
+                        signal_quality[i] = 1
+                        neutral_reason[i] = NEUTRAL_REASON_NONE
             elif ev_type == 'short_sl':
+                path_outcome[i] = 3
                 if sl_to_opposite:
                     bias_label[i] = 0
                     signal_quality[i] = 1
                 else:
-                    bias_label[i] = 2   # NEUTRAL
-                path_outcome[i] = 3
-                if bias_label[i] == 2:
-                    neutral_reason[i] = NEUTRAL_REASON_SHORT_SL
+                    decided = _mfe_mae_decide(sess_end)
+                    bias_label[i] = decided
+                    if decided == 2:
+                        neutral_reason[i] = NEUTRAL_REASON_SHORT_SL
+                    else:
+                        signal_quality[i] = 1
+                        neutral_reason[i] = NEUTRAL_REASON_NONE
 
     # ── كتابة النتائج ─────────────────────────────────────────────────────────
     df['bias_label']     = bias_label
@@ -2450,6 +2493,9 @@ def build_day_trading_labels(
     min_atr: float = 0.0003,     # حد أدنى لـ ATR (3 pips لـ GBPUSD)
     *,
     strict_train_pool: bool = False,
+    timeout_mfe_mae: bool = True,
+    timeout_mfe_mae_ratio: float = 2.0,
+    timeout_mfe_min_move_atr: float = 1.0,
 ) -> pd.DataFrame:
     """
     يبني labels للـ Day Trading على مسار سببي داخل الأفق:
@@ -2535,26 +2581,49 @@ def build_day_trading_labels(
 
         london_ok = bool(df['is_london'].iloc[i] or df['is_overlap'].iloc[i])
 
+        # قرار MFE/MAE — لكل حالة non-TP (timeout, long_sl, short_sl).
+        # يحلّ مشكلة ≈99% NEUTRAL: الـ TP نادراً يُضرب على 5min، والـ *_sl
+        # outcomes كانت تُصنَّف NEUTRAL تلقائياً. (منطق modules.label_engine_v2.)
+        def _mfe_mae_decide() -> int:
+            if not timeout_mfe_mae:
+                return 2
+            win = close[i + 1: horizon_end + 1]
+            if win.size == 0:
+                return 2
+            d = win - entry
+            mfe = max(0.0, float(np.max(d)))
+            mae = max(0.0, float(-np.min(d)))
+            min_move = float(timeout_mfe_min_move_atr) * atr_i
+            ratio = float(timeout_mfe_mae_ratio)
+            if mfe > ratio * mae and mfe >= min_move:
+                return 0
+            if mae > ratio * mfe and mae >= min_move:
+                return 1
+            return 2
+
         if first_ev is None:
-            bias_label[i] = 2
+            decided = _mfe_mae_decide()
+            bias_label[i] = decided
             path_outcome[i] = 4
-            signal_quality[i] = 0
+            signal_quality[i] = 0 if decided == 2 else (2 if london_ok else 1)
         elif first_ev[0] == 'long_tp':
             bias_label[i] = 0
             path_outcome[i] = 0
             signal_quality[i] = 2 if london_ok else 1
         elif first_ev[0] == 'long_sl':
-            bias_label[i] = 2
+            decided = _mfe_mae_decide()
+            bias_label[i] = decided
             path_outcome[i] = 2
-            signal_quality[i] = 0
+            signal_quality[i] = 0 if decided == 2 else 1
         elif first_ev[0] == 'short_tp':
             bias_label[i] = 1
             path_outcome[i] = 1
             signal_quality[i] = 2 if london_ok else 1
         elif first_ev[0] == 'short_sl':
-            bias_label[i] = 2
+            decided = _mfe_mae_decide()
+            bias_label[i] = decided
             path_outcome[i] = 3
-            signal_quality[i] = 0
+            signal_quality[i] = 0 if decided == 2 else 1
 
     out = df.copy()
     out['bias_label'] = bias_label
