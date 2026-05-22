@@ -233,5 +233,34 @@ class TestMFEMAEConsistencyWithLabelEngine(unittest.TestCase):
         )
 
 
+class TestV20MirrorsRoot(unittest.TestCase):
+    """يحرس أن v20/prepare_day_trading.py مطابق لملف الجذر.
+
+    سبب الوجود: المستخدم يشغّل `python -m v20.prepare_day_trading`، فلو
+    انحرف ملف v20 عن الجذر يعود خلل الـ 99% NEUTRAL دون أن يلاحَظ.
+    """
+
+    def test_v20_copy_identical_to_root(self):
+        root = os.path.join(_ROOT, 'prepare_day_trading.py')
+        v20 = os.path.join(_ROOT, 'v20', 'prepare_day_trading.py')
+        self.assertTrue(os.path.exists(v20),
+                        "v20/prepare_day_trading.py مفقود — يجب أن يكون نسخة من الجذر")
+        with open(root, encoding='utf-8') as f:
+            root_src = f.read()
+        with open(v20, encoding='utf-8') as f:
+            v20_src = f.read()
+        self.assertEqual(
+            root_src, v20_src,
+            "v20/prepare_day_trading.py انحرف عن الجذر — أعد النسخ من الجذر",
+        )
+
+    def test_v20_has_the_fix(self):
+        v20 = os.path.join(_ROOT, 'v20', 'prepare_day_trading.py')
+        with open(v20, encoding='utf-8') as f:
+            src = f.read()
+        self.assertIn('timeout_mfe_mae', src,
+                       "إصلاح Sprint 19 غير موجود في نسخة v20")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
