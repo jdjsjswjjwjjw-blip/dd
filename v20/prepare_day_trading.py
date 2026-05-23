@@ -3242,6 +3242,7 @@ def _attach_price_cycle_features(df_bars: pd.DataFrame) -> pd.DataFrame:
     """يضيف 12 ميزة بنيوية من modules/price_cycle (Wyckoff + swing + fractal).
 
     يحتاج أعمدة OHLCV في df_bars. كل الميزات سببية (لا look-ahead).
+    Skip بأمان لو N < 20 (لازم >= ATR window=14 للـ derived features).
     """
     from modules.price_cycle.data_structures import BarSequence
     from modules.price_cycle.feature_pipeline import build_cycle_features
@@ -3250,6 +3251,13 @@ def _attach_price_cycle_features(df_bars: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in required if c not in df_bars.columns]
     if missing:
         raise KeyError(f"price_cycle: أعمدة مفقودة: {missing}")
+
+    if len(df_bars) < 20:
+        print(f"  ⚠️  price_cycle: skip (N={len(df_bars)} < 20 minimum)")
+        for col in _PRICE_CYCLE_STRUCTURAL_COLS:
+            if col not in df_bars.columns:
+                df_bars[col] = np.float32(0.0)
+        return df_bars
 
     ts_ns = pd.to_datetime(df_bars['ts_event']).astype('datetime64[ns]').astype(np.int64).to_numpy()
     bars_seq = BarSequence(

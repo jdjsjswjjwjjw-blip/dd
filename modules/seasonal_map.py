@@ -60,9 +60,10 @@ def _minutes_in_window(hour: np.ndarray, minute: np.ndarray,
     """Return (minutes_since_open, minutes_to_close, in_window_mask).
 
     For times outside the session, since/to_close are 0 and mask is False.
-    Mask is the unambiguous indicator (since=0 is valid at session open).
+    NaT-safe: hour/minute that are out of valid range (caller's responsibility
+    to set 0 for NaT) get treated as outside-window automatically.
     """
-    cur_min = hour.astype(np.int32) * 60 + minute.astype(np.int32)
+    cur_min = hour.astype(np.int64) * 60 + minute.astype(np.int64)
     open_min = open_hour * 60
     close_min = close_hour * 60
     in_window = (cur_min >= open_min) & (cur_min < close_min)
@@ -105,8 +106,11 @@ def add_seasonal_features(
         ts = _coerce_ts(out[ts_col])
 
     # ── Time-of-day phase ────────────────────────────────────────────────
-    hour = ts.hour.to_numpy()
-    minute = ts.minute.to_numpy()
+    # NaT-safe extraction: replace invalid timestamps with sentinel values
+    # so int casts don't raise RuntimeWarning ("invalid value encountered").
+    nat_mask = ts.isna() if hasattr(ts, 'isna') else np.array([False] * len(out))
+    hour = np.where(nat_mask, 0, ts.hour.to_numpy()).astype(np.int64)
+    minute = np.where(nat_mask, 0, ts.minute.to_numpy()).astype(np.int64)
 
     london_since, london_to_close, in_london = _minutes_in_window(
         hour, minute, LONDON_OPEN_HOUR, LONDON_CLOSE_HOUR,
@@ -143,7 +147,8 @@ def add_seasonal_features(
         out['session_phase'] = phase
 
     # ── Day-of-week cyclical ─────────────────────────────────────────────
-    dow = ts.dayofweek.to_numpy()  # 0=Mon ... 6=Sun
+    # NaT-safe: dayofweek/day/month return -1 or huge int for NaT → mask to 0
+    dow = np.where(nat_mask, 0, ts.dayofweek.to_numpy()).astype(np.int64)  # 0=Mon ... 6=Sun
     if 'dow_sin' not in out.columns:
         out['dow_sin'] = np.sin(2 * np.pi * dow / 7.0).astype(np.float32)
     if 'dow_cos' not in out.columns:
@@ -154,9 +159,9 @@ def add_seasonal_features(
         out['is_friday'] = (dow == 4).astype(np.int8)
 
     # ── Day-of-month + month-end / quarter-end / year-end ────────────────
-    dom = ts.day.to_numpy()
-    month = ts.month.to_numpy()
-    days_in_month = ts.days_in_month.to_numpy()
+    dom = np.where(nat_mask, 1, ts.day.to_numpy()).astype(np.int64)
+    month = np.where(nat_mask, 1, ts.month.to_numpy()).astype(np.int64)
+    days_in_month = np.where(nat_mask, 31, ts.days_in_month.to_numpy()).astype(np.int64)
     days_to_eom = (days_in_month - dom).astype(np.int32)
 
     if 'dom' not in out.columns:
@@ -178,7 +183,7 @@ def add_seasonal_features(
         out['is_year_end'] = ((month == 12) & (days_to_eom <= 4)).astype(np.int8)
 
     # ── Week-of-year ─────────────────────────────────────────────────────
-    woy = ts.isocalendar().week.to_numpy()
+    woy = np.where(nat_mask, 1, ts.isocalendar().week.to_numpy()).astype(np.int64)
     if 'woy_sin' not in out.columns:
         out['woy_sin'] = np.sin(2 * np.pi * woy / 52.0).astype(np.float32)
     if 'woy_cos' not in out.columns:
