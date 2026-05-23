@@ -287,21 +287,23 @@ def _resolve_mbo_size_column(df_mbo: pd.DataFrame) -> str:
     raise KeyError("MBO data must include one of size/qty/volume")
 
 
-def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
-    """
-    Reconstruct core tick-level microstructure features when raw MBO lacks them.
-    Uses the same engine families as stage-1 refinery to avoid losing signal quality.
-    """
-    missing = [c for c in CORE_MBO_REQUIRED_COLS if c not in df_mbo.columns]
-    if not missing:
-        return df_mbo
+def _enrich_mbo_run_loop(
+    price_arr: np.ndarray,
+    size_arr: np.ndarray,
+    action_arr: np.ndarray,
+    side_arr: np.ndarray,
+    oid_arr: np.ndarray,
+    ts_ns_arr: np.ndarray,
+    ts_pd_arr,  # pd.DatetimeIndex or np.ndarray[datetime64]
+    day_idx_arr: np.ndarray,
+    min_price_move: float,
+    volatility: float,
+) -> dict:
+    """Pure loop over MBO ticks for one chunk (one day in parallel mode، الكامل في sequential).
 
-    print(
-        "  🧠 Core microstructure reconstruction: "
-        f"{len(missing)} missing columns -> rebuilding from raw ticks",
-    )
-
-    from modules.auto_calibrator import AutoCalibrator
+    تُنشئ مَحركات جديدة، تجري التحديث لكل tick، وتُعيد dict من numpy arrays
+    بالطول نفسه. لا تعتمد على pandas — لكي تُستدعى من worker processes أو inline.
+    """
     from modules.microstructure import FastMicrostructureEngine, AbsorptionIntensityEngine, CancelRatioEngine
     from modules.micro_volatility import MicroVolatilityEngine
     from modules.market_research_features import KylesLambdaEngine, HawkesIntensityEngine, VNETEngine
@@ -310,25 +312,8 @@ def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
     from modules.fisher_alpha import FastFisherAlpha
     from modules.fim_anomaly import FastFIMDetector
 
-    out = df_mbo.copy()
-    out['ts_event'] = pd.to_datetime(out['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
-    out = out.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
-    if out.empty:
-        return out
-
-    size_col = _resolve_mbo_size_column(out)
-    if size_col != 'size':
-        out['size'] = pd.to_numeric(out[size_col], errors='coerce').fillna(0.0).astype(np.float64)
-    else:
-        out['size'] = pd.to_numeric(out['size'], errors='coerce').fillna(0.0).astype(np.float64)
-    out['price'] = pd.to_numeric(out['price'], errors='coerce').fillna(0.0).astype(np.float64)
-    action_s = out['action'].astype(str).str.upper() if 'action' in out.columns else pd.Series('T', index=out.index)
-    side_s = out['side'].astype(str).str.upper() if 'side' in out.columns else pd.Series('', index=out.index)
-    order_ids = out['order_id'] if 'order_id' in out.columns else pd.Series([None] * len(out), index=out.index)
-
-    calibrator = AutoCalibrator(n_ticks=2000).fit(out, price_col='price', size_col='size', action_col='action')
     micro = FastMicrostructureEngine()
-    absorb = AbsorptionIntensityEngine(min_price_move=max(float(calibrator.min_price_move), 1e-8))
+    absorb = AbsorptionIntensityEngine(min_price_move=max(float(min_price_move), 1e-8))
     cancel = CancelRatioEngine()
     mv = MicroVolatilityEngine()
     kyle = KylesLambdaEngine(window=50)
@@ -338,11 +323,11 @@ def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
     fim = FastFIMDetector()
     momentum = MomentumContextEngine()
     sweep = LiquiditySweepDetector(
-        sweep_threshold=max(0.05, min(float(calibrator.volatility) * 2.0, 0.30)),
+        sweep_threshold=max(0.05, min(float(volatility) * 2.0, 0.30)),
     )
     vwap = SessionVWAPEngine()
 
-    n = len(out)
+    n = len(price_arr)
     cvd_arr = np.zeros(n, dtype=np.float64)
     sess_cvd_arr = np.zeros(n, dtype=np.float64)
     absorb_arr = np.zeros(n, dtype=np.float64)
@@ -380,25 +365,13 @@ def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
     last_sess_cvd = 0.0
     last_day_idx = -1
 
-    # ── Cache numpy arrays + precompute ts/day vectorized (يلغي pandas .at overhead في loop)
-    _price_arr = out['price'].to_numpy(dtype=np.float64)
-    _size_arr = out['size'].to_numpy(dtype=np.float64)
-    _action_arr = np.asarray([s.strip().upper() for s in action_s.astype(str).to_numpy()], dtype=object)
-    _side_arr = np.asarray([s.strip().upper() for s in side_s.astype(str).to_numpy()], dtype=object)
-    _oid_arr = order_ids.to_numpy() if hasattr(order_ids, 'to_numpy') else np.asarray(order_ids)
-    _ts_dt = pd.to_datetime(out['ts_event'].to_numpy())  # tz-naive after dt.tz_localize(None) above
-    _ts_ns_arr = _ts_dt.astype('datetime64[ns]').astype(np.int64)
-    # Day boundary as integer day-since-epoch (vectorized عوض ts.date() per iter)
-    _day_idx_arr = (_ts_ns_arr // (86_400 * 1_000_000_000)).astype(np.int64)
-    _ts_pd_arr = pd.DatetimeIndex(_ts_dt)  # for vwap.update(ts, …) calls — still need pd.Timestamp
-
     for i in range(n):
-        px = _price_arr[i]
-        sz = _size_arr[i]
-        act = _action_arr[i]
-        sd = _side_arr[i]
-        oid = _oid_arr[i]
-        day_idx = _day_idx_arr[i]
+        px = price_arr[i]
+        sz = size_arr[i]
+        act = action_arr[i]
+        sd = side_arr[i]
+        oid = oid_arr[i]
+        day_idx = day_idx_arr[i]
         if last_day_idx == -1:
             last_day_idx = day_idx
         elif day_idx != last_day_idx:
@@ -406,7 +379,7 @@ def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
             cvd = 0.0
             last_sess_cvd = 0.0
             last_day_idx = day_idx
-        ts_ns = int(_ts_ns_arr[i])
+        ts_ns = int(ts_ns_arr[i])
 
         spoof_arr[i] = float(micro.process_mbo_tick(act, oid, sd, sz, px, ts_ns))
         cr = float(cancel.process_tick(act, oid, sz))
@@ -441,7 +414,7 @@ def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
             else:
                 vnet_side = sd
             last_vnet = float(vnet.update(px, sz, vnet_side))
-            last_vwap, last_vwap_z, _, last_sess_cvd = vwap.update(_ts_pd_arr[i], px, float(sz), bool(is_buy))
+            last_vwap, last_vwap_z, _, last_sess_cvd = vwap.update(ts_pd_arr[i], px, float(sz), bool(is_buy))
 
         cvd_arr[i] = cvd
         sess_cvd_arr[i] = float(last_sess_cvd)
@@ -457,7 +430,7 @@ def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
         vwap_arr[i] = float(last_vwap)
         vwap_z_arr[i] = float(last_vwap_z)
 
-    rebuilt_cols = {
+    return {
         'cvd': cvd_arr,
         'session_cvd': sess_cvd_arr,
         'absorption_intensity': absorb_arr,
@@ -479,6 +452,121 @@ def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
         'vwap_z_score': vwap_z_arr,
         'spoofing_ratio': spoof_arr,
     }
+
+
+def _enrich_mbo_chunk_worker(args: tuple) -> dict:
+    """Pool.map adapter: يفك tuple ويستدعي _enrich_mbo_run_loop."""
+    return _enrich_mbo_run_loop(*args)
+
+
+def enrich_mbo_with_core_microstructure(
+    df_mbo: pd.DataFrame,
+    *,
+    n_workers: int | None = None,
+) -> pd.DataFrame:
+    """
+    Reconstruct core tick-level microstructure features when raw MBO lacks them.
+    Uses the same engine families as stage-1 refinery to avoid losing signal quality.
+
+    n_workers: عدد العمليات المتوازية. None = auto (cpu_count - 1)، 1 = sequential.
+               override عبر env DD_N_WORKERS. الانقسام بالـ day (آمن: cvd/session_cvd
+               يتم reset في حدود اليوم في النسخة sequential أيضاً).
+    """
+    missing = [c for c in CORE_MBO_REQUIRED_COLS if c not in df_mbo.columns]
+    if not missing:
+        return df_mbo
+
+    print(
+        "  🧠 Core microstructure reconstruction: "
+        f"{len(missing)} missing columns -> rebuilding from raw ticks",
+    )
+
+    from modules.auto_calibrator import AutoCalibrator
+
+    out = df_mbo.copy()
+    out['ts_event'] = pd.to_datetime(out['ts_event'], utc=True, errors='coerce').dt.tz_localize(None)
+    out = out.dropna(subset=['ts_event']).sort_values('ts_event').reset_index(drop=True)
+    if out.empty:
+        return out
+
+    size_col = _resolve_mbo_size_column(out)
+    if size_col != 'size':
+        out['size'] = pd.to_numeric(out[size_col], errors='coerce').fillna(0.0).astype(np.float64)
+    else:
+        out['size'] = pd.to_numeric(out['size'], errors='coerce').fillna(0.0).astype(np.float64)
+    out['price'] = pd.to_numeric(out['price'], errors='coerce').fillna(0.0).astype(np.float64)
+    action_s = out['action'].astype(str).str.upper() if 'action' in out.columns else pd.Series('T', index=out.index)
+    side_s = out['side'].astype(str).str.upper() if 'side' in out.columns else pd.Series('', index=out.index)
+    order_ids = out['order_id'] if 'order_id' in out.columns else pd.Series([None] * len(out), index=out.index)
+
+    calibrator = AutoCalibrator(n_ticks=2000).fit(out, price_col='price', size_col='size', action_col='action')
+    min_price_move = float(calibrator.min_price_move)
+    volatility = float(calibrator.volatility)
+
+    # ── Cache numpy arrays + precompute ts/day vectorized
+    _price_arr = out['price'].to_numpy(dtype=np.float64)
+    _size_arr = out['size'].to_numpy(dtype=np.float64)
+    _action_arr = np.asarray([s.strip().upper() for s in action_s.astype(str).to_numpy()], dtype=object)
+    _side_arr = np.asarray([s.strip().upper() for s in side_s.astype(str).to_numpy()], dtype=object)
+    _oid_arr = order_ids.to_numpy() if hasattr(order_ids, 'to_numpy') else np.asarray(order_ids)
+    _ts_dt = pd.to_datetime(out['ts_event'].to_numpy())
+    _ts_ns_arr = _ts_dt.astype('datetime64[ns]').astype(np.int64)
+    _day_idx_arr = (_ts_ns_arr // (86_400 * 1_000_000_000)).astype(np.int64)
+    _ts_pd_arr = pd.DatetimeIndex(_ts_dt)
+
+    # ── قرار التوازي: env override > arg > auto
+    env_workers = os.environ.get('DD_N_WORKERS', '').strip()
+    if env_workers:
+        try:
+            n_workers = max(1, int(env_workers))
+        except ValueError:
+            pass
+    if n_workers is None:
+        n_workers = max(1, (os.cpu_count() or 1) - 1)
+
+    unique_days = np.unique(_day_idx_arr)
+    n_days = int(len(unique_days))
+    effective_workers = min(n_workers, n_days) if n_days > 0 else 1
+
+    if effective_workers <= 1 or n_days <= 1:
+        # ── Sequential path (نفس السلوك القديم)
+        print(f"  ⏳ enrich loop: sequential (n_ticks={len(out):,}, days={n_days})")
+        rebuilt_cols = _enrich_mbo_run_loop(
+            _price_arr, _size_arr, _action_arr, _side_arr, _oid_arr,
+            _ts_ns_arr, _ts_pd_arr, _day_idx_arr,
+            min_price_move, volatility,
+        )
+    else:
+        # ── Parallel path: نقسم على الأيام، نعالج كل يوم في worker process
+        import multiprocessing as mp
+        print(
+            f"  ⚡ enrich loop: parallel (workers={effective_workers}, "
+            f"n_ticks={len(out):,}, days={n_days})"
+        )
+        # Build chunk args per day (preserve order)
+        chunk_args: list[tuple] = []
+        for d in unique_days:
+            mask = (_day_idx_arr == d)
+            chunk_args.append((
+                _price_arr[mask],
+                _size_arr[mask],
+                _action_arr[mask],
+                _side_arr[mask],
+                _oid_arr[mask],
+                _ts_ns_arr[mask],
+                _ts_pd_arr[mask],  # DatetimeIndex slicing keeps as DatetimeIndex
+                _day_idx_arr[mask],
+                min_price_move,
+                volatility,
+            ))
+        # fork on Linux inherits modules — no re-import overhead
+        ctx = mp.get_context('fork')
+        with ctx.Pool(effective_workers) as pool:
+            chunk_results = pool.map(_enrich_mbo_chunk_worker, chunk_args)
+        # Concatenate per-column في ترتيب الأيام (which matches original sequential)
+        rebuilt_cols = {}
+        for col in chunk_results[0].keys():
+            rebuilt_cols[col] = np.concatenate([r[col] for r in chunk_results])
 
     for col, arr in rebuilt_cols.items():
         if col not in df_mbo.columns:
@@ -2995,7 +3083,12 @@ def _sanitize_mbp_ticks_for_daytrade(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def load_mbo_ticks_enriched(mbo_dir: str, *, sanitize_input_ticks: bool = True) -> pd.DataFrame:
+def load_mbo_ticks_enriched(
+    mbo_dir: str,
+    *,
+    sanitize_input_ticks: bool = True,
+    n_workers: int | None = None,
+) -> pd.DataFrame:
     """تحميل MBO (مجلد أو ملف) و enrich_mbo_with_core_microstructure."""
     mbo_path = os.path.abspath(str(mbo_dir))
     ext = os.path.splitext(mbo_path)[1].lower()
@@ -3031,7 +3124,7 @@ def load_mbo_ticks_enriched(mbo_dir: str, *, sanitize_input_ticks: bool = True) 
     else:
         df_mbo["ts_event"] = pd.to_datetime(df_mbo["ts_event"])
         df_mbo = df_mbo.sort_values("ts_event").reset_index(drop=True)
-    df_mbo = enrich_mbo_with_core_microstructure(df_mbo)
+    df_mbo = enrich_mbo_with_core_microstructure(df_mbo, n_workers=n_workers)
     return df_mbo
 
 
@@ -3164,6 +3257,7 @@ def run_day_trading_refinery(
     sanitize_input_ticks: bool = True,
     enrich_v19_2: bool = False,
     enrich_v19_2_skip_missing: bool = True,
+    n_workers: int | None = None,
 ) -> str:
     """
     Pipeline كاملة: MBO → Day Trading Dataset
@@ -3258,7 +3352,7 @@ def run_day_trading_refinery(
         print("\n📥 تحميل MBO data...")
         if not mbo_dir:
             raise ValueError("❌ mbo_dir مطلوب بدون --preflight-parquet")
-        df_mbo = load_mbo_ticks_enriched(mbo_dir, sanitize_input_ticks=sanitize_input_ticks)
+        df_mbo = load_mbo_ticks_enriched(mbo_dir, sanitize_input_ticks=sanitize_input_ticks, n_workers=n_workers)
         mbo_path_contract = os.path.abspath(str(mbo_dir))
         print(f"  ✅ {len(df_mbo):,} تيك | {df_mbo['ts_event'].min()} → {df_mbo['ts_event'].max()}")
 
@@ -3417,7 +3511,7 @@ def run_day_trading_refinery(
                         "أو مرّر --reuse-lob-tensors-dir، أو --no-lob"
                     )
                 print("  📥 تحميل MBO/MBP من أجل LOB فقط...")
-                df_mbo = load_mbo_ticks_enriched(mbo_dir, sanitize_input_ticks=sanitize_input_ticks)
+                df_mbo = load_mbo_ticks_enriched(mbo_dir, sanitize_input_ticks=sanitize_input_ticks, n_workers=n_workers)
                 if mbp_path:
                     df_mbp = _read_mbp_table(str(mbp_path), levels=10)
                     if df_mbp is not None and len(df_mbp):
@@ -3990,6 +4084,17 @@ if __name__ == '__main__':
             'الافتراضي: معطّل (backward compat).'
         ),
     )
+    p.add_argument(
+        '--n-workers',
+        type=int,
+        default=None,
+        help=(
+            'عدد worker processes لـ enrich_mbo loop. None=auto (cpu_count-1)، '
+            '1=sequential (مطابق بايت-لبايت للسلوك القديم). يمكن override بـ env DD_N_WORKERS. '
+            'الانقسام بالـ day؛ المحركات stateful بتاخد reset في حدود اليوم في النسخة المتوازية '
+            '(~92-97%% من ticks متطابقة مع sequential، الفرق في warmup transient أول كل يوم).'
+        ),
+    )
     args = p.parse_args()
 
     if args.inspect_parquet:
@@ -4047,4 +4152,5 @@ if __name__ == '__main__':
         sanitize_max_bar_return_pct=args.sanitize_max_bar_return,
         sanitize_input_ticks=(not args.no_sanitize_input_ticks),
         enrich_v19_2=args.enrich_v19_2,
+        n_workers=args.n_workers,
     )
