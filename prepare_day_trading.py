@@ -2611,15 +2611,17 @@ NEUTRAL_TYPE_LATE_MOVE = 3
 NEUTRAL_TYPE_LOW_EXPECTANCY = 4
 NEUTRAL_TYPE_STOP_FIRST = 5
 NEUTRAL_TYPE_DATA_QUALITY = 6
+NEUTRAL_TYPE_NON_EVENT = 7
 
 NEUTRAL_TYPE_NAMES = {
-    0: 'directional',           # ليس NEUTRAL
+    0: 'directional',           # bias_label = LONG/SHORT (نظيف)
     1: 'no_trade_edge',         # كلا MFE/MAE < 0.5 ATR (لا حركة)
     2: 'ambiguous',             # كلاهما > 0.5 ATR، متقاربان
     3: 'late_move',             # حركة قوية لكن بعد الـ horizon
     4: 'low_expectancy',        # حركة موجودة لكن أصغر من cost
     5: 'stop_first',            # MAE قبل MFE (SL يُضرب أولاً)
     6: 'data_quality_block',    # ATR/data ناقصة
+    7: 'non_event',             # is_event=False (مش مرشح للتداول أصلاً)
 }
 
 
@@ -2724,7 +2726,7 @@ def compute_multitask_label_diagnostics(
     out['net_expectancy_proxy'] = net_exp.astype(np.float32)
 
     # ── neutral_type: تصنيف الـ NEUTRAL لـ 6 فئات ──────────────────────
-    nt = np.zeros(n, dtype=np.int8)  # 0 = directional
+    nt = np.zeros(n, dtype=np.int8)  # 0 = directional (سيبقى فقط للـ LONG/SHORT الحقيقية)
     is_neutral = (bias == 2)
     is_event = (
         out['is_event'].to_numpy().astype(bool) if 'is_event' in out.columns
@@ -2732,8 +2734,11 @@ def compute_multitask_label_diagnostics(
     )
     has_atr = atr > 1e-12
 
+    # non_event NEUTRAL: bars خارج pool التداول → فئة منفصلة (مش "directional")
+    nt[is_neutral & ~is_event] = NEUTRAL_TYPE_NON_EVENT
+
     # data_quality_block: ATR ناقص
-    nt[is_neutral & ~has_atr] = NEUTRAL_TYPE_DATA_QUALITY
+    nt[is_neutral & is_event & ~has_atr] = NEUTRAL_TYPE_DATA_QUALITY
 
     # داخل event-NEUTRAL valid (has_atr) — نصنّف
     valid = is_neutral & is_event & has_atr & (nt == 0)
