@@ -27,6 +27,31 @@ from .data_structures import BarLOB
 from .hierarchical_model import HierarchicalLOBTransformer
 
 
+class _TorchSaveProxy:
+    """Wraps a torch.nn.Module so `.save(path)` mimics Keras `Model.save(path)`.
+
+    Used by DeepLOBCNNAdapter so train_v19.py's `encoder.model.save(path)` line
+    works transparently. All other attribute access forwards to the inner model.
+    """
+
+    def __init__(self, model):
+        # Avoid recursion: store via __dict__ since __setattr__ would forward
+        object.__setattr__(self, '_inner_model', model)
+
+    def save(self, path: str) -> None:
+        # train_v19 passes a .keras path; rewrite to .pt for torch.save.
+        if path.endswith('.keras') or path.endswith('.h5'):
+            path = path.rsplit('.', 1)[0] + '.pt'
+        torch.save(self._inner_model.state_dict(), path)
+
+    def __getattr__(self, name: str):
+        # Called only if attribute not found on proxy itself
+        return getattr(self._inner_model, name)
+
+    def __call__(self, *args, **kwargs):
+        return self._inner_model(*args, **kwargs)
+
+
 class DeepLOBCNNAdapter:
     """Drop-in replacement for `modules.deeplob_cnn.DeepLOBCNN`.
 
@@ -83,6 +108,49 @@ class DeepLOBCNNAdapter:
             self._fitted = False
 
         self.model.to(self.device)
+        # Wrap the torch model so train_v19.py's `encoder.model.save(path)` works.
+        # HierarchicalLOBTransformer uses torch.save; train_v19 expects Keras .save().
+        self.model = _TorchSaveProxy(self.model)
+
+    # ── train_v19.py drop-in compatibility ─────────────────────────────────
+    def get_embeddings(self, lob_tensor: np.ndarray) -> np.ndarray:
+        """Alias for predict() to match DeepLOBCNN/LOBTransformer interface."""
+        return self.predict(lob_tensor)
+
+    def fit_auxiliary(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        *,
+        epochs: int = 20,
+        batch: int = 48,
+        output_dir: str = '.',
+    ) -> dict:
+        """Auxiliary-task fit hook expected by train_v19.stage2_oof_visual_embeddings.
+
+        ⚠️ Inference-only mode: HierarchicalLOBTransformer trains via its
+        7 multi-task heads through modules/deep_lob/training_loop.py — NOT
+        through a single-target auxiliary MSE. When called without a pre-trained
+        checkpoint, we log a warning and skip; embeddings will be from random
+        weights.
+
+        لتدريب الـ Transformer:
+            from modules.deep_lob.training_loop import HierarchicalLOBTrainer
+            trainer = HierarchicalLOBTrainer(model, config, output_dir)
+            trainer.fit(train_loader, val_loader)
+        """
+        import warnings
+        if not self._fitted:
+            warnings.warn(
+                f"DeepLOBCNNAdapter.fit_auxiliary: no pre-trained checkpoint at "
+                f"{self.brain_file}. HierarchicalLOBTransformer trains via "
+                f"multi-task loop, not auxiliary MSE. Skipping fit — embeddings "
+                f"will be from random weights. See modules/deep_lob/training_loop.py.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return {'status': 'skipped_inference_only', 'epochs': 0}
+        return {'status': 'skipped_using_pretrained', 'epochs': 0}
 
     def predict(self, lob_tensor: np.ndarray) -> np.ndarray:
         """Predict 8-dim visual embedding from LOB tensor.

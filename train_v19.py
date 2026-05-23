@@ -68,7 +68,12 @@ from prepare_training_data import (
 VISUAL_EMB_DIM = 8
 VISUAL_MODEL_DEEPLOB = 'deeplob'
 VISUAL_MODEL_LOB_TRANSFORMER = 'lob_transformer'
-SUPPORTED_VISUAL_MODELS = {VISUAL_MODEL_DEEPLOB, VISUAL_MODEL_LOB_TRANSFORMER}
+VISUAL_MODEL_HIERARCHICAL_LOB = 'hierarchical_lob'  # PR #17: modules/deep_lob/
+SUPPORTED_VISUAL_MODELS = {
+    VISUAL_MODEL_DEEPLOB,
+    VISUAL_MODEL_LOB_TRANSFORMER,
+    VISUAL_MODEL_HIERARCHICAL_LOB,
+}
 from modules.config_v19 import load_v19_config
 from modules.decision_policy_v19 import DEFAULT_DECISION_POLICY_ARTIFACT, build_decision_policy
 from modules.dynamic_labels import (
@@ -426,6 +431,8 @@ def _visual_model_artifact_name(model_type: str) -> str:
     model_type = _resolve_visual_model_type(model_type)
     if model_type == VISUAL_MODEL_DEEPLOB:
         return 'deeplob_cnn_v19.keras'
+    if model_type == VISUAL_MODEL_HIERARCHICAL_LOB:
+        return 'hierarchical_lob_transformer_v19.pt'
     return 'lob_transformer_v19.keras'
 
 
@@ -435,6 +442,9 @@ def _load_visual_runtime(model_type: str):
         if resolved == VISUAL_MODEL_DEEPLOB:
             from modules.deeplob_cnn import DeepLOBCNN
             return DeepLOBCNN, True, resolved
+        if resolved == VISUAL_MODEL_HIERARCHICAL_LOB:
+            from modules.deep_lob.integration_adapter import DeepLOBCNNAdapter
+            return DeepLOBCNNAdapter, True, resolved
         from modules.lob_transformer import LOBTransformer
         return LOBTransformer, True, VISUAL_MODEL_LOB_TRANSFORMER
     except ImportError:
