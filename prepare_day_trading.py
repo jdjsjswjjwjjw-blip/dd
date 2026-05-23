@@ -3221,6 +3221,62 @@ def add_fwd_ret_clean_column(
     return out
 
 
+# الأعمدة الـ 12 التي يضيفها _attach_price_cycle_features (4 swing + 5 phase + 3 fractal)
+_PRICE_CYCLE_STRUCTURAL_COLS: tuple[str, ...] = (
+    'cycle_structure_score',     # HH/HL/LH/LL pattern strength ∈ [-1, 1]
+    'cycle_bars_since_swing',    # normalized [0, 1]
+    'cycle_trend_maturity',      # young/mature/exhausted ∈ {0, 0.5, 1}
+    'cycle_momentum_decay',      # 0 = strong momentum, 1 = decayed
+    'cycle_phase_acc_prob',      # P(Accumulation) Wyckoff
+    'cycle_phase_markup_prob',   # P(Markup)
+    'cycle_phase_dist_prob',     # P(Distribution)
+    'cycle_phase_markdown_prob', # P(Markdown)
+    'cycle_position',            # موقع داخل الدورة ∈ [0, 1]
+    'cycle_hurst',               # Hurst exponent (>0.5=trending, <0.5=mean-revert)
+    'cycle_fractal_dim',         # fractal dimension
+    'cycle_mtf_alignment',       # multi-timeframe (1×/4×/16×) alignment
+)
+
+
+def _attach_price_cycle_features(df_bars: pd.DataFrame) -> pd.DataFrame:
+    """يضيف 12 ميزة بنيوية من modules/price_cycle (Wyckoff + swing + fractal).
+
+    يحتاج أعمدة OHLCV في df_bars. كل الميزات سببية (لا look-ahead).
+    """
+    from modules.price_cycle.data_structures import BarSequence
+    from modules.price_cycle.feature_pipeline import build_cycle_features
+
+    required = ('ts_event', 'open', 'high', 'low', 'close', 'volume')
+    missing = [c for c in required if c not in df_bars.columns]
+    if missing:
+        raise KeyError(f"price_cycle: أعمدة مفقودة: {missing}")
+
+    ts_ns = pd.to_datetime(df_bars['ts_event']).astype('datetime64[ns]').astype(np.int64).to_numpy()
+    bars_seq = BarSequence(
+        timestamps_ns=ts_ns,
+        open  = pd.to_numeric(df_bars['open'],   errors='coerce').fillna(0.0).to_numpy(dtype=np.float64),
+        high  = pd.to_numeric(df_bars['high'],   errors='coerce').fillna(0.0).to_numpy(dtype=np.float64),
+        low   = pd.to_numeric(df_bars['low'],    errors='coerce').fillna(0.0).to_numpy(dtype=np.float64),
+        close = pd.to_numeric(df_bars['close'],  errors='coerce').fillna(0.0).to_numpy(dtype=np.float64),
+        volume= pd.to_numeric(df_bars['volume'], errors='coerce').fillna(0.0).to_numpy(dtype=np.float64),
+    )
+
+    feats = build_cycle_features(bars_seq, generate_weak_labels=False)
+    structural = feats.structural_features  # (T, 12)
+    assert structural.shape[1] == len(_PRICE_CYCLE_STRUCTURAL_COLS), (
+        f"price_cycle: expected {len(_PRICE_CYCLE_STRUCTURAL_COLS)} structural "
+        f"features, got {structural.shape[1]}"
+    )
+
+    n_added = 0
+    for i, col in enumerate(_PRICE_CYCLE_STRUCTURAL_COLS):
+        if col not in df_bars.columns:
+            df_bars[col] = structural[:, i].astype(np.float32)
+            n_added += 1
+    print(f"  ✅ +{n_added} cycle structural features (swing + Wyckoff + fractal)")
+    return df_bars
+
+
 def run_day_trading_refinery(
     mbo_dir: str | None,
     mbp_path: str | None,
@@ -3258,6 +3314,8 @@ def run_day_trading_refinery(
     enrich_v19_2: bool = False,
     enrich_v19_2_skip_missing: bool = True,
     n_workers: int | None = None,
+    add_seasonal_features_flag: bool = True,
+    add_cycle_features_flag: bool = True,
 ) -> str:
     """
     Pipeline كاملة: MBO → Day Trading Dataset
@@ -3394,6 +3452,25 @@ def run_day_trading_refinery(
         print("\n🧭 Regime assignment...")
         df_bars = assign_regime_label(df_bars)
         print(f"  ✅ {len(df_bars.columns)} feature")
+
+        # ── Seasonal Map: 21 ميزة موسمية سببية من ts_event ────────────
+        if add_seasonal_features_flag:
+            print("\n🗓️  Seasonal map features...")
+            try:
+                from modules.seasonal_map import add_seasonal_features as _add_seasonal
+                cols_before = len(df_bars.columns)
+                df_bars = _add_seasonal(df_bars, ts_col='ts_event')
+                print(f"  ✅ +{len(df_bars.columns) - cols_before} seasonal features")
+            except Exception as e:
+                print(f"  ⚠️  seasonal_map تجاوزت: {e}")
+
+        # ── Price Cycle (PR #18): 12 ميزة بنيوية (Wyckoff + swing + fractal) ─
+        if add_cycle_features_flag:
+            print("\n🌊 Price cycle structural features...")
+            try:
+                df_bars = _attach_price_cycle_features(df_bars)
+            except Exception as e:
+                print(f"  ⚠️  price_cycle تجاوزت: {e}")
 
         df_bars = _sanitize_bars_extreme_close_returns(df_bars, sanitize_max_bar_return_pct)
 
@@ -4085,6 +4162,23 @@ if __name__ == '__main__':
         ),
     )
     p.add_argument(
+        '--no-seasonal',
+        action='store_true',
+        help=(
+            'يعطّل إضافة الـ 21 ميزة من modules/seasonal_map.py '
+            '(session_phase، dow، month_end، quarter_end، …). افتراضي: مُفعَّل.'
+        ),
+    )
+    p.add_argument(
+        '--no-cycle-features',
+        action='store_true',
+        help=(
+            'يعطّل إضافة الـ 12 ميزة بنيوية من modules/price_cycle (PR #18): '
+            'Wyckoff phases + swing structure + Hurst + fractal alignment. '
+            'افتراضي: مُفعَّل.'
+        ),
+    )
+    p.add_argument(
         '--n-workers',
         type=int,
         default=None,
@@ -4153,4 +4247,6 @@ if __name__ == '__main__':
         sanitize_input_ticks=(not args.no_sanitize_input_ticks),
         enrich_v19_2=args.enrich_v19_2,
         n_workers=args.n_workers,
+        add_seasonal_features_flag=(not args.no_seasonal),
+        add_cycle_features_flag=(not args.no_cycle_features),
     )
