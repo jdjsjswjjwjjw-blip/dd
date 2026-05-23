@@ -62,26 +62,32 @@ from .fractal_features import (
     multi_timeframe_alignment,
     compute_fractal_features,
 )
-from .cycle_encoder import (
-    CycleEncoder,
-    TCNEncoder,
-    TemporalBlock,
-    CausalConv1d,
-)
-from .cycle_model import (
-    PriceCycleModel,
-    CycleHeads,
-    CycleOutput,
-    CycleTargets,
-)
-from .multi_scale_fusion import (
-    MultiScaleFusion,
-    MultiScaleTradingSystem,
-    FusionOutput,
-    CrossAttentionFusion,
-    GatingFusion,
-    ConcatFusion,
-)
+# ── torch-dependent modules: lazy import to allow feature-only usage بدون PyTorch
+try:
+    from .cycle_encoder import (
+        CycleEncoder,
+        TCNEncoder,
+        TemporalBlock,
+        CausalConv1d,
+    )
+    from .cycle_model import (
+        PriceCycleModel,
+        CycleHeads,
+        CycleOutput,
+        CycleTargets,
+    )
+    from .multi_scale_fusion import (
+        MultiScaleFusion,
+        MultiScaleTradingSystem,
+        FusionOutput,
+        CrossAttentionFusion,
+        GatingFusion,
+        ConcatFusion,
+    )
+    _TORCH_AVAILABLE = True
+except ImportError:
+    # PyTorch not installed — deep cycle models unavailable but feature_pipeline works
+    _TORCH_AVAILABLE = False
 from .feature_pipeline import (
     CycleFeatureSet,
     build_cycle_features,

@@ -3324,6 +3324,8 @@ def run_day_trading_refinery(
     n_workers: int | None = None,
     add_seasonal_features_flag: bool = True,
     add_cycle_features_flag: bool = True,
+    timeout_mfe_mae_ratio: float = 2.0,
+    timeout_mfe_min_move_atr: float = 1.0,
 ) -> str:
     """
     Pipeline كاملة: MBO → Day Trading Dataset
@@ -3512,6 +3514,7 @@ def run_day_trading_refinery(
     print(f"\n🏷️  بناء Labels — First Barrier Hit — regime + event_score tiers (إن فُعّلت)...")
     print(f"   TP/SL per regime: {REGIME_TP_SL}")
     print(f"   Max bars per regime: {REGIME_MAX_BARS}")
+    print(f"   Sprint 19 MFE/MAE: ratio={timeout_mfe_mae_ratio}, min_move_atr={timeout_mfe_min_move_atr}")
     df_labeled = label_by_outcome(
         df_bars,
         default_tp_mult=tp_atr_mult,
@@ -3523,6 +3526,8 @@ def run_day_trading_refinery(
         sl_to_opposite=sl_to_opposite,
         include_weak_directional_in_train=include_weak_directional_in_train,
         use_event_score_tier_labels=event_score_tier_labels,
+        timeout_mfe_mae_ratio=timeout_mfe_mae_ratio,
+        timeout_mfe_min_move_atr=timeout_mfe_min_move_atr,
     )
 
     # توافق backward: أضف label_end_ts إذا لم توجد
@@ -4170,6 +4175,26 @@ if __name__ == '__main__':
         ),
     )
     p.add_argument(
+        '--timeout-mfe-mae-ratio',
+        type=float,
+        default=2.0,
+        help=(
+            'Sprint 19: MFE/MAE ratio لاتخاذ قرار اتجاهي في حالات timeout/SL. '
+            'الافتراضي=2.0 (الفائز يجب أن يكون ضعف الخاسر). '
+            'لبيانات low volatility، جرّب 1.3-1.5 لرفع directional yield.'
+        ),
+    )
+    p.add_argument(
+        '--timeout-mfe-min-move-atr',
+        type=float,
+        default=1.0,
+        help=(
+            'Sprint 19: الحد الأدنى لحركة MFE/MAE بوحدة ATR. الافتراضي=1.0. '
+            'لبيانات low volatility (مثل 6B في فترات هادئة)، جرّب 0.3-0.5 '
+            'لرفع directional labels من ~2%% إلى ~30-50%%.'
+        ),
+    )
+    p.add_argument(
         '--no-seasonal',
         action='store_true',
         help=(
@@ -4257,4 +4282,6 @@ if __name__ == '__main__':
         n_workers=args.n_workers,
         add_seasonal_features_flag=(not args.no_seasonal),
         add_cycle_features_flag=(not args.no_cycle_features),
+        timeout_mfe_mae_ratio=args.timeout_mfe_mae_ratio,
+        timeout_mfe_min_move_atr=args.timeout_mfe_min_move_atr,
     )
