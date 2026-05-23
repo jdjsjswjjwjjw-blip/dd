@@ -2593,6 +2593,214 @@ def label_by_outcome(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Multi-task Label Diagnostics (Phase 1 — Plan الجديدة)
+# ══════════════════════════════════════════════════════════════════════════════
+# يضيف أعمدة تشخيصية بعد label_by_outcome دون كسر backward compat.
+# الهدف: تفصيل سبب NEUTRAL إلى 6 فئات + إضافة tradability_label منفصل
+# عن direction، عشان يُدرَّب multi-head MetaLearner لاحقاً.
+#
+# Cost defaults معايرة لـ 6B (British Pound futures):
+DEFAULT_SPREAD_TICKS = 2.0        # bid-ask spread (~1-2 ticks for 6B)
+DEFAULT_TICK_SIZE = 0.0001        # 0.0001 USD per tick
+DEFAULT_FEES_ATR_PROXY = 0.15     # fees as fraction of ATR (proxy)
+
+NEUTRAL_TYPE_NONE = 0
+NEUTRAL_TYPE_NO_TRADE_EDGE = 1
+NEUTRAL_TYPE_AMBIGUOUS = 2
+NEUTRAL_TYPE_LATE_MOVE = 3
+NEUTRAL_TYPE_LOW_EXPECTANCY = 4
+NEUTRAL_TYPE_STOP_FIRST = 5
+NEUTRAL_TYPE_DATA_QUALITY = 6
+
+NEUTRAL_TYPE_NAMES = {
+    0: 'directional',           # ليس NEUTRAL
+    1: 'no_trade_edge',         # كلا MFE/MAE < 0.5 ATR (لا حركة)
+    2: 'ambiguous',             # كلاهما > 0.5 ATR، متقاربان
+    3: 'late_move',             # حركة قوية لكن بعد الـ horizon
+    4: 'low_expectancy',        # حركة موجودة لكن أصغر من cost
+    5: 'stop_first',            # MAE قبل MFE (SL يُضرب أولاً)
+    6: 'data_quality_block',    # ATR/data ناقصة
+}
+
+
+def compute_multitask_label_diagnostics(
+    df: pd.DataFrame,
+    *,
+    horizon_bars: int = 24,
+    spread_ticks: float = DEFAULT_SPREAD_TICKS,
+    tick_size: float = DEFAULT_TICK_SIZE,
+    fees_atr_proxy: float = DEFAULT_FEES_ATR_PROXY,
+) -> pd.DataFrame:
+    """يضيف diagnostic columns للـ multi-task training (Phase 1 من Multi-task Plan).
+
+    الأعمدة المُضافة (10 أعمدة):
+        mfe, mae                : extremes الخامة بـ price units
+        mfe_atr, mae_atr        : normalized بـ ATR
+        time_to_first_touch     : عدد bars حتى أول touch لـ 0.5 ATR
+        stop_first_flag         : 1 لو MAE > 1 ATR قبل MFE > 1 ATR
+        net_expectancy_proxy    : net expected gain بعد spread+fees (in ATR units)
+        neutral_type            : سبب الـ NEUTRAL (6 فئات + 0 للـ directional)
+        tradability_label       : 0/1 — صف نظيف للتداول
+        market_state_label      : 5-class causal (مأخوذ من regime_label الموجود)
+
+    الـ tradability_label = 1 يعني:
+        bias_label ∈ {LONG, SHORT}
+        AND net_expectancy_proxy > 0 (profitable بعد costs)
+        AND stop_first_flag == 0 (لم يُضرب SL قبل TP)
+    """
+    out = df.copy()
+    n = len(out)
+
+    if 'close' not in out.columns:
+        print("  ⚠️  multitask_diagnostics: 'close' مفقود — skip")
+        return out
+
+    close = pd.to_numeric(out['close'], errors='coerce').to_numpy(dtype=np.float64)
+    atr_col = 'atr_14' if 'atr_14' in out.columns else ('atr' if 'atr' in out.columns else None)
+    if atr_col is None:
+        print("  ⚠️  multitask_diagnostics: 'atr_14'/'atr' مفقود — skip")
+        return out
+    atr = pd.to_numeric(out[atr_col], errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
+
+    # ── حساب MFE/MAE + sequence-aware (stop_first) ──────────────────────
+    mfe = np.zeros(n, dtype=np.float64)
+    mae = np.zeros(n, dtype=np.float64)
+    mfe_atr_arr = np.zeros(n, dtype=np.float64)
+    mae_atr_arr = np.zeros(n, dtype=np.float64)
+    time_to_touch = np.zeros(n, dtype=np.int32)
+    stop_first = np.zeros(n, dtype=np.int8)
+
+    for i in range(n):
+        end = min(i + horizon_bars + 1, n)
+        if end <= i + 1 or atr[i] <= 1e-12:
+            continue
+        win = close[i + 1: end] - close[i]
+        if win.size == 0:
+            continue
+        mfe_i = max(0.0, float(np.max(win)))
+        mae_i = max(0.0, float(-np.min(win)))
+        mfe[i] = mfe_i
+        mae[i] = mae_i
+        mfe_atr_arr[i] = mfe_i / atr[i]
+        mae_atr_arr[i] = mae_i / atr[i]
+
+        # stop_first: المسار يضرب SL (1 ATR) قبل TP (1 ATR)
+        atr_i = atr[i]
+        tp_idx = int(np.argmax(win >= atr_i)) if (win >= atr_i).any() else -1
+        sl_idx = int(np.argmax(win <= -atr_i)) if (win <= -atr_i).any() else -1
+        if sl_idx >= 0 and (tp_idx < 0 or sl_idx < tp_idx):
+            stop_first[i] = 1
+
+        # time_to_first_touch: أول touch لـ 0.5 ATR (أي اتجاه)
+        threshold = 0.5 * atr[i]
+        hit_mask = np.abs(win) >= threshold
+        if hit_mask.any():
+            time_to_touch[i] = int(np.argmax(hit_mask)) + 1
+
+    out['mfe'] = mfe.astype(np.float32)
+    out['mae'] = mae.astype(np.float32)
+    out['mfe_atr'] = mfe_atr_arr.astype(np.float32)
+    out['mae_atr'] = mae_atr_arr.astype(np.float32)
+    out['time_to_first_touch'] = time_to_touch
+    out['stop_first_flag'] = stop_first
+
+    # ── net_expectancy_proxy: gain بعد spread + fees ──────────────────
+    cost_atr = float(fees_atr_proxy) + np.where(
+        atr > 1e-12,
+        spread_ticks * tick_size / np.maximum(atr, 1e-12),
+        0.0,
+    )
+    bias = (
+        out['bias_label'].to_numpy() if 'bias_label' in out.columns
+        else np.full(n, 2, dtype=np.int8)
+    )
+    net_exp = np.where(
+        bias == 0, mfe_atr_arr - cost_atr,
+        np.where(
+            bias == 1, mae_atr_arr - cost_atr,
+            np.maximum(mfe_atr_arr, mae_atr_arr) - cost_atr,
+        ),
+    )
+    out['net_expectancy_proxy'] = net_exp.astype(np.float32)
+
+    # ── neutral_type: تصنيف الـ NEUTRAL لـ 6 فئات ──────────────────────
+    nt = np.zeros(n, dtype=np.int8)  # 0 = directional
+    is_neutral = (bias == 2)
+    is_event = (
+        out['is_event'].to_numpy().astype(bool) if 'is_event' in out.columns
+        else np.ones(n, dtype=bool)
+    )
+    has_atr = atr > 1e-12
+
+    # data_quality_block: ATR ناقص
+    nt[is_neutral & ~has_atr] = NEUTRAL_TYPE_DATA_QUALITY
+
+    # داخل event-NEUTRAL valid (has_atr) — نصنّف
+    valid = is_neutral & is_event & has_atr & (nt == 0)
+    small = 0.5
+    cond_edge = valid & (mfe_atr_arr < small) & (mae_atr_arr < small)
+    nt[cond_edge] = NEUTRAL_TYPE_NO_TRADE_EDGE
+    cond_stop = valid & (nt == 0) & (stop_first == 1)
+    nt[cond_stop] = NEUTRAL_TYPE_STOP_FIRST
+    cond_low_exp = valid & (nt == 0) & (mfe_atr_arr >= small) & (net_exp < 0)
+    nt[cond_low_exp] = NEUTRAL_TYPE_LOW_EXPECTANCY
+    cond_late = valid & (nt == 0) & (mfe_atr_arr > 2.0) & (time_to_touch > int(horizon_bars * 0.7))
+    nt[cond_late] = NEUTRAL_TYPE_LATE_MOVE
+    cond_amb = valid & (nt == 0) & (mfe_atr_arr > small) & (mae_atr_arr > small)
+    nt[cond_amb] = NEUTRAL_TYPE_AMBIGUOUS
+    # fallback: أي NEUTRAL باقي → ambiguous
+    nt[valid & (nt == 0)] = NEUTRAL_TYPE_AMBIGUOUS
+
+    out['neutral_type'] = nt
+
+    # ── tradability_label: clean trade indicator ─────────────────────
+    is_directional = (bias == 0) | (bias == 1)
+    is_profitable = net_exp > 0
+    is_clean = stop_first == 0
+    out['tradability_label'] = (is_directional & is_profitable & is_clean).astype(np.int8)
+
+    # ── market_state_label: 5-class (mapped من regime_label الموجود) ──
+    # Mapping:
+    #   trending      → 'trend'
+    #   ranging       → 'chop'
+    #   volatile      → 'volatile'
+    #   low_liquidity → 'liquidity_vacuum'
+    #   (mean_reversion سيُضاف لاحقاً عبر classifier منفصل)
+    regime_to_state = {
+        'trending': 'trend',
+        'ranging': 'chop',
+        'volatile': 'volatile',
+        'low_liquidity': 'liquidity_vacuum',
+    }
+    if 'regime_label' in out.columns:
+        out['market_state_label'] = out['regime_label'].astype(str).map(regime_to_state).fillna('chop')
+        state_codes = {'trend': 0, 'chop': 1, 'volatile': 2, 'liquidity_vacuum': 3, 'mean_reversion': 4}
+        out['market_state_code'] = out['market_state_label'].map(state_codes).fillna(1).astype(np.int8)
+
+    # ── Diagnostics print ────────────────────────────────────────────
+    print("\n📊 Multi-task Diagnostics:")
+    print("─" * 60)
+    if 'tradability_label' in out.columns:
+        trad = int(out['tradability_label'].sum())
+        print(f"  tradability_label = 1: {trad:,} ({trad/n*100:.1f}%)")
+    nt_counts = pd.Series(nt).value_counts().sort_index()
+    print(f"  neutral_type distribution:")
+    for code, name in NEUTRAL_TYPE_NAMES.items():
+        cnt = int(nt_counts.get(code, 0))
+        if cnt > 0:
+            print(f"    {name:22s}: {cnt:>6,} ({cnt/n*100:5.1f}%)")
+    print(f"  MFE in ATR units: median={np.median(mfe_atr_arr[mfe_atr_arr>0]):.2f}, "
+          f"p90={np.percentile(mfe_atr_arr[mfe_atr_arr>0], 90):.2f}")
+    print(f"  stop_first events: {int(stop_first.sum()):,} "
+          f"({stop_first.sum()/n*100:.1f}%)")
+    print(f"  net_expectancy_proxy > 0: {int((net_exp > 0).sum()):,} "
+          f"({(net_exp > 0).sum()/n*100:.1f}%)")
+    print("─" * 60)
+
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # STEP 3: Day Trading Labels
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3338,6 +3546,7 @@ def run_day_trading_refinery(
     timeout_mfe_mae_ratio: float = 2.0,
     timeout_mfe_min_move_atr: float = 1.0,
     ignore_event_direction_veto: bool = False,
+    add_multitask_diagnostics: bool = True,
 ) -> str:
     """
     Pipeline كاملة: MBO → Day Trading Dataset
@@ -3562,6 +3771,16 @@ def run_day_trading_refinery(
         f"  ✅ Labels: {label_dist} | event_flag={event_strict:.1%} | "
         f"train_pool={train_pool:.1%} | LONG/SHORT ratio≈{imb:.2f}:1"
     )
+
+    # ── 4.5 Multi-task Diagnostics (Phase 1 من Multi-task Plan) ────────
+    # يضيف 10 أعمدة جديدة بدون كسر الـ bias_label القديم:
+    #   mfe/mae/mfe_atr/mae_atr/time_to_first_touch/stop_first_flag
+    #   net_expectancy_proxy/neutral_type/tradability_label/market_state_label
+    if add_multitask_diagnostics:
+        df_labeled = compute_multitask_label_diagnostics(
+            df_labeled,
+            horizon_bars=int(horizon_bars * 4),  # نافذة أوسع للتشخيص
+        )
 
     # ── 5. Soft Labels ────────────────────────────────────────────
     print("\n🧪 إرفاق Soft Labels...")
@@ -4220,6 +4439,16 @@ if __name__ == '__main__':
         ),
     )
     p.add_argument(
+        '--no-multitask-diagnostics',
+        action='store_true',
+        help=(
+            'يعطّل Multi-task diagnostic columns (Phase 1 من Multi-task Plan). '
+            'الافتراضي: مُفعَّل — يضيف 10 أعمدة (mfe/mae/tradability_label/'
+            'neutral_type/market_state_label/net_expectancy_proxy/...) بدون كسر '
+            'bias_label القديم. تُستخدم في Phase 2 لتدريب multi-head MetaLearner.'
+        ),
+    )
+    p.add_argument(
         '--no-seasonal',
         action='store_true',
         help=(
@@ -4310,4 +4539,5 @@ if __name__ == '__main__':
         timeout_mfe_mae_ratio=args.timeout_mfe_mae_ratio,
         timeout_mfe_min_move_atr=args.timeout_mfe_min_move_atr,
         ignore_event_direction_veto=args.ignore_event_direction_veto,
+        add_multitask_diagnostics=(not args.no_multitask_diagnostics),
     )
