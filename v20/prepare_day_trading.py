@@ -2231,9 +2231,15 @@ def label_by_outcome(
     timeout_mfe_mae: bool = True,
     timeout_mfe_mae_ratio: float = 2.0,
     timeout_mfe_min_move_atr: float = 1.0,
+    ignore_event_direction_veto: bool = False,
 ) -> pd.DataFrame:
     """
     يلصق الليبل بناءً على أول حاجز يُضرب (First Barrier Hit).
+
+    ignore_event_direction_veto: إذا True، يلغى فيتو event_direction (و Kalman أمبيغوس)
+    على قرار MFE/MAE. على real data، event_direction voting (CVD+OBI+Kalman) قد يخطئ
+    بنسبة عالية → الـ veto يُسقط directional signal حقيقي. التشغيل بـ ignore=True يستخدم
+    raw MFE/MAE فقط؛ event_direction يبقى متاح كـ feature column للنموذج.
 
     الفروق الجوهرية عن build_day_trading_labels:
         1. يعمل على events فقط (is_event == 1) → كفاءة حسابية
@@ -2382,15 +2388,20 @@ def label_by_outcome(
         event_dir_i = int(event_dir_arr[i])
         allow_long = True
         allow_short = True
-        if event_dir_i > 0:
-            allow_short = False
-        elif event_dir_i < 0:
-            allow_long = False
-        else:
-            if kalman_dir_i == 1 and event_score_i < float(kalman_event_floor):
+        # event_direction veto: مُعطّل افتراضياً عند ignore_event_direction_veto=True
+        # السبب: على real data أثبت الـ diagnostic إن event_direction voting (CVD+OBI+Kalman)
+        # غلط ~70% من الحالات → الـ veto يضيع 60%+ من الـ directional signal الحقيقي.
+        # event_direction يبقى متاح كـ feature column للنموذج يتعلم منه بدل ما يكون veto صلب.
+        if not ignore_event_direction_veto:
+            if event_dir_i > 0:
                 allow_short = False
-            elif kalman_dir_i == -1 and event_score_i < float(kalman_event_floor):
+            elif event_dir_i < 0:
                 allow_long = False
+            else:
+                if kalman_dir_i == 1 and event_score_i < float(kalman_event_floor):
+                    allow_short = False
+                elif kalman_dir_i == -1 and event_score_i < float(kalman_event_floor):
+                    allow_long = False
 
         tp_dist = tp_mult * atr_i
         sl_dist = sl_mult * atr_i
@@ -3326,6 +3337,7 @@ def run_day_trading_refinery(
     add_cycle_features_flag: bool = True,
     timeout_mfe_mae_ratio: float = 2.0,
     timeout_mfe_min_move_atr: float = 1.0,
+    ignore_event_direction_veto: bool = False,
 ) -> str:
     """
     Pipeline كاملة: MBO → Day Trading Dataset
@@ -3515,6 +3527,7 @@ def run_day_trading_refinery(
     print(f"   TP/SL per regime: {REGIME_TP_SL}")
     print(f"   Max bars per regime: {REGIME_MAX_BARS}")
     print(f"   Sprint 19 MFE/MAE: ratio={timeout_mfe_mae_ratio}, min_move_atr={timeout_mfe_min_move_atr}")
+    print(f"   event_direction veto: {'DISABLED (raw MFE/MAE)' if ignore_event_direction_veto else 'enabled'}")
     df_labeled = label_by_outcome(
         df_bars,
         default_tp_mult=tp_atr_mult,
@@ -3528,6 +3541,7 @@ def run_day_trading_refinery(
         use_event_score_tier_labels=event_score_tier_labels,
         timeout_mfe_mae_ratio=timeout_mfe_mae_ratio,
         timeout_mfe_min_move_atr=timeout_mfe_min_move_atr,
+        ignore_event_direction_veto=ignore_event_direction_veto,
     )
 
     # توافق backward: أضف label_end_ts إذا لم توجد
@@ -4195,6 +4209,17 @@ if __name__ == '__main__':
         ),
     )
     p.add_argument(
+        '--ignore-event-direction-veto',
+        action='store_true',
+        help=(
+            'يلغي فيتو event_direction على قرار MFE/MAE في labeling. '
+            'على real data، إذا كان event_direction voting (CVD+OBI+Kalman) ضعيف '
+            'الدقة، الـ veto يُسقط directional signal حقيقي ويرفع NEUTRAL لـ 97%%. '
+            'استخدم هذا الـ flag لاستخراج اللعنة من البيانات بالاعتماد على MFE/MAE فقط؛ '
+            'event_direction يبقى متاح كـ feature column للنموذج.'
+        ),
+    )
+    p.add_argument(
         '--no-seasonal',
         action='store_true',
         help=(
@@ -4284,4 +4309,5 @@ if __name__ == '__main__':
         add_cycle_features_flag=(not args.no_cycle_features),
         timeout_mfe_mae_ratio=args.timeout_mfe_mae_ratio,
         timeout_mfe_min_move_atr=args.timeout_mfe_min_move_atr,
+        ignore_event_direction_veto=args.ignore_event_direction_veto,
     )
