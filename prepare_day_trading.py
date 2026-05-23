@@ -378,26 +378,35 @@ def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
     last_vwap = 0.0
     last_vwap_z = 0.0
     last_sess_cvd = 0.0
-    last_day = None
+    last_day_idx = -1
+
+    # ── Cache numpy arrays + precompute ts/day vectorized (يلغي pandas .at overhead في loop)
+    _price_arr = out['price'].to_numpy(dtype=np.float64)
+    _size_arr = out['size'].to_numpy(dtype=np.float64)
+    _action_arr = np.asarray([s.strip().upper() for s in action_s.astype(str).to_numpy()], dtype=object)
+    _side_arr = np.asarray([s.strip().upper() for s in side_s.astype(str).to_numpy()], dtype=object)
+    _oid_arr = order_ids.to_numpy() if hasattr(order_ids, 'to_numpy') else np.asarray(order_ids)
+    _ts_dt = pd.to_datetime(out['ts_event'].to_numpy())  # tz-naive after dt.tz_localize(None) above
+    _ts_ns_arr = _ts_dt.astype('datetime64[ns]').astype(np.int64)
+    # Day boundary as integer day-since-epoch (vectorized عوض ts.date() per iter)
+    _day_idx_arr = (_ts_ns_arr // (86_400 * 1_000_000_000)).astype(np.int64)
+    _ts_pd_arr = pd.DatetimeIndex(_ts_dt)  # for vwap.update(ts, …) calls — still need pd.Timestamp
 
     for i in range(n):
-        px = float(out.at[i, 'price'])
-        sz = float(out.at[i, 'size'])
-        act = str(action_s.iat[i]).strip().upper()
-        sd = str(side_s.iat[i]).strip().upper()
-        oid = order_ids.iat[i]
-        ts = pd.Timestamp(out.at[i, 'ts_event'])
-        if ts.tzinfo is not None:
-            ts = ts.tz_convert(None)
-        day = ts.date()
-        if last_day is None:
-            last_day = day
-        elif day != last_day:
+        px = _price_arr[i]
+        sz = _size_arr[i]
+        act = _action_arr[i]
+        sd = _side_arr[i]
+        oid = _oid_arr[i]
+        day_idx = _day_idx_arr[i]
+        if last_day_idx == -1:
+            last_day_idx = day_idx
+        elif day_idx != last_day_idx:
             # Keep CVD session-local instead of carrying net month bias across days.
             cvd = 0.0
             last_sess_cvd = 0.0
-            last_day = day
-        ts_ns = int(ts.value)
+            last_day_idx = day_idx
+        ts_ns = int(_ts_ns_arr[i])
 
         spoof_arr[i] = float(micro.process_mbo_tick(act, oid, sd, sz, px, ts_ns))
         cr = float(cancel.process_tick(act, oid, sz))
@@ -432,7 +441,7 @@ def enrich_mbo_with_core_microstructure(df_mbo: pd.DataFrame) -> pd.DataFrame:
             else:
                 vnet_side = sd
             last_vnet = float(vnet.update(px, sz, vnet_side))
-            last_vwap, last_vwap_z, _, last_sess_cvd = vwap.update(ts, px, float(sz), bool(is_buy))
+            last_vwap, last_vwap_z, _, last_sess_cvd = vwap.update(_ts_pd_arr[i], px, float(sz), bool(is_buy))
 
         cvd_arr[i] = cvd
         sess_cvd_arr[i] = float(last_sess_cvd)
@@ -1056,10 +1065,13 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = DAY_TRADE_DEFAULT_BA
         signed[(is_trade & is_buy).to_numpy()] = size_s[(is_trade & is_buy)].to_numpy(dtype=np.float64)
         signed[(is_trade & is_sell).to_numpy()] = -size_s[(is_trade & is_sell)].to_numpy(dtype=np.float64)
         tick_cvd = pd.Series(signed, index=df.index, dtype=np.float64).cumsum()
-    bars['cvd'] = tick_cvd.resample(freq).last().reindex(bars.index).ffill().fillna(0.0)
-    bars['bar_cvd_delta'] = tick_cvd.resample(freq).agg(
-        lambda x: float(x.iloc[-1] - x.iloc[0]) if len(x) > 1 else 0.0,
-    ).reindex(bars.index).fillna(0.0)
+    _cvd_rs = tick_cvd.resample(freq)
+    _cvd_last = _cvd_rs.last()
+    _cvd_first = _cvd_rs.first()
+    _cvd_count = _cvd_rs.count()
+    bars['cvd'] = _cvd_last.reindex(bars.index).ffill().fillna(0.0)
+    _delta_full = (_cvd_last - _cvd_first).where(_cvd_count > 1, 0.0).fillna(0.0)
+    bars['bar_cvd_delta'] = _delta_full.reindex(bars.index).fillna(0.0)
     if 'session_cvd' in df.columns:
         bars['session_cvd'] = _resample_num('session_cvd', 'last', 0.0)
     else:
@@ -1199,24 +1211,32 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = DAY_TRADE_DEFAULT_BA
             bars['buy_ratio'] = ((ofi_proxy + 1.0) * 0.5).clip(0.0, 1.0).astype(np.float32)
 
     # ── Velocity / micro-dynamics داخل الشمعة (MBO ticks) ───────────────
-    bars['cvd_velocity'] = tick_cvd.resample(freq).apply(
-        lambda x: float(x.iloc[-1] - x.iloc[0]) / max(len(x), 1) if len(x) > 1 else 0.0,
-    ).fillna(0.0)
+    _cnt_safe = _cvd_count.replace(0, 1)
+    _velocity_full = (_delta_full / _cnt_safe).where(_cvd_count > 1, 0.0).fillna(0.0)
+    bars['cvd_velocity'] = _velocity_full.reindex(bars.index).fillna(0.0)
     bar_d = pd.to_numeric(bars.get('bar_cvd_delta', 0.0), errors='coerce').fillna(0.0)
     bars['cvd_net_direction'] = np.sign(
         bar_d.to_numpy(dtype=np.float64),
     ).astype(np.int8)
 
-    def _count_reversals(series: pd.Series) -> float:
-        vals = pd.to_numeric(series, errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
-        if vals.size < 2:
-            return 0.0
-        signs = np.sign(vals)
-        return float(np.sum(np.diff(signs.astype(np.float64)) != 0))
-
     tick_ct = bars['tick_count'].clip(lower=1)
     if 'obi' in df.columns:
-        bars['imb_reversals'] = df['obi'].resample(freq).apply(_count_reversals).fillna(0.0)
+        # Vectorized: sign-change events per bar via groupby، بدل Python lambda لكل bar
+        _obi_vals = pd.to_numeric(df['obi'], errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
+        if _obi_vals.size >= 2:
+            _signs = np.sign(_obi_vals)
+            _sign_change = np.zeros(_obi_vals.size, dtype=np.int64)
+            _sign_change[1:] = (np.diff(_signs) != 0).astype(np.int64)
+            # Mask sign changes that cross bar boundaries (don't count them)
+            _grp_key = df.index.floor(freq)
+            _new_bar = np.zeros(len(_grp_key), dtype=bool)
+            _new_bar[0] = True
+            _new_bar[1:] = _grp_key[1:] != _grp_key[:-1]
+            _sign_change[_new_bar] = 0
+            _rev_series = pd.Series(_sign_change, index=df.index).resample(freq).sum()
+            bars['imb_reversals'] = _rev_series.reindex(bars.index).fillna(0.0).astype(np.float64)
+        else:
+            bars['imb_reversals'] = 0.0
     else:
         bars['imb_reversals'] = 0.0
     obi_base = pd.to_numeric(
@@ -1829,28 +1849,40 @@ def build_rolling_lob_tensors_mbo_only(
     df_mbo = df_mbo.copy()
     df_mbo['ts_event'] = pd.to_datetime(df_mbo['ts_event'])
     df_mbo['bar_key'] = df_mbo['ts_event'].dt.floor(freq)
-    tick_med = max(float(pd.to_numeric(df_mbo.get('size', 0), errors='coerce').median() or 1.0), 1e-6)
+    size_num = pd.to_numeric(df_mbo.get('size', 0), errors='coerce').fillna(0.0)
+    df_mbo['_size_num'] = size_num
+    tick_med = max(float(size_num.median() or 1.0), 1e-6)
 
     bars = df_bars.sort_values('ts_event').reset_index(drop=True)
     n_bars = len(bars)
     T = int(max(lookback_bars, 1))
 
-    feats: list[tuple[float, float, float] | None] = []
-    ts_bar = bars['ts_event'].to_numpy()
+    # ── O(bars × ticks) → O(ticks): pre-aggregate once via groupby، ثم alignment vectorized
+    side_a = df_mbo['side'].astype(str).str.upper().eq('A')
+    side_b = df_mbo['side'].astype(str).str.upper().eq('B')
+    action_t = df_mbo['action'].astype(str).str.upper().eq('T')
+    tick_count_g = df_mbo.groupby('bar_key').size()
+    buy_vol_g  = df_mbo.loc[side_a, ['bar_key', '_size_num']].groupby('bar_key')['_size_num'].sum()
+    sell_vol_g = df_mbo.loc[side_b, ['bar_key', '_size_num']].groupby('bar_key')['_size_num'].sum()
+    buy_t_g    = df_mbo.loc[side_a & action_t, ['bar_key', '_size_num']].groupby('bar_key')['_size_num'].sum()
+    sell_t_g   = df_mbo.loc[side_b & action_t, ['bar_key', '_size_num']].groupby('bar_key')['_size_num'].sum()
 
-    for bi in range(n_bars):
-        bar_time = pd.Timestamp(ts_bar[bi]).floor(freq)
-        sub = df_mbo[df_mbo['bar_key'] == bar_time]
-        if sub.empty:
-            feats.append(None)
-            continue
-        buy_vol = float(sub.loc[sub['side'] == 'A', 'size'].sum())
-        sell_vol = float(sub.loc[sub['side'] == 'B', 'size'].sum())
-        tot_v = buy_vol + sell_vol
-        imb = (buy_vol - sell_vol) / max(tot_v, 1.0)
-        buy_t = float(sub[(sub['side'] == 'A') & (sub['action'] == 'T')]['size'].sum())
-        sell_t = float(sub[(sub['side'] == 'B') & (sub['action'] == 'T')]['size'].sum())
-        feats.append((imb, buy_t / tick_med, sell_t / tick_med))
+    ts_bar = bars['ts_event'].to_numpy()
+    ts_bar_floored = pd.to_datetime(ts_bar).floor(freq)
+    has_ticks = tick_count_g.reindex(ts_bar_floored).fillna(0).to_numpy() > 0
+    bv = buy_vol_g.reindex(ts_bar_floored).fillna(0.0).to_numpy(dtype=np.float64)
+    sv = sell_vol_g.reindex(ts_bar_floored).fillna(0.0).to_numpy(dtype=np.float64)
+    bt = buy_t_g.reindex(ts_bar_floored).fillna(0.0).to_numpy(dtype=np.float64)
+    st = sell_t_g.reindex(ts_bar_floored).fillna(0.0).to_numpy(dtype=np.float64)
+    tot_v = bv + sv
+    imb_arr = (bv - sv) / np.maximum(tot_v, 1.0)
+    c1_arr = bt / tick_med
+    c2_arr = st / tick_med
+
+    feats: list[tuple[float, float, float] | None] = [
+        (float(imb_arr[i]), float(c1_arr[i]), float(c2_arr[i])) if bool(has_ticks[i]) else None
+        for i in range(n_bars)
+    ]
 
     tensors = np.zeros((n_bars, T, n_levels, 3), dtype=np.float32)
     timestamps = bars['ts_event'].to_numpy(dtype='datetime64[ns]', copy=False)
