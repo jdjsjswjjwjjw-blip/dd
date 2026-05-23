@@ -8,7 +8,7 @@ Forces the backbone to learn deep market structure by predicting:
     - next_price (regression, log-return)
     - next_imbalance (regression, [-1, 1])
     - next_volatility (regression, ATR-relative)
-    - next_regime (3-way classification)
+    - next_regime (4-way classification: matches regime_config.REGIMES order)
     - wall_persist (regression, bars until wall consumed)
     - time_to_event (regression, bars until next significant event)
 
@@ -43,7 +43,7 @@ class MultiTaskOutput:
     next_price: torch.Tensor             # (B,) - log-return
     next_imbalance: torch.Tensor         # (B,) - signed
     next_volatility: torch.Tensor        # (B,) - log ATR or relative
-    next_regime_logits: torch.Tensor     # (B, 3)
+    next_regime_logits: torch.Tensor     # (B, 4)  — trending/ranging/volatile/low_liquidity
     wall_persist: torch.Tensor           # (B,) - bars
     time_to_event: torch.Tensor          # (B,) - bars
     shared_embedding: torch.Tensor       # (B, shared_dim) - useful للـ downstream
@@ -80,7 +80,7 @@ class MultiTaskTargets:
     next_price: Optional[torch.Tensor] = None     # (B,) float
     next_imbalance: Optional[torch.Tensor] = None # (B,) float in [-1, 1]
     next_volatility: Optional[torch.Tensor] = None# (B,) float (positive)
-    next_regime: Optional[torch.Tensor] = None    # (B,) int — 0/1/2
+    next_regime: Optional[torch.Tensor] = None    # (B,) int — 0=trending, 1=ranging, 2=volatile, 3=low_liquidity
     wall_persist: Optional[torch.Tensor] = None   # (B,) float (positive)
     time_to_event: Optional[torch.Tensor] = None  # (B,) float (positive)
 

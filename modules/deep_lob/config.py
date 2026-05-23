@@ -154,7 +154,7 @@ class MultiTaskHeadsConfig:
         - next_price (auxiliary, regression)
         - next_imbalance (auxiliary, regression)
         - next_volatility (auxiliary, regression)
-        - next_regime (auxiliary, classification 3-way)
+        - next_regime (auxiliary, classification 4-way: matches regime_config.REGIMES)
         - wall_persist (auxiliary, regression - bars until wall consumed)
         - time_to_event (auxiliary, regression - bars until next significant event)
     """
@@ -173,8 +173,9 @@ class MultiTaskHeadsConfig:
     wall_persist_weight: float = 0.15
     time_to_event_weight: float = 0.10
 
-    # Regime config
-    regime_n_classes: int = 3   # trending / ranging / volatile
+    # Regime config — matches regime_config.REGIMES order:
+    #   0=trending, 1=ranging, 2=volatile, 3=low_liquidity
+    regime_n_classes: int = 4
 
     # Dropout على الـ heads
     dropout: float = 0.1

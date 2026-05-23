@@ -15,16 +15,20 @@ QuantSystem V19 | Section 9 من المرجع التقني
 from __future__ import annotations
 
 # ── تعريف الـ Regimes المدعومة ────────────────────────────────────────────────
-REGIMES: tuple[str, ...] = ('trending', 'ranging', 'volatile')
+# low_liquidity أُضيف لمطابقة assign_regime_label في prepare_day_trading.py
+# الذي يصنّف الـ bars بنسبة mbp_bar_coverage < 0.30 كـ low_liquidity منذ V19.
+REGIMES: tuple[str, ...] = ('trending', 'ranging', 'volatile', 'low_liquidity')
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Event Detection — عتبة كشف الأحداث الحقيقية
 # ──────────────────────────────────────────────────────────────────────────────
 # Volatile: عتبة أعلى — فقط إشارات قوية جداً تمر (السوق فوضوي والإشارات الضعيفة مضللة)
+# low_liquidity: أعلى عتبة — إشارات ضعيفة في عمق ضعيف = ضوضاء غالباً
 REGIME_EVENT_THRESHOLD: dict[str, float] = {
-    'trending': 0.60,
-    'ranging' : 0.60,
-    'volatile': 0.75,
+    'trending'      : 0.60,
+    'ranging'       : 0.60,
+    'volatile'      : 0.75,
+    'low_liquidity' : 0.80,
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -34,10 +38,12 @@ REGIME_EVENT_THRESHOLD: dict[str, float] = {
 # Trending:  حركة طويلة → TP = 2× ATR كافٍ، SL = 1× ATR عادي
 # Ranging:   رفع TP قليلًا لتقليل break-even المطلوب مع الحفاظ على SL مضبوط
 # Volatile:  TP أوسع وSL أضيق نسبيًا حتى لا يصبح BE غير واقعي
+# low_liquidity: أهداف صغيرة + SL ضيق — السبريد أوسع، الحركة محدودة
 REGIME_TP_SL: dict[str, tuple[float, float]] = {
-    'trending': (2.0, 1.0),
-    'ranging' : (1.1, 0.6),
-    'volatile': (1.8, 1.0),
+    'trending'      : (2.0, 1.0),
+    'ranging'       : (1.1, 0.6),
+    'volatile'      : (1.8, 1.0),
+    'low_liquidity' : (1.0, 0.5),
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -47,10 +53,12 @@ REGIME_TP_SL: dict[str, tuple[float, float]] = {
 # Trending:  الحركة تستمر طويلاً → 12 bar = 60 دقيقة
 # Ranging:   الحركة تعكس بسرعة → 6 bars = 30 دقيقة
 # Volatile:  الحركة تنتهي بسرعة → 3 bars = 15 دقيقة
+# low_liquidity: نافذة قصيرة — العمق الضعيف لا يدعم حركة مستدامة
 REGIME_MAX_BARS: dict[str, int] = {
-    'trending': 12,
-    'ranging' :  6,
-    'volatile':  3,
+    'trending'      : 12,
+    'ranging'       :  6,
+    'volatile'      :  3,
+    'low_liquidity' :  4,
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -59,10 +67,12 @@ REGIME_MAX_BARS: dict[str, int] = {
 # Trending:  عمق أوسط + iterations كثيرة → يتعلم تسلسل اتجاهي طويل
 # Ranging:   عمق أكبر → يتعلم أنماط انعكاس دقيقة
 # Volatile:  عمق ضحل + learning_rate أسرع → يتعلم بسرعة ولا يُفرط في التخصيص
+# low_liquidity: نموذج معتدل — البيانات أقل، تجنّب overfitting
 REGIME_MODEL_CONFIGS: dict[str, dict] = {
-    'trending': {'iterations': 800,  'learning_rate': 0.02,  'depth': 7},
-    'ranging' : {'iterations': 1000, 'learning_rate': 0.015, 'depth': 8},
-    'volatile': {'iterations': 500,  'learning_rate': 0.05,  'depth': 5},
+    'trending'      : {'iterations': 800,  'learning_rate': 0.02,  'depth': 7},
+    'ranging'       : {'iterations': 1000, 'learning_rate': 0.015, 'depth': 8},
+    'volatile'      : {'iterations': 500,  'learning_rate': 0.05,  'depth': 5},
+    'low_liquidity' : {'iterations': 600,  'learning_rate': 0.03,  'depth': 6},
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -72,6 +82,7 @@ REGIME_MODEL_CONFIGS: dict[str, dict] = {
 # Trending:  يحتاج لقياس التسارع والزخم الاتجاهي
 # Ranging:   يحتاج لقياس الاضطراب والانعكاسات وعمق السيولة
 # Volatile:  يحتاج للحظات الذروة والضغط الشديد
+# low_liquidity: يحتاج لقياس عمق/تغطية الـ LOB والإلغاءات
 REGIME_EXTRA_FEATURES: dict[str, list[str]] = {
     'trending': [
         'cvd_velocity',           # تسارع الضغط الاتجاهي
@@ -92,6 +103,13 @@ REGIME_EXTRA_FEATURES: dict[str, list[str]] = {
         'micro_atr_max',          # أعلى تقلب intrabar
         'absorption_intensity',   # شدة الامتصاص
     ],
+    'low_liquidity': [
+        'mbp_bar_coverage',       # تغطية MBP داخل الشمعة
+        'mbo_bar_coverage',       # كثافة تيكات MBO
+        'cancel_ratio',           # نسبة الإلغاءات
+        'spoofing_ratio',         # نسبة السبوفينغ
+        'inter_event_time',       # فجوات زمنية بين الأحداث
+    ],
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -99,20 +117,24 @@ REGIME_EXTRA_FEATURES: dict[str, list[str]] = {
 # ──────────────────────────────────────────────────────────────────────────────
 # Volatile: delta أكبر + lambda أصغر = يكتشف drift بسرعة أكبر
 #           لأن السوق الـ volatile يتغير أسرع من الـ trending/ranging
+# low_liquidity: متوسط — التعلّم بسرعة معتدلة لتفادي ضجيج البيانات الناقصة
 REGIME_DRIFT_CONFIG: dict[str, dict] = {
-    'trending': {'delta': 0.005, 'lambda_': 50},
-    'ranging' : {'delta': 0.005, 'lambda_': 50},
-    'volatile': {'delta': 0.008, 'lambda_': 30},
+    'trending'      : {'delta': 0.005, 'lambda_': 50},
+    'ranging'       : {'delta': 0.005, 'lambda_': 50},
+    'volatile'      : {'delta': 0.008, 'lambda_': 30},
+    'low_liquidity' : {'delta': 0.006, 'lambda_': 40},
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 7. Live Prediction: Confidence Threshold
 # ──────────────────────────────────────────────────────────────────────────────
 # Volatile: ثقة أعلى مطلوبة لأن الإشارات الخاطئة في volatile أكثر تكلفةً
+# low_liquidity: أعلى ثقة مطلوبة — كلفة الخطأ في سيولة ضعيفة كبيرة جداً (slippage)
 REGIME_PRED_THRESHOLD: dict[str, float] = {
-    'trending': 0.60,
-    'ranging' : 0.60,
-    'volatile': 0.65,
+    'trending'      : 0.60,
+    'ranging'       : 0.60,
+    'volatile'      : 0.65,
+    'low_liquidity' : 0.70,
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -155,54 +177,32 @@ EVENT_LABEL_TIER_WEAK: tuple[float, float, int] = (1.0, 1.0, 6)
 # جدول ملخص سريع للمراجعة
 # ──────────────────────────────────────────────────────────────────────────────
 def print_regime_summary() -> None:
-    """يطبع جدول مقارنة الإعدادات — للتشخيص فقط."""
-    print("\n" + "═" * 70)
+    """يطبع جدول مقارنة الإعدادات لكل Regime — للتشخيص فقط."""
+    print("\n" + "═" * 86)
     print("  Regime Configuration Summary — QuantSystem V19")
-    print("═" * 70)
-    header = f"  {'Setting':<28} {'Trending':>12} {'Ranging':>12} {'Volatile':>12}"
+    print("═" * 86)
+    header = f"  {'Setting':<24} {'Trending':>12} {'Ranging':>12} {'Volatile':>12} {'LowLiq':>14}"
     print(header)
-    print("─" * 70)
+    print("─" * 86)
+
+    def _row(label: str, fmt) -> tuple:
+        return (label,) + tuple(fmt(r) for r in REGIMES)
+
     rows = [
-        ("Event threshold",
-         str(REGIME_EVENT_THRESHOLD['trending']),
-         str(REGIME_EVENT_THRESHOLD['ranging']),
-         str(REGIME_EVENT_THRESHOLD['volatile'])),
-        ("TP multiplier",
-         f"{REGIME_TP_SL['trending'][0]}× ATR",
-         f"{REGIME_TP_SL['ranging'][0]}× ATR",
-         f"{REGIME_TP_SL['volatile'][0]}× ATR"),
-        ("SL multiplier",
-         f"{REGIME_TP_SL['trending'][1]}× ATR",
-         f"{REGIME_TP_SL['ranging'][1]}× ATR",
-         f"{REGIME_TP_SL['volatile'][1]}× ATR"),
-        ("Max horizon (bars)",
-         str(REGIME_MAX_BARS['trending']),
-         str(REGIME_MAX_BARS['ranging']),
-         str(REGIME_MAX_BARS['volatile'])),
-        ("CatBoost depth",
-         str(REGIME_MODEL_CONFIGS['trending']['depth']),
-         str(REGIME_MODEL_CONFIGS['ranging']['depth']),
-         str(REGIME_MODEL_CONFIGS['volatile']['depth'])),
-        ("CatBoost iterations",
-         str(REGIME_MODEL_CONFIGS['trending']['iterations']),
-         str(REGIME_MODEL_CONFIGS['ranging']['iterations']),
-         str(REGIME_MODEL_CONFIGS['volatile']['iterations'])),
-        ("Learning rate",
-         str(REGIME_MODEL_CONFIGS['trending']['learning_rate']),
-         str(REGIME_MODEL_CONFIGS['ranging']['learning_rate']),
-         str(REGIME_MODEL_CONFIGS['volatile']['learning_rate'])),
-        ("Drift lambda_",
-         str(REGIME_DRIFT_CONFIG['trending']['lambda_']),
-         str(REGIME_DRIFT_CONFIG['ranging']['lambda_']),
-         str(REGIME_DRIFT_CONFIG['volatile']['lambda_'])),
-        ("Pred threshold",
-         str(REGIME_PRED_THRESHOLD['trending']),
-         str(REGIME_PRED_THRESHOLD['ranging']),
-         str(REGIME_PRED_THRESHOLD['volatile'])),
+        _row("Event threshold", lambda r: str(REGIME_EVENT_THRESHOLD[r])),
+        _row("TP multiplier",   lambda r: f"{REGIME_TP_SL[r][0]}× ATR"),
+        _row("SL multiplier",   lambda r: f"{REGIME_TP_SL[r][1]}× ATR"),
+        _row("Max horizon (bars)", lambda r: str(REGIME_MAX_BARS[r])),
+        _row("CatBoost depth",  lambda r: str(REGIME_MODEL_CONFIGS[r]['depth'])),
+        _row("CatBoost iters",  lambda r: str(REGIME_MODEL_CONFIGS[r]['iterations'])),
+        _row("Learning rate",   lambda r: str(REGIME_MODEL_CONFIGS[r]['learning_rate'])),
+        _row("Drift lambda_",   lambda r: str(REGIME_DRIFT_CONFIG[r]['lambda_'])),
+        _row("Pred threshold",  lambda r: str(REGIME_PRED_THRESHOLD[r])),
     ]
-    for label, t, r, v in rows:
-        print(f"  {label:<28} {t:>12} {r:>12} {v:>12}")
-    print("═" * 70 + "\n")
+    for row in rows:
+        label, t, r, v, llq = row
+        print(f"  {label:<24} {t:>12} {r:>12} {v:>12} {llq:>14}")
+    print("═" * 86 + "\n")
 
 
 if __name__ == '__main__':
