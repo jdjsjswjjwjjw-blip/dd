@@ -32,6 +32,15 @@ import argparse
 import os
 import sys
 
+# يضمن أن جذر المشروع (الذي يحوي modules/ و regime_config.py) على sys.path
+# حتى عند تشغيل الملف كسكربت بمسار كامل: `python /path/to/v20/prepare_day_trading.py`.
+# مع `python -m v20.prepare_day_trading` هذا no-op لأن cwd جذر المشروع أصلاً.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _candidate in (_HERE, os.path.dirname(_HERE)):
+    if os.path.isdir(os.path.join(_candidate, 'modules')) and _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+        break
+
 if __name__ == '__main__':
     print('[prepare_day_trading] loading heavy imports (numpy, pandas, TF hooks)...', flush=True)
 
