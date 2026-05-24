@@ -166,9 +166,23 @@ python self_supervised/validate_ssl.py \
     --output "$SSL_OUTPUT_DIR/validation_report.json" \
     2>&1 | tee "$SSL_OUTPUT_DIR/phase_e_validation.log"
 
+# ── Phase F: Pattern Discovery & Interpretability ──
+echo ""
+echo "═══ PHASE F: Pattern Discovery — ما تعلّمه النموذج ═══"
+python self_supervised/explain_patterns.py \
+    --features "$FEATURES" \
+    --embeddings "$EMBEDDINGS" \
+    --direction-head "$DIRECTION_CKPT" \
+    --output "$SSL_OUTPUT_DIR/interpretability" \
+    --n-clusters 8 \
+    2>&1 | tee "$SSL_OUTPUT_DIR/phase_f_patterns.log"
+
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  SSL FULL PIPELINE COMPLETE"
 echo "  Output: $SSL_OUTPUT_DIR"
-echo "  Final verdict: see $SSL_OUTPUT_DIR/validation_report.json"
+echo ""
+echo "  📊 Validation: $SSL_OUTPUT_DIR/validation_report.json"
+echo "  🔍 Patterns:   $SSL_OUTPUT_DIR/interpretability/interpretability_report.md"
+echo "  📈 Clusters:   $SSL_OUTPUT_DIR/interpretability/cluster_statistics.csv"
 echo "═══════════════════════════════════════════════════════════════"
