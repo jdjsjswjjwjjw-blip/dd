@@ -54,6 +54,7 @@ def _build_bar_orders(
     bar_start_ns: int,
     n_orders_max: int = 200,
     tick_size: float = 0.0001,
+    bar_duration_ns: int = 900_000_000_000,  # 15min default
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     يبني OrderBatch لـ bar واحدة من MBO ticks في ذلك الـ window.
@@ -86,9 +87,10 @@ def _build_bar_orders(
     sizes = pd.to_numeric(mbo_bar['size'], errors='coerce').fillna(0).to_numpy(dtype=np.float32)
     prices = pd.to_numeric(mbo_bar['price'], errors='coerce').fillna(mid_price).to_numpy(dtype=np.float32)
 
-    # Time offset (ms within bar window)
+    # Time offset normalized [0, 1] of bar duration (NOT raw ms — كان يسبب NaN gradients)
     ts_ns = pd.to_datetime(mbo_bar['ts_event']).astype('datetime64[ns]').astype(np.int64).to_numpy()
-    time_offset_ms = ((ts_ns - bar_start_ns) / 1_000_000).astype(np.float32)
+    offset_ns = (ts_ns - bar_start_ns).astype(np.float64)
+    time_offset_norm = np.clip(offset_ns / max(bar_duration_ns, 1), 0.0, 1.0).astype(np.float32)
 
     # Price distance from mid (in ticks)
     if tick_size > 0:
@@ -127,7 +129,7 @@ def _build_bar_orders(
     features[:n_actual, 1] = actions
     features[:n_actual, 2] = log_size
     features[:n_actual, 3] = price_dist_ticks
-    features[:n_actual, 4] = time_offset_ms
+    features[:n_actual, 4] = time_offset_norm   # ∈ [0, 1] بدل ms
     features[:n_actual, 5] = np.log1p(repeat_count - 1)  # log(repeat_count), 0 for unique
     features[:n_actual, 6] = np.log1p(level_hits - 1)    # log(level_hits)
 
@@ -243,6 +245,7 @@ def build_order_batches(
             orders, mask = _build_bar_orders(
                 mbo_in_bar, mid_price, bar_start_ns,
                 n_orders_max=n_orders_max, tick_size=tick_size,
+                bar_duration_ns=int(freq_td.total_seconds() * 1_000_000_000),
             )
             order_features[bi, lag] = orders
             order_masks[bi, lag] = mask

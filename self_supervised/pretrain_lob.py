@@ -41,7 +41,7 @@ def make_ssl_targets(batch: dict, device: torch.device) -> MultiTaskTargets:
     )
 
 
-def train_epoch(model, loader, optimizer, device, scaler=None) -> dict:
+def train_epoch(model, loader, optimizer, device, scaler=None, scheduler=None) -> dict:
     model.train()
     losses_sum = {}
     n_batches = 0
@@ -60,15 +60,17 @@ def train_epoch(model, loader, optimizer, device, scaler=None) -> dict:
                 losses = model.heads.compute_loss(outputs, targets)
             scaler.scale(losses['total']).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # ← أصرم
             scaler.step(optimizer)
             scaler.update()
         else:
             outputs = model(**inputs)
             losses = model.heads.compute_loss(outputs, targets)
             losses['total'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # ← أصرم
             optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         for k, v in losses.items():
             losses_sum[k] = losses_sum.get(k, 0.0) + float(v.item())
         n_batches += 1
@@ -154,6 +156,14 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
     )
+    # Linear warmup للـ 5% الأولى — يمنع gradient explosions في أول epochs
+    total_steps = args.epochs * len(train_loader)
+    warmup_steps = max(1, int(0.05 * total_steps))
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        return 1.0
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 
     best_val_loss = float('inf')
@@ -162,7 +172,7 @@ def main():
 
     for epoch in range(args.epochs):
         t0 = time.time()
-        train_metrics = train_epoch(model, train_loader, optimizer, device, scaler)
+        train_metrics = train_epoch(model, train_loader, optimizer, device, scaler, scheduler)
         val_metrics = eval_epoch(model, holdout_loader, device)
         elapsed = time.time() - t0
 

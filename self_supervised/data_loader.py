@@ -307,6 +307,11 @@ class SSLDataset(Dataset):
             # Real orders from MBO: preserves order IDs, iceberg signals, etc.
             order_features = np.asarray(self.order_features_arr[idx], dtype=np.float32)
             order_masks = np.asarray(self.order_masks_arr[idx], dtype=bool)
+            # Defense-in-depth: لو time_offset (channel 4) فيه قيم كبيرة جداً
+            # (من order_batches قديمة قبل الـ fix)، نعيد تطبيعها هنا
+            t_off = order_features[:, :, 4]
+            if t_off.max() > 100:  # > 100 يعني raw ms (pre-fix)، normalize
+                order_features[:, :, 4] = t_off / max(t_off.max(), 1.0)
         else:
             # Pseudo-orders from LOB tensor (lossy — no order IDs, no iceberg)
             order_features, order_masks = _lob_tensor_to_orders_vectorized(
