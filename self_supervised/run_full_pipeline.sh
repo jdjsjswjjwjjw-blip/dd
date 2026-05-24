@@ -1,13 +1,13 @@
 #!/bin/bash
-# ssl/run_full_pipeline.sh
+# self_supervised/run_full_pipeline.sh
 # ═══════════════════════════════════════════════════════════════
 # Full SSL training + validation pipeline (MAX SIGNAL, NO DATA LOSS).
 #
 # الاستخدام:
-#   ./ssl/run_full_pipeline.sh <pipeline_dir> <mbo_path> [ssl_output] [train_split]
+#   ./self_supervised/run_full_pipeline.sh <pipeline_dir> <mbo_path> [ssl_output] [train_split]
 #
 #   Example:
-#   ./ssl/run_full_pipeline.sh pipeline_3months mbo_3months.parquet
+#   ./self_supervised/run_full_pipeline.sh pipeline_3months mbo_3months.parquet
 #
 # الـ phases:
 #   A0. Build OrderBatches من raw MBO (يحافظ على iceberg signals)
@@ -55,7 +55,7 @@ ORDER_BATCHES_FLAG=""
 if [ -n "$MBO_PATH" ] && [ -f "$MBO_PATH" ]; then
     echo "═══ PHASE A0: Build OrderBatches من raw MBO ═══"
     echo "  هذا يحافظ على iceberg signals + order_id + action لكل tick"
-    python ssl/build_order_batches.py \
+    python self_supervised/build_order_batches.py \
         --mbo "$MBO_PATH" \
         --features "$FEATURES" \
         --output "$ORDER_BATCHES_DIR" \
@@ -77,7 +77,7 @@ fi
 
 # ── Phase A: Pretrain LOB Transformer ──
 echo "═══ PHASE A: Pretrain LOB Transformer ═══"
-python ssl/pretrain_lob.py \
+python self_supervised/pretrain_lob.py \
     --features "$FEATURES" \
     --lob-tensors "$LOB_TENSORS" \
     --lob-timestamps "$LOB_TIMESTAMPS" \
@@ -98,7 +98,7 @@ echo ""
 
 # ── Phase B: Pretrain Price Cycle ──
 echo "═══ PHASE B: Pretrain Price Cycle Model ═══"
-python ssl/pretrain_cycle.py \
+python self_supervised/pretrain_cycle.py \
     --features "$FEATURES" \
     --lob-tensors "$LOB_TENSORS" \
     --lob-timestamps "$LOB_TIMESTAMPS" \
@@ -119,7 +119,7 @@ echo ""
 
 # ── Phase C: Extract Embeddings ──
 echo "═══ PHASE C: Extract Embeddings ═══"
-python ssl/extract_embeddings.py \
+python self_supervised/extract_embeddings.py \
     --features "$FEATURES" \
     --lob-tensors "$LOB_TENSORS" \
     --lob-timestamps "$LOB_TIMESTAMPS" \
@@ -139,7 +139,7 @@ echo ""
 
 # ── Phase D: Fine-Tune Direction Head ──
 echo "═══ PHASE D: Fine-Tune Direction Head ═══"
-python ssl/fine_tune_direction.py \
+python self_supervised/fine_tune_direction.py \
     --features "$FEATURES" \
     --embeddings "$EMBEDDINGS" \
     --output "$SSL_OUTPUT_DIR/direction" \
@@ -158,7 +158,7 @@ echo ""
 
 # ── Phase E: Validation ──
 echo "═══ PHASE E: Validation ═══"
-python ssl/validate_ssl.py \
+python self_supervised/validate_ssl.py \
     --features "$FEATURES" \
     --embeddings "$EMBEDDINGS" \
     --direction-head "$DIRECTION_CKPT" \

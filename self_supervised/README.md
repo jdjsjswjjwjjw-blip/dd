@@ -24,8 +24,8 @@ ls pipeline_clean/lob_tensors.npy
 ls mbo_data.parquet   # ← مهم لـ iceberg detection!
 
 # 2. Run full SSL pipeline (~5-7 hours on GPU، with iceberg support)
-chmod +x ssl/run_full_pipeline.sh
-./ssl/run_full_pipeline.sh pipeline_clean mbo_data.parquet checkpoints/ssl_run 0.75
+chmod +x self_supervised/run_full_pipeline.sh
+./self_supervised/run_full_pipeline.sh pipeline_clean mbo_data.parquet checkpoints/ssl_run 0.75
 
 # 3. Check verdict
 cat checkpoints/ssl_run/validation_report.json
@@ -49,7 +49,7 @@ cat checkpoints/ssl_run/validation_report.json
 
 ### Phase A0: Build OrderBatches من raw MBO (NEW — ~15-30 min CPU)
 ```bash
-python ssl/build_order_batches.py \
+python self_supervised/build_order_batches.py \
     --mbo mbo_data.parquet \
     --features pipeline_clean/day_trading_features.parquet \
     --output checkpoints/ssl_run/order_batches \
@@ -63,7 +63,7 @@ python ssl/build_order_batches.py \
 
 ### Phase A: Pretrain LOB Transformer (~1-2 hours GPU)
 ```bash
-python ssl/pretrain_lob.py \
+python self_supervised/pretrain_lob.py \
     --features pipeline_clean/day_trading_features.parquet \
     --lob-tensors pipeline_clean/lob_tensors.npy \
     --output checkpoints/ssl_lob \
@@ -80,7 +80,7 @@ Trains 6 SSL heads (no direction labels):
 
 ### Phase B: Pretrain Price Cycle Model (~30-60 min GPU)
 ```bash
-python ssl/pretrain_cycle.py \
+python self_supervised/pretrain_cycle.py \
     --features pipeline_clean/day_trading_features.parquet \
     --lob-tensors pipeline_clean/lob_tensors.npy \
     --output checkpoints/ssl_cycle \
@@ -95,7 +95,7 @@ Trains 4 SSL heads (Wyckoff weak labels from rules):
 
 ### Phase C: Extract Embeddings (~5-10 min)
 ```bash
-python ssl/extract_embeddings.py \
+python self_supervised/extract_embeddings.py \
     --features pipeline_clean/day_trading_features.parquet \
     --lob-tensors pipeline_clean/lob_tensors.npy \
     --lob-checkpoint checkpoints/ssl_lob/best_ssl_lob.pt \
@@ -107,7 +107,7 @@ Produces `embeddings.npy` of shape `(N, micro_dim + macro_dim + seasonal + cycle
 
 ### Phase D: Fine-Tune Direction Head (~5-15 min)
 ```bash
-python ssl/fine_tune_direction.py \
+python self_supervised/fine_tune_direction.py \
     --features pipeline_clean/day_trading_features.parquet \
     --embeddings checkpoints/embeddings/embeddings.npy \
     --output checkpoints/direction_head \
@@ -118,7 +118,7 @@ Small MLP (3 layers, ~10K parameters) trained on directional labels only.
 
 ### Phase E: Validation
 ```bash
-python ssl/validate_ssl.py \
+python self_supervised/validate_ssl.py \
     --features pipeline_clean/day_trading_features.parquet \
     --embeddings checkpoints/embeddings/embeddings.npy \
     --direction-head checkpoints/direction_head/best_direction_head.pt \
@@ -147,7 +147,7 @@ Produces verdict report with 6 acceptance criteria.
 ## File Structure
 
 ```
-ssl/
+self_supervised/
 ├── README.md                  # this file
 ├── __init__.py
 ├── data_loader.py             # SSL Dataset + DataLoaders

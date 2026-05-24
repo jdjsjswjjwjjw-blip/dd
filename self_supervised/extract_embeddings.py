@@ -26,7 +26,7 @@ from modules.deep_lob.hierarchical_model import HierarchicalLOBTransformer
 from modules.price_cycle.config import PriceCycleConfig
 from modules.price_cycle.cycle_model import PriceCycleModel
 
-from ssl.data_loader import SSLDataset
+from self_supervised.data_loader import SSLDataset
 
 
 def load_lob_model(checkpoint_path: str, device: torch.device) -> HierarchicalLOBTransformer:
@@ -43,8 +43,8 @@ def load_lob_model(checkpoint_path: str, device: torch.device) -> HierarchicalLO
 def load_cycle_model(checkpoint_path: str, device: torch.device,
                      input_dim: int = 14) -> PriceCycleModel:
     config = PriceCycleConfig()
-    if hasattr(config, 'encoder') and hasattr(config.encoder, 'input_dim'):
-        config.encoder.input_dim = input_dim
+    if hasattr(config, 'encoder') and hasattr(config.encoder, 'n_input_features'):
+        config.encoder.n_input_features = input_dim
     model = PriceCycleModel(config)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = ckpt.get('model_state_dict', ckpt)

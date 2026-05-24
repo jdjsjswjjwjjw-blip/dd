@@ -28,7 +28,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from ssl.fine_tune_direction import DirectionHead
+from self_supervised.fine_tune_direction import DirectionHead
 
 
 # Acceptance thresholds (matches our agreed criteria)
