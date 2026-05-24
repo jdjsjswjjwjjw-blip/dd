@@ -77,6 +77,7 @@ def eval_epoch(model, loader, device) -> dict:
     model.eval()
     losses_sum = {}
     n_batches = 0
+    n_nan_batches = 0
     with torch.no_grad():
         for batch in loader:
             targets = make_ssl_targets(batch, device)
@@ -88,9 +89,15 @@ def eval_epoch(model, loader, device) -> dict:
             }
             outputs = model(**inputs)
             losses = model.heads.compute_loss(outputs, targets)
+            # NaN guard في eval برضو
+            if not torch.isfinite(losses['total']):
+                n_nan_batches += 1
+                continue
             for k, v in losses.items():
                 losses_sum[k] = losses_sum.get(k, 0.0) + float(v.item())
             n_batches += 1
+    if n_nan_batches > 0:
+        print(f"           ⚠️  eval: skipped {n_nan_batches} NaN batches")
     return {k: v / max(n_batches, 1) for k, v in losses_sum.items()}
 
 

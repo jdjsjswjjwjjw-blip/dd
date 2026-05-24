@@ -270,8 +270,16 @@ class SSLDataset(Dataset):
             return np.full(n, fallback, dtype=dtype)
 
         close = pd.to_numeric(self.df['close'], errors='coerce').to_numpy(dtype=np.float64)
+        # Clip close لـ range معقول (يحمي من corrupted OHLCV)
+        close = np.where(np.isfinite(close) & (close > 0), close, np.nan)
+        # Use forward-fill for any NaN
+        if np.any(np.isnan(close)):
+            close_series = pd.Series(close).ffill().bfill().fillna(1.0)
+            close = close_series.to_numpy(dtype=np.float64)
         log_ret = np.zeros(n, dtype=np.float32)
         log_ret[:-1] = np.log(np.maximum(close[1:], 1e-9) / np.maximum(close[:-1], 1e-9)).astype(np.float32)
+        # Clip to ±10% per bar (يمنع corrupted ticks من تخريب)
+        log_ret = np.clip(log_ret, -0.1, 0.1).astype(np.float32)
         self.next_price = log_ret
 
         obi_col = 'obi_net' if 'obi_net' in self.df.columns else 'order_flow_imbalance'
@@ -283,6 +291,8 @@ class SSLDataset(Dataset):
 
         atr_col = 'atr_14' if 'atr_14' in self.df.columns else 'atr'
         atr = _safe_col(atr_col, fallback=0.001)
+        # Clip ATR لـ range معقول (0.0001 = 1 pip, 0.05 = 500 pip)
+        atr = np.clip(atr, 1e-5, 0.05).astype(np.float32)
         next_atr = np.zeros(n, dtype=np.float32)
         next_atr[:-1] = atr[1:]
         self.next_volatility = np.maximum(next_atr, 1e-6)

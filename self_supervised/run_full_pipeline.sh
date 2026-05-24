@@ -86,7 +86,7 @@ python self_supervised/pretrain_lob.py \
     --epochs 30 \
     --batch-size 8 \
     --num-workers 2 \
-    --lr 2e-5 \
+    --lr 1e-5 \
     --train-split "$TRAIN_SPLIT" \
     2>&1 | tee "$SSL_OUTPUT_DIR/phase_a_lob.log"
 
