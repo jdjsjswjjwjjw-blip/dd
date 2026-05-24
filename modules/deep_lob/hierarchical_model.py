@@ -141,9 +141,18 @@ class HierarchicalLOBTransformer(nn.Module):
         events = events.reshape(B, T, E, D_event)
 
         # ── Stage 4: Bar-level LSTM ────────────────────────────────────────
+        # Infer bar validity from order_masks (a bar is valid iff it has ≥1 order)
+        inferred_bar_mask = order_masks.any(dim=-1)  # (B, T)
         if bar_mask is None:
-            # Infer bar_mask: a bar is valid if it has at least one valid order
-            bar_mask = order_masks.any(dim=-1)  # (B, T)
+            bar_mask = inferred_bar_mask
+        else:
+            # AND with inferred: respect both user-provided mask AND data-driven mask
+            bar_mask = bar_mask.bool() & inferred_bar_mask
+
+        # Bug fix: zero out events for empty bars (مع الـ attention fix فوق، الـ
+        # bars الفاضية بقت تطلع bias-driven values مش NaN — نتصفّرها قبل LSTM
+        # عشان مايبوظش الـ hidden state)
+        events = events * bar_mask.unsqueeze(-1).unsqueeze(-1).float()
 
         bar_sequence_output, bar_final_state = self.bar_lstm(events, bar_mask)
         # bar_final_state : (B, output_dim_lstm)

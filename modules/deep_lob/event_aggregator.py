@@ -106,7 +106,13 @@ class EventAggregator(nn.Module):
 
         # Mask invalid orders
         if order_mask is not None:
-            invalid = ~order_mask
+            # Bug fix: لو bar مفيهاش أي order، order_mask = all False
+            # → softmax(all -inf) = NaN
+            # Solution: rows الفاضية، عاملها كأنها كلها valid (events للـ bars دي
+            # هتتصفر downstream بـ bar_mask في LSTM)
+            row_has_valid = order_mask.any(dim=-1, keepdim=True)  # (B, 1)
+            safe_mask = order_mask | (~row_has_valid)             # (B, N)
+            invalid = ~safe_mask
             invalid_expanded = invalid.unsqueeze(1).expand(-1, E, -1)
             logits = logits.masked_fill(invalid_expanded, float("-inf"))
 

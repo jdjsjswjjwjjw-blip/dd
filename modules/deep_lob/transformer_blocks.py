@@ -144,8 +144,13 @@ class MultiHeadSelfAttention(nn.Module):
 
         # Mask padding tokens
         if key_padding_mask is not None:
-            # Mask is True for valid; invert to mask out invalid
-            invalid_mask = ~key_padding_mask
+            # Bug fix: لو bar مفيهاش أي order valid، key_padding_mask = all False
+            # → masked_fill(all_True, -inf) → softmax([all -inf]) = NaN
+            # Solution: للـ rows الفاضية تماماً، عاملها كأنها كلها valid (output يتصفر
+            # برضو بـ key_padding_mask multiplication بعد كده في encoder)
+            row_has_valid = key_padding_mask.any(dim=-1, keepdim=True)  # (B, 1)
+            safe_mask = key_padding_mask | (~row_has_valid)             # (B, N)
+            invalid_mask = ~safe_mask
             # (B, 1, 1, N) → broadcast to (B, n_heads, N, N)
             invalid_mask = invalid_mask.unsqueeze(1).unsqueeze(1)
             attn = attn.masked_fill(invalid_mask, float("-inf"))
