@@ -210,11 +210,157 @@ def feature_importance_via_perturbation(
     return importance
 
 
+def analyze_seasonal_patterns(
+    df: pd.DataFrame,
+    direction_preds: np.ndarray,
+    direction_probs: np.ndarray,
+    true_labels: np.ndarray,
+) -> dict:
+    """تحليل dedicated للأنماط الموسمية — accuracy + bias حسب:
+        - hour of day (via session features)
+        - day of week
+        - session phase (opening/middle/closing/outside)
+        - month-end / quarter-end / year-end
+        - DST transition weeks
+        - calendar event windows
+    """
+    n = len(df)
+    seasonal = {
+        'total_samples': int(n),
+        'overall_accuracy': float((direction_preds == true_labels).mean()),
+        'overall_confidence': float(direction_probs.max(axis=1).mean()),
+    }
+
+    # ── Helper for per-bucket accuracy ──
+    def _bucket_stats(mask: np.ndarray, name: str) -> dict:
+        n_sub = int(mask.sum())
+        if n_sub < 3:
+            return {'n_samples': n_sub, 'accuracy': None, 'confidence': None,
+                    'long_pct': None, 'short_pct': None}
+        preds_sub = direction_preds[mask]
+        labels_sub = true_labels[mask]
+        probs_sub = direction_probs[mask]
+        return {
+            'n_samples': n_sub,
+            'accuracy': float((preds_sub == labels_sub).mean()),
+            'confidence': float(probs_sub.max(axis=1).mean()),
+            'long_pct': float((preds_sub == 0).mean()),
+            'short_pct': float((preds_sub == 1).mean()),
+            'pct_of_total': float(n_sub / n * 100),
+        }
+
+    # ── 1. Session Phase Analysis ──
+    if 'session_phase' in df.columns:
+        phase_names = {0: 'opening', 1: 'middle', 2: 'closing', 3: 'outside'}
+        seasonal['session_phase'] = {}
+        for code, name in phase_names.items():
+            mask = (df['session_phase'] == code).to_numpy()
+            seasonal['session_phase'][name] = _bucket_stats(mask, name)
+
+    # ── 2. Day-of-week Analysis ──
+    if 'is_monday' in df.columns and 'is_friday' in df.columns:
+        seasonal['day_of_week'] = {
+            'monday': _bucket_stats((df['is_monday'] == 1).to_numpy(), 'mon'),
+            'friday': _bucket_stats((df['is_friday'] == 1).to_numpy(), 'fri'),
+            'rest_of_week': _bucket_stats(
+                ((df['is_monday'] == 0) & (df['is_friday'] == 0)).to_numpy(), 'rest'
+            ),
+        }
+
+    # ── 3. Time within London/NY session ──
+    if 'time_since_london_open_min' in df.columns:
+        london_active = (df['time_since_london_open_min'] > 0).to_numpy()
+        seasonal['london_session'] = {
+            'active': _bucket_stats(london_active, 'london_active'),
+            'first_hour': _bucket_stats(
+                ((df['time_since_london_open_min'] > 0) &
+                 (df['time_since_london_open_min'] <= 60)).to_numpy(), 'london_first_hr'
+            ),
+            'last_hour': _bucket_stats(
+                ((df['time_to_london_close_min'] > 0) &
+                 (df['time_to_london_close_min'] <= 60)).to_numpy(), 'london_last_hr'
+            ),
+        }
+
+    if 'time_since_ny_open_min' in df.columns:
+        seasonal['ny_session'] = {
+            'active': _bucket_stats(
+                (df['time_since_ny_open_min'] > 0).to_numpy(), 'ny_active'
+            ),
+            'first_hour': _bucket_stats(
+                ((df['time_since_ny_open_min'] > 0) &
+                 (df['time_since_ny_open_min'] <= 60)).to_numpy(), 'ny_first_hr'
+            ),
+            'last_hour': _bucket_stats(
+                ((df['time_to_ny_close_min'] > 0) &
+                 (df['time_to_ny_close_min'] <= 60)).to_numpy(), 'ny_last_hr'
+            ),
+        }
+
+    # ── 4. Calendar effects ──
+    seasonal['calendar_effects'] = {}
+    for col_name, label in [
+        ('is_month_end', 'month_end'),
+        ('is_month_start', 'month_start'),
+        ('is_quarter_end', 'quarter_end'),
+        ('is_year_end', 'year_end'),
+        ('is_dst_transition_week', 'dst_transition'),
+        ('is_first_week_of_year', 'first_week_year'),
+        ('is_event_window', 'event_window'),
+    ]:
+        if col_name in df.columns:
+            seasonal['calendar_effects'][label] = _bucket_stats(
+                (df[col_name] == 1).to_numpy(), label,
+            )
+
+    # ── 5. Time-of-day breakdown (hour bins via cyclical features) ──
+    if 'time_since_london_open_min' in df.columns:
+        # Use minutes since London open as proxy for time-of-day
+        minutes = df['time_since_london_open_min'].to_numpy()
+        seasonal['time_buckets'] = {}
+        for label, lo, hi in [
+            ('pre_london', 0, 0),  # mask differently
+            ('london_0-2h', 1, 120),
+            ('london_2-4h', 120, 240),
+            ('london_4-6h', 240, 360),
+            ('london_6-8h', 360, 480),
+            ('london_8h+', 480, 999999),
+        ]:
+            if label == 'pre_london':
+                ny_min = df['time_since_ny_open_min'].to_numpy()
+                mask = (minutes == 0) & (ny_min == 0)
+            else:
+                mask = (minutes >= lo) & (minutes < hi)
+            seasonal['time_buckets'][label] = _bucket_stats(mask, label)
+
+    # ── 6. Best/Worst seasonal windows ──
+    all_buckets = []
+    for cat, items in seasonal.items():
+        if cat in ('total_samples', 'overall_accuracy', 'overall_confidence'):
+            continue
+        if isinstance(items, dict):
+            for sub_name, stats in items.items():
+                if isinstance(stats, dict) and stats.get('accuracy') is not None and stats.get('n_samples', 0) >= 10:
+                    all_buckets.append({
+                        'category': cat,
+                        'bucket': sub_name,
+                        'accuracy': stats['accuracy'],
+                        'n_samples': stats['n_samples'],
+                        'confidence': stats.get('confidence'),
+                    })
+    all_buckets.sort(key=lambda x: x['accuracy'], reverse=True)
+    seasonal['top_5_windows'] = all_buckets[:5]
+    seasonal['bottom_5_windows'] = all_buckets[-5:][::-1] if len(all_buckets) >= 5 else []
+
+    return seasonal
+
+
 def generate_markdown_report(
     cluster_stats: list[dict],
     feature_importance: dict,
     overall_stats: dict,
     output_path: str,
+    seasonal_stats: dict | None = None,
 ) -> None:
     """يولّد تقرير قابل للقراءة بالعربي + English."""
     lines = [
@@ -287,6 +433,85 @@ def generate_markdown_report(
             f'| `{group}` | {imp["baseline_acc"]:.3f} | {imp["perturbed_acc"]:.3f} | '
             f'{imp["accuracy_drop"]:.3f} | {imp["importance_pct"]:.1f}% |'
         )
+
+    # ── Seasonal Patterns Section ──
+    if seasonal_stats:
+        lines.extend(['', '---', '', '## 🗓️ أنماط Seasonal Map (Temporal Patterns)', ''])
+        lines.append(f"**Overall Accuracy:** {seasonal_stats['overall_accuracy']:.3f} | "
+                    f"**Overall Confidence:** {seasonal_stats['overall_confidence']:.3f}")
+        lines.append('')
+
+        def _print_bucket_table(title: str, items: dict) -> list[str]:
+            out = [f'### {title}', '',
+                   '| Window | Samples | Accuracy | Confidence | LONG% | SHORT% |',
+                   '|---|---|---|---|---|---|']
+            for name, stats in items.items():
+                if not isinstance(stats, dict) or stats.get('n_samples', 0) < 3:
+                    continue
+                acc = stats.get('accuracy')
+                conf = stats.get('confidence')
+                long_pct = stats.get('long_pct')
+                short_pct = stats.get('short_pct')
+                out.append(
+                    f"| `{name}` | {stats['n_samples']} | "
+                    f"{acc:.3f if acc is not None else 'N/A'} | "
+                    f"{conf:.3f if conf is not None else 'N/A'} | "
+                    f"{(long_pct or 0)*100:.1f}% | {(short_pct or 0)*100:.1f}% |"
+                )
+            out.append('')
+            return out
+
+        if 'session_phase' in seasonal_stats:
+            lines.extend(_print_bucket_table(
+                '### Session Phase (opening/middle/closing/outside)',
+                seasonal_stats['session_phase'],
+            ))
+        if 'day_of_week' in seasonal_stats:
+            lines.extend(_print_bucket_table(
+                'Day of Week (Monday / Friday / Rest)',
+                seasonal_stats['day_of_week'],
+            ))
+        if 'london_session' in seasonal_stats:
+            lines.extend(_print_bucket_table(
+                'London Session',
+                seasonal_stats['london_session'],
+            ))
+        if 'ny_session' in seasonal_stats:
+            lines.extend(_print_bucket_table(
+                'NY Session',
+                seasonal_stats['ny_session'],
+            ))
+        if 'time_buckets' in seasonal_stats:
+            lines.extend(_print_bucket_table(
+                'Time-of-Day Buckets',
+                seasonal_stats['time_buckets'],
+            ))
+        if 'calendar_effects' in seasonal_stats:
+            lines.extend(_print_bucket_table(
+                'Calendar Effects (month-end / quarter-end / DST / events)',
+                seasonal_stats['calendar_effects'],
+            ))
+
+        # Top/Bottom windows
+        if seasonal_stats.get('top_5_windows'):
+            lines.append('### 🏆 Top 5 Profitable Windows')
+            lines.append('')
+            lines.append('| Rank | Category | Window | Accuracy | Samples |')
+            lines.append('|---|---|---|---|---|')
+            for i, w in enumerate(seasonal_stats['top_5_windows'], 1):
+                lines.append(f"| {i} | {w['category']} | `{w['bucket']}` | "
+                           f"{w['accuracy']:.3f} | {w['n_samples']} |")
+            lines.append('')
+
+        if seasonal_stats.get('bottom_5_windows'):
+            lines.append('### ⚠️ Bottom 5 Risky Windows')
+            lines.append('')
+            lines.append('| Rank | Category | Window | Accuracy | Samples |')
+            lines.append('|---|---|---|---|---|')
+            for i, w in enumerate(seasonal_stats['bottom_5_windows'], 1):
+                lines.append(f"| {i} | {w['category']} | `{w['bucket']}` | "
+                           f"{w['accuracy']:.3f} | {w['n_samples']} |")
+            lines.append('')
 
     lines.extend([
         '',
@@ -475,6 +700,16 @@ def main():
         'accuracy': f'{acc:.3f}',
     }
 
+    # ── Seasonal Pattern Analysis ──
+    print(f"\n🗓️  Analyzing seasonal patterns (time/day/calendar)...")
+    seasonal_stats = analyze_seasonal_patterns(
+        df_dir, preds, probs, y,
+    )
+    print(f"   Overall accuracy: {seasonal_stats['overall_accuracy']:.3f}")
+    if seasonal_stats.get('top_5_windows'):
+        print(f"   Best window: {seasonal_stats['top_5_windows'][0]['bucket']} "
+              f"(acc={seasonal_stats['top_5_windows'][0]['accuracy']:.3f})")
+
     # JSON
     json_path = Path(args.output) / 'patterns_analysis.json'
     with open(json_path, 'w', encoding='utf-8') as f:
@@ -482,12 +717,16 @@ def main():
             'overall': overall_stats,
             'clusters': cluster_stats,
             'feature_importance': feature_importance,
+            'seasonal': seasonal_stats,
         }, f, indent=2, ensure_ascii=False)
     print(f"   ✅ {json_path}")
 
     # Markdown
     md_path = Path(args.output) / 'interpretability_report.md'
-    generate_markdown_report(cluster_stats, feature_importance, overall_stats, str(md_path))
+    generate_markdown_report(
+        cluster_stats, feature_importance, overall_stats,
+        str(md_path), seasonal_stats=seasonal_stats,
+    )
     print(f"   ✅ {md_path}")
 
     # CSV summary
