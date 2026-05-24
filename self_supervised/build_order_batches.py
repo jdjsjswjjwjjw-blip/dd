@@ -85,7 +85,11 @@ def _build_bar_orders(
     sides = mbo_bar['side'].astype(str).map(SIDE_MAP).fillna(2).to_numpy(dtype=np.float32)
     actions = mbo_bar['action'].astype(str).map(ACTION_MAP).fillna(0).to_numpy(dtype=np.float32)
     sizes = pd.to_numeric(mbo_bar['size'], errors='coerce').fillna(0).to_numpy(dtype=np.float32)
-    prices = pd.to_numeric(mbo_bar['price'], errors='coerce').fillna(mid_price).to_numpy(dtype=np.float32)
+    # Robust mid: لو mid_price ذاتها NaN، نستخدم fallback 1.0
+    safe_mid = float(mid_price) if (np.isfinite(mid_price) and mid_price > 0) else 1.0
+    prices = pd.to_numeric(mbo_bar['price'], errors='coerce').to_numpy(dtype=np.float32)
+    # Replace NaN/inf بـ safe_mid (يمنع warnings عند الـ cast)
+    prices = np.where(np.isfinite(prices), prices, safe_mid).astype(np.float32)
 
     # Time offset normalized [0, 1] of bar duration (NOT raw ms — كان يسبب NaN gradients)
     ts_ns = pd.to_datetime(mbo_bar['ts_event']).astype('datetime64[ns]').astype(np.int64).to_numpy()
