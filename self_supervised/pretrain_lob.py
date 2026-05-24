@@ -41,10 +41,40 @@ def make_ssl_targets(batch: dict, device: torch.device) -> MultiTaskTargets:
     )
 
 
-def train_epoch(model, loader, optimizer, device, scaler=None, scheduler=None) -> dict:
+def _sanitize_inputs(inputs: dict, targets) -> tuple[dict, int]:
+    """Replace NaN/Inf في inputs/targets with safe values. Returns (cleaned, n_replacements)."""
+    n_fixed = 0
+    for k, v in inputs.items():
+        if v.dtype.is_floating_point:
+            bad = int((~torch.isfinite(v)).sum().item())
+            if bad > 0:
+                inputs[k] = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+                n_fixed += bad
+    for attr in ('next_price', 'next_imbalance', 'next_volatility', 'wall_persist', 'time_to_event'):
+        v = getattr(targets, attr, None)
+        if v is not None and v.dtype.is_floating_point:
+            bad = int((~torch.isfinite(v)).sum().item())
+            if bad > 0:
+                setattr(targets, attr, torch.nan_to_num(v, nan=0.0, posinf=1.0, neginf=-1.0))
+                n_fixed += bad
+    return inputs, n_fixed
+
+
+def _params_are_finite(model) -> bool:
+    for p in model.parameters():
+        if not torch.isfinite(p.data).all():
+            return False
+    return True
+
+
+def train_epoch(model, loader, optimizer, device, scaler=None, scheduler=None,
+                epoch_num: int = 0) -> dict:
     model.train()
     losses_sum = {}
     n_batches = 0
+    n_skipped = 0
+    n_input_nan = 0
+    n_grad_nan = 0
     for batch in loader:
         targets = make_ssl_targets(batch, device)
         inputs = {
@@ -53,16 +83,31 @@ def train_epoch(model, loader, optimizer, device, scaler=None, scheduler=None) -
             'bar_mask': batch['bar_mask'].to(device),
             'context': batch['context'].to(device),
         }
+        inputs, n_fixed = _sanitize_inputs(inputs, targets)
+        n_input_nan += n_fixed
+
         optimizer.zero_grad()
         outputs = model(**inputs)
         losses = model.heads.compute_loss(outputs, targets)
         total_loss = losses['total']
 
-        # NaN guard: skip batch لو الـ loss = NaN/Inf (يحمي من corruption)
+        # NaN guard: skip batch لو الـ loss = NaN/Inf
         if not torch.isfinite(total_loss):
+            n_skipped += 1
             continue
 
         total_loss.backward()
+        # Check gradient finite قبل ما نـ step (يمنع params NaN propagation)
+        grad_ok = True
+        for p in model.parameters():
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                grad_ok = False
+                break
+        if not grad_ok:
+            n_grad_nan += 1
+            optimizer.zero_grad()
+            continue
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optimizer.step()
         if scheduler is not None:
@@ -70,6 +115,15 @@ def train_epoch(model, loader, optimizer, device, scaler=None, scheduler=None) -
         for k, v in losses.items():
             losses_sum[k] = losses_sum.get(k, 0.0) + float(v.item())
         n_batches += 1
+    if n_skipped > 0 or n_input_nan > 0 or n_grad_nan > 0:
+        print(f"           ⚠️  train: skipped {n_skipped} NaN-loss + {n_grad_nan} NaN-grad batches, "
+              f"sanitized {n_input_nan} NaN/Inf input values")
+    if not _params_are_finite(model):
+        print(f"           🚨 train: model params became NaN/Inf! resetting BAD params to 0")
+        with torch.no_grad():
+            for p in model.parameters():
+                if not torch.isfinite(p.data).all():
+                    p.data = torch.nan_to_num(p.data, nan=0.0, posinf=0.0, neginf=0.0)
     return {k: v / max(n_batches, 1) for k, v in losses_sum.items()}
 
 
@@ -78,6 +132,7 @@ def eval_epoch(model, loader, device) -> dict:
     losses_sum = {}
     n_batches = 0
     n_nan_batches = 0
+    n_input_nan = 0
     with torch.no_grad():
         for batch in loader:
             targets = make_ssl_targets(batch, device)
@@ -87,6 +142,8 @@ def eval_epoch(model, loader, device) -> dict:
                 'bar_mask': batch['bar_mask'].to(device),
                 'context': batch['context'].to(device),
             }
+            inputs, n_fixed = _sanitize_inputs(inputs, targets)
+            n_input_nan += n_fixed
             outputs = model(**inputs)
             losses = model.heads.compute_loss(outputs, targets)
             # NaN guard في eval برضو
@@ -96,8 +153,9 @@ def eval_epoch(model, loader, device) -> dict:
             for k, v in losses.items():
                 losses_sum[k] = losses_sum.get(k, 0.0) + float(v.item())
             n_batches += 1
-    if n_nan_batches > 0:
-        print(f"           ⚠️  eval: skipped {n_nan_batches} NaN batches")
+    if n_nan_batches > 0 or n_input_nan > 0:
+        print(f"           ⚠️  eval: skipped {n_nan_batches} NaN batches, "
+              f"sanitized {n_input_nan} NaN/Inf input values, valid={n_batches}")
     return {k: v / max(n_batches, 1) for k, v in losses_sum.items()}
 
 
@@ -175,7 +233,8 @@ def main():
 
     for epoch in range(args.epochs):
         t0 = time.time()
-        train_metrics = train_epoch(model, train_loader, optimizer, device, scaler, scheduler)
+        train_metrics = train_epoch(model, train_loader, optimizer, device, scaler, scheduler,
+                                   epoch_num=epoch + 1)
         val_metrics = eval_epoch(model, holdout_loader, device)
         elapsed = time.time() - t0
 

@@ -317,9 +317,24 @@ class SSLDataset(Dataset):
         self.phase_target = phase
         self.swing_target = swing
         self.maturity_target = maturity
-        self.cycle_position_target = cycle_pos
+        self.cycle_position_target = np.nan_to_num(cycle_pos, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        print(f"     ✅ SSL targets ready (10 tasks × {n:,} bars)")
+        # Final NaN/Inf sanitization على كل targets قبل التدريب
+        self.next_price = np.nan_to_num(self.next_price, nan=0.0, posinf=0.1, neginf=-0.1)
+        self.next_imbalance = np.nan_to_num(self.next_imbalance, nan=0.0, posinf=1.0, neginf=-1.0)
+        self.next_volatility = np.nan_to_num(self.next_volatility, nan=1e-4, posinf=0.05, neginf=1e-6)
+        self.wall_persist = np.nan_to_num(self.wall_persist, nan=0.0, posinf=12.0, neginf=0.0)
+        self.time_to_event = np.nan_to_num(self.time_to_event, nan=24.0, posinf=24.0, neginf=0.0)
+
+        # تحقق نهائي
+        all_clean = (
+            np.isfinite(self.next_price).all() and np.isfinite(self.next_imbalance).all()
+            and np.isfinite(self.next_volatility).all() and np.isfinite(self.wall_persist).all()
+            and np.isfinite(self.time_to_event).all() and np.isfinite(self.cycle_position_target).all()
+        )
+        if not all_clean:
+            print(f"     🚨 WARNING: targets still have NaN/Inf after sanitization!")
+        print(f"     ✅ SSL targets ready (10 tasks × {n:,} bars), all finite={all_clean}")
 
     def __len__(self) -> int:
         return self.n_samples
@@ -329,11 +344,17 @@ class SSLDataset(Dataset):
 
         lob_window = np.asarray(self.lob_tensors[idx], dtype=np.float32)
 
+        # Sanitize lob_window first (mmap files can carry NaN from corrupted ticks)
+        lob_window = np.nan_to_num(lob_window, nan=0.0, posinf=0.0, neginf=0.0)
+
         # ── Order features: real orders (NEW) or pseudo-orders (fallback) ──
         if self.use_real_orders:
             # Real orders from MBO: preserves order IDs, iceberg signals, etc.
             order_features = np.asarray(self.order_features_arr[idx], dtype=np.float32)
             order_masks = np.asarray(self.order_masks_arr[idx], dtype=bool)
+            # CRITICAL safety net: NaN/Inf في order_features = val=NaN guaranteed
+            # (build_order_batches has guards لكن edge cases ممكن تسرّب)
+            order_features = np.nan_to_num(order_features, nan=0.0, posinf=0.0, neginf=0.0)
             # Defense-in-depth: لو time_offset (channel 4) فيه قيم كبيرة جداً
             # (من order_batches قديمة قبل الـ fix)، نعيد تطبيعها هنا
             t_off = order_features[:, :, 4]
@@ -344,6 +365,7 @@ class SSLDataset(Dataset):
             order_features, order_masks = _lob_tensor_to_orders_vectorized(
                 lob_window, n_orders=self.n_orders,
             )
+            order_features = np.nan_to_num(order_features, nan=0.0, posinf=0.0, neginf=0.0)
         bar_mask = np.ones(lob_window.shape[0], dtype=bool)
         context = _build_context_features(
             self.df.iloc[idx], self.context_cols, target_dim=self.context_dim,
@@ -353,6 +375,8 @@ class SSLDataset(Dataset):
         if n_ctx_actual > 0:
             context[:n_ctx_actual] = (context[:n_ctx_actual] - self.context_mu) / self.context_sigma
             context[:n_ctx_actual] = np.clip(context[:n_ctx_actual], -5.0, 5.0)  # safety clip
+        # Final safety net عشان مفيش NaN يوصل للموديل
+        context = np.nan_to_num(context, nan=0.0, posinf=5.0, neginf=-5.0)
 
         # Cycle window
         cycle_cols = [
@@ -370,6 +394,7 @@ class SSLDataset(Dataset):
         if cycle_window.shape[0] < T:
             pad = np.zeros((T - cycle_window.shape[0], cycle_window.shape[1]), dtype=np.float32)
             cycle_window = np.concatenate([pad, cycle_window], axis=0)
+        cycle_window = np.nan_to_num(cycle_window, nan=0.0, posinf=0.0, neginf=0.0)
 
         return {
             'order_features': torch.from_numpy(order_features),
