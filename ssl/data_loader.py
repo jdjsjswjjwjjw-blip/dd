@@ -154,11 +154,16 @@ class SSLDataset(Dataset):
     """Dataset for SSL pretraining من output prepare_day_trading.py.
 
     كل sample يحتوي على:
-        - LOB tensor history (T=50, P=20, C=3)
+        - إما LOB tensor (T=50, P=20, C=3) — pseudo-orders mode (lossy)
+        - أو OrderBatch (T=50, N=200, F=7) — real orders mode (الأفضل — iceberg, etc.)
         - Context features (138-dim من DataFrame row)
         - SSL targets (10 targets، كلها مشتقة من البيانات، لا labels يدوية)
 
     لا يستخدم bias_label أبداً — هذا هو نقطة SSL.
+
+    Order Mode:
+        - Real orders (recommended): pass order_batches_dir to use raw MBO orders
+        - Pseudo-orders (fallback): builds from LOB tensors (loses iceberg info)
     """
 
     def __init__(
@@ -167,6 +172,7 @@ class SSLDataset(Dataset):
         lob_tensors_path: str,
         lob_timestamps_path: Optional[str] = None,
         *,
+        order_batches_dir: Optional[str] = None,   # ← NEW: real orders dir
         lookback_bars: int = 50,
         n_orders: int = 20,
         context_dim: int = 138,
@@ -176,6 +182,8 @@ class SSLDataset(Dataset):
         self.lookback_bars = lookback_bars
         self.n_orders = n_orders
         self.context_dim = context_dim
+        self.order_batches_dir = order_batches_dir
+        self.use_real_orders = order_batches_dir is not None
 
         print(f"  📂 Loading {features_parquet}...")
         self.df = pd.read_parquet(features_parquet)
@@ -189,6 +197,24 @@ class SSLDataset(Dataset):
             raise ValueError(
                 f"Length mismatch: df={len(self.df)} vs lob={len(self.lob_tensors)}"
             )
+
+        # ── NEW: Load real OrderBatches if provided ──
+        if self.use_real_orders:
+            ob_features = os.path.join(order_batches_dir, 'order_features.npy')
+            ob_masks = os.path.join(order_batches_dir, 'order_masks.npy')
+            if not (os.path.exists(ob_features) and os.path.exists(ob_masks)):
+                print(f"  ⚠️  OrderBatches not found in {order_batches_dir}")
+                print(f"      → falling back to pseudo-orders from LOB tensors")
+                self.use_real_orders = False
+            else:
+                print(f"  📂 Loading real OrderBatches from {order_batches_dir}...")
+                self.order_features_arr = np.load(ob_features, mmap_mode='r')
+                self.order_masks_arr = np.load(ob_masks, mmap_mode='r')
+                print(f"     order_features: {self.order_features_arr.shape}")
+                print(f"     order_masks: {self.order_masks_arr.shape}")
+                # Override n_orders to match
+                self.n_orders = self.order_features_arr.shape[2]
+                print(f"     ✅ Real orders mode enabled (n_orders={self.n_orders})")
 
         self.min_idx = max(lookback_bars, min_idx or 0)
         self.max_idx = min(len(self.df) - 25, max_idx or len(self.df))
@@ -269,9 +295,17 @@ class SSLDataset(Dataset):
         idx = self.min_idx + item
 
         lob_window = np.asarray(self.lob_tensors[idx], dtype=np.float32)
-        order_features, order_masks = _lob_tensor_to_orders_vectorized(
-            lob_window, n_orders=self.n_orders,
-        )
+
+        # ── Order features: real orders (NEW) or pseudo-orders (fallback) ──
+        if self.use_real_orders:
+            # Real orders from MBO: preserves order IDs, iceberg signals, etc.
+            order_features = np.asarray(self.order_features_arr[idx], dtype=np.float32)
+            order_masks = np.asarray(self.order_masks_arr[idx], dtype=bool)
+        else:
+            # Pseudo-orders from LOB tensor (lossy — no order IDs, no iceberg)
+            order_features, order_masks = _lob_tensor_to_orders_vectorized(
+                lob_window, n_orders=self.n_orders,
+            )
         bar_mask = np.ones(lob_window.shape[0], dtype=bool)
         context = _build_context_features(
             self.df.iloc[idx], self.context_cols, target_dim=self.context_dim,
@@ -318,6 +352,7 @@ def build_ssl_loaders(
     lob_tensors_path: str,
     lob_timestamps_path: Optional[str] = None,
     *,
+    order_batches_dir: Optional[str] = None,    # ← NEW: real orders
     batch_size: int = 32,
     train_split: float = 0.75,
     num_workers: int = 0,
@@ -328,6 +363,9 @@ def build_ssl_loaders(
 
     train_split=0.75 يعني أول 75% train، آخر 25% holdout.
     لا random shuffle عبر الـ split — للحفاظ على causality.
+
+    order_batches_dir: لو متوفر، يستخدم real orders من MBO خام بدل pseudo-orders.
+        مهم لـ iceberg detection و الحفاظ على معلومات order_id/action.
     """
     df = pd.read_parquet(features_parquet)
     n = len(df)
@@ -336,15 +374,18 @@ def build_ssl_loaders(
 
     print(f"⚙️  Building SSL data loaders...")
     print(f"   Time split: train [0..{split_idx}], holdout [{split_idx}..{n}]")
+    print(f"   Order mode: {'REAL (from MBO)' if order_batches_dir else 'pseudo (from LOB tensor)'}")
 
     train_ds = SSLDataset(
         features_parquet, lob_tensors_path, lob_timestamps_path,
+        order_batches_dir=order_batches_dir,
         lookback_bars=lookback_bars,
         min_idx=lookback_bars,
         max_idx=split_idx,
     )
     holdout_ds = SSLDataset(
         features_parquet, lob_tensors_path, lob_timestamps_path,
+        order_batches_dir=order_batches_dir,
         lookback_bars=lookback_bars,
         min_idx=split_idx,
         max_idx=n - 25,

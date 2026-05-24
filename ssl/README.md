@@ -21,16 +21,45 @@ SSL:         1,234 bars × 10 SSL tasks → pretrain encoders
 # 1. Prerequisites: prepare_day_trading.py output
 ls pipeline_clean/day_trading_features.parquet
 ls pipeline_clean/lob_tensors.npy
+ls mbo_data.parquet   # ← مهم لـ iceberg detection!
 
-# 2. Run full SSL pipeline (~4-6 hours on GPU)
+# 2. Run full SSL pipeline (~5-7 hours on GPU، with iceberg support)
 chmod +x ssl/run_full_pipeline.sh
-./ssl/run_full_pipeline.sh pipeline_clean checkpoints/ssl_run 0.75
+./ssl/run_full_pipeline.sh pipeline_clean mbo_data.parquet checkpoints/ssl_run 0.75
 
 # 3. Check verdict
 cat checkpoints/ssl_run/validation_report.json
 ```
 
+## ⚠️ Important: Real Orders vs Pseudo-Orders
+
+**Pass raw MBO** to enable iceberg detection. Without it:
+- ✅ Pipeline still works
+- ❌ LOB Transformer can't detect iceberg patterns
+- ❌ Cancellation patterns lost
+- ❌ Order lifecycle info gone
+
+**With raw MBO:**
+- ✅ Real orders preserved (order_id, action, full sequence)
+- ✅ Iceberg detection via repeat_count + level_hits
+- ✅ Cancellation patterns intact
+- ✅ Latent event types (sweep/absorb/spoof/iceberg/wall_build/wall_break) discoverable
+
 ## Pipeline Phases
+
+### Phase A0: Build OrderBatches من raw MBO (NEW — ~15-30 min CPU)
+```bash
+python ssl/build_order_batches.py \
+    --mbo mbo_data.parquet \
+    --features pipeline_clean/day_trading_features.parquet \
+    --output checkpoints/ssl_run/order_batches \
+    --lookback-bars 50 --n-orders 200
+```
+
+يبني `order_features.npy` و `order_masks.npy`:
+- Shape: `(N_bars, T=50, N_orders=200, F=7)`
+- 7 features per order: side, action_type, log_size, price_dist, time_offset, **log_repeat_count** (iceberg!), **log_level_hits** (wall!)
+- لكل bar، آخر 200 order من الـ window (T=50 bars)
 
 ### Phase A: Pretrain LOB Transformer (~1-2 hours GPU)
 ```bash

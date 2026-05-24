@@ -101,6 +101,9 @@ def main():
     p.add_argument('--features', required=True)
     p.add_argument('--lob-tensors', required=True)
     p.add_argument('--lob-timestamps', default=None)
+    p.add_argument('--order-batches-dir', default=None,
+                  help='Optional: path to order_batches dir (real MBO orders).'
+                       ' Recommended for iceberg detection.')
     p.add_argument('--output', default='checkpoints/ssl_lob')
     p.add_argument('--epochs', type=int, default=50)
     p.add_argument('--batch-size', type=int, default=32)
@@ -133,6 +136,7 @@ def main():
 
     train_loader, holdout_loader = build_ssl_loaders(
         args.features, args.lob_tensors, args.lob_timestamps,
+        order_batches_dir=args.order_batches_dir,
         batch_size=args.batch_size, train_split=args.train_split,
         num_workers=args.num_workers, lookback_bars=args.lookback_bars,
     )

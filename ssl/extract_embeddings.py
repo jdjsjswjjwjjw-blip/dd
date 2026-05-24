@@ -59,6 +59,7 @@ def main():
     p.add_argument('--features', required=True)
     p.add_argument('--lob-tensors', required=True)
     p.add_argument('--lob-timestamps', default=None)
+    p.add_argument('--order-batches-dir', default=None)
     p.add_argument('--lob-checkpoint', required=True, help='best_ssl_lob.pt')
     p.add_argument('--cycle-checkpoint', required=True, help='best_ssl_cycle.pt')
     p.add_argument('--output-dir', default='checkpoints/embeddings')
@@ -83,6 +84,7 @@ def main():
 
     dataset = SSLDataset(
         args.features, args.lob_tensors, args.lob_timestamps,
+        order_batches_dir=args.order_batches_dir,
         lookback_bars=args.lookback_bars,
         min_idx=args.lookback_bars,
         max_idx=n,
