@@ -163,13 +163,19 @@ def build_order_batches(
     print(f"📂 Loading MBO data...")
     df_mbo = pd.read_parquet(mbo_path)
     df_mbo['ts_event'] = pd.to_datetime(df_mbo['ts_event'])
+    # Normalize timezone (مهم: لو tz mismatch بين MBO و bars، الـ groupby keys لا تطابق)
+    if df_mbo['ts_event'].dt.tz is not None:
+        df_mbo['ts_event'] = df_mbo['ts_event'].dt.tz_convert('UTC').dt.tz_localize(None)
     df_mbo = df_mbo.sort_values('ts_event').reset_index(drop=True)
-    print(f"   {len(df_mbo):,} MBO ticks")
+    print(f"   {len(df_mbo):,} MBO ticks | tz=naive")
 
     # ── Load bars features ──
     print(f"📂 Loading bars features...")
     df_bars = pd.read_parquet(features_parquet)
     df_bars['ts_event'] = pd.to_datetime(df_bars['ts_event'])
+    # Same normalization
+    if df_bars['ts_event'].dt.tz is not None:
+        df_bars['ts_event'] = df_bars['ts_event'].dt.tz_convert('UTC').dt.tz_localize(None)
     df_bars = df_bars.sort_values('ts_event').reset_index(drop=True)
     n_bars = len(df_bars)
 

@@ -84,8 +84,8 @@ python self_supervised/pretrain_lob.py \
     $ORDER_BATCHES_FLAG \
     --output "$SSL_OUTPUT_DIR/lob" \
     --epochs 30 \
-    --batch-size 64 \
-    --num-workers 4 \
+    --batch-size 8 \
+    --num-workers 2 \
     --lr 2e-5 \
     --train-split "$TRAIN_SPLIT" \
     2>&1 | tee "$SSL_OUTPUT_DIR/phase_a_lob.log"
@@ -107,8 +107,8 @@ python self_supervised/pretrain_cycle.py \
     $ORDER_BATCHES_FLAG \
     --output "$SSL_OUTPUT_DIR/cycle" \
     --epochs 25 \
-    --batch-size 64 \
-    --num-workers 4 \
+    --batch-size 32 \
+    --num-workers 2 \
     --lr 2e-5 \
     --train-split "$TRAIN_SPLIT" \
     2>&1 | tee "$SSL_OUTPUT_DIR/phase_b_cycle.log"
