@@ -246,20 +246,26 @@ class SSLDataset(Dataset):
         n = len(self.df)
         print(f"  ⚙️  Precomputing SSL targets...")
 
+        def _safe_col(col_name, fallback=0.0, dtype=np.float32):
+            """Safely extract numeric column or fallback array."""
+            if col_name in self.df.columns:
+                return pd.to_numeric(self.df[col_name], errors='coerce').fillna(fallback).to_numpy(dtype=dtype)
+            return np.full(n, fallback, dtype=dtype)
+
         close = pd.to_numeric(self.df['close'], errors='coerce').to_numpy(dtype=np.float64)
         log_ret = np.zeros(n, dtype=np.float32)
         log_ret[:-1] = np.log(np.maximum(close[1:], 1e-9) / np.maximum(close[:-1], 1e-9)).astype(np.float32)
         self.next_price = log_ret
 
         obi_col = 'obi_net' if 'obi_net' in self.df.columns else 'order_flow_imbalance'
-        obi = pd.to_numeric(self.df.get(obi_col, 0.0), errors='coerce').fillna(0.0).to_numpy(dtype=np.float32)
+        obi = _safe_col(obi_col, fallback=0.0)
         obi = np.clip(obi, -1.0, 1.0)
         next_obi = np.zeros(n, dtype=np.float32)
         next_obi[:-1] = obi[1:]
         self.next_imbalance = next_obi
 
         atr_col = 'atr_14' if 'atr_14' in self.df.columns else 'atr'
-        atr = pd.to_numeric(self.df.get(atr_col, 0.001), errors='coerce').fillna(0.001).to_numpy(dtype=np.float32)
+        atr = _safe_col(atr_col, fallback=0.001)
         next_atr = np.zeros(n, dtype=np.float32)
         next_atr[:-1] = atr[1:]
         self.next_volatility = np.maximum(next_atr, 1e-6)

@@ -170,6 +170,25 @@ def build_order_batches(
     df_bars['ts_event'] = pd.to_datetime(df_bars['ts_event'])
     df_bars = df_bars.sort_values('ts_event').reset_index(drop=True)
     n_bars = len(df_bars)
+
+    # ── Auto-detect freq من bars (override الـ user input لو لا يطابق) ──
+    diffs_sec = df_bars['ts_event'].diff().dt.total_seconds().dropna()
+    if len(diffs_sec) > 10:
+        median_diff = float(diffs_sec.median())
+        detected_freq = None
+        if median_diff <= 75:
+            detected_freq = '1min'
+        elif median_diff <= 360:
+            detected_freq = '5min'
+        elif median_diff <= 1080:
+            detected_freq = '15min'
+        elif median_diff <= 2400:
+            detected_freq = '30min'
+        elif median_diff <= 4200:
+            detected_freq = '1h'
+        if detected_freq and detected_freq != freq:
+            print(f"   ⚠️  Detected bar freq = {detected_freq} (overriding --freq {freq})")
+            freq = detected_freq
     print(f"   {n_bars:,} bars @ {freq}")
 
     # ── Pre-compute bar windows ──
