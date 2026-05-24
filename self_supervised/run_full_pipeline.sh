@@ -145,6 +145,7 @@ python self_supervised/fine_tune_direction.py \
     --output "$SSL_OUTPUT_DIR/direction" \
     --epochs 100 \
     --batch-size 32 \
+    --hidden-dim 128 \
     --train-split "$TRAIN_SPLIT" \
     2>&1 | tee "$SSL_OUTPUT_DIR/phase_d_direction.log"
 
