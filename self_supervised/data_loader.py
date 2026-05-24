@@ -239,7 +239,24 @@ class SSLDataset(Dataset):
         self.context_cols = [c for c in numeric_cols if c not in exclude_cols][:context_dim]
         print(f"     context features: {len(self.context_cols)} (capped at {context_dim})")
 
+        # Compute z-score normalization stats for context features
+        # (يمنع gradient explosions من cvd/cumulative values)
+        self._compute_context_stats()
+
         self._precompute_targets()
+
+    def _compute_context_stats(self):
+        """Compute mean/std لكل context column للـ z-score normalization."""
+        ctx_data = np.zeros((len(self.df), len(self.context_cols)), dtype=np.float64)
+        for j, col in enumerate(self.context_cols):
+            vals = pd.to_numeric(self.df[col], errors='coerce').fillna(0.0).to_numpy()
+            ctx_data[:, j] = np.clip(vals, -1e9, 1e9)  # safety clip
+        self.context_mu = ctx_data.mean(axis=0).astype(np.float32)
+        self.context_sigma = ctx_data.std(axis=0).astype(np.float32)
+        # Avoid division by zero
+        self.context_sigma = np.maximum(self.context_sigma, 1e-6)
+        print(f"     context stats: mu range=[{self.context_mu.min():.3e}, {self.context_mu.max():.3e}], "
+              f"sigma range=[{self.context_sigma.min():.3e}, {self.context_sigma.max():.3e}]")
 
     def _precompute_targets(self):
         """Precompute SSL targets للسرعة."""
@@ -321,6 +338,11 @@ class SSLDataset(Dataset):
         context = _build_context_features(
             self.df.iloc[idx], self.context_cols, target_dim=self.context_dim,
         )
+        # Z-score normalization (يمنع gradient explosion من cvd/cumulative values)
+        n_ctx_actual = len(self.context_cols)
+        if n_ctx_actual > 0:
+            context[:n_ctx_actual] = (context[:n_ctx_actual] - self.context_mu) / self.context_sigma
+            context[:n_ctx_actual] = np.clip(context[:n_ctx_actual], -5.0, 5.0)  # safety clip
 
         # Cycle window
         cycle_cols = [

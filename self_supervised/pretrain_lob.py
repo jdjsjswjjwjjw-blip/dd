@@ -54,21 +54,17 @@ def train_epoch(model, loader, optimizer, device, scaler=None, scheduler=None) -
             'context': batch['context'].to(device),
         }
         optimizer.zero_grad()
-        if scaler is not None:
-            with torch.amp.autocast('cuda'):
-                outputs = model(**inputs)
-                losses = model.heads.compute_loss(outputs, targets)
-            scaler.scale(losses['total']).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # ← أصرم
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            outputs = model(**inputs)
-            losses = model.heads.compute_loss(outputs, targets)
-            losses['total'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # ← أصرم
-            optimizer.step()
+        outputs = model(**inputs)
+        losses = model.heads.compute_loss(outputs, targets)
+        total_loss = losses['total']
+
+        # NaN guard: skip batch لو الـ loss = NaN/Inf (يحمي من corruption)
+        if not torch.isfinite(total_loss):
+            continue
+
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        optimizer.step()
         if scheduler is not None:
             scheduler.step()
         for k, v in losses.items():
