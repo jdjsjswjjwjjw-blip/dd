@@ -291,8 +291,13 @@ class SSLDataset(Dataset):
         print(f"     {len(self.df):,} rows × {len(self.df.columns)} columns")
 
         print(f"  📂 Loading {lob_tensors_path}...")
-        self.lob_tensors = np.load(lob_tensors_path, mmap_mode='r')
-        print(f"     shape={self.lob_tensors.shape}")
+        # D2 fix: avoid mmap_mode='r' — multi-process DataLoader workers
+        # fork shared file descriptors and can hit data corruption races
+        # on Linux. Loading into memory is safe for typical SSL dataset
+        # sizes (~1GB for 6 months of 15min × 50 × 20 × 3 × fp32).
+        self.lob_tensors = np.load(lob_tensors_path)
+        print(f"     shape={self.lob_tensors.shape}, "
+              f"size={self.lob_tensors.nbytes / 1e9:.2f} GB")
 
         if len(self.df) != len(self.lob_tensors):
             raise ValueError(
@@ -309,9 +314,11 @@ class SSLDataset(Dataset):
                 self.use_real_orders = False
             else:
                 print(f"  📂 Loading real OrderBatches from {order_batches_dir}...")
-                self.order_features_arr = np.load(ob_features, mmap_mode='r')
-                self.order_masks_arr = np.load(ob_masks, mmap_mode='r')
-                print(f"     order_features: {self.order_features_arr.shape}")
+                # D2 fix: see above. ~1.16 GB for typical SSL setup.
+                self.order_features_arr = np.load(ob_features)
+                self.order_masks_arr = np.load(ob_masks)
+                print(f"     order_features: {self.order_features_arr.shape}, "
+                      f"size={self.order_features_arr.nbytes / 1e9:.2f} GB")
                 print(f"     order_masks: {self.order_masks_arr.shape}")
                 self.n_orders = self.order_features_arr.shape[2]
                 print(f"     ✅ Real orders mode enabled (n_orders={self.n_orders})")

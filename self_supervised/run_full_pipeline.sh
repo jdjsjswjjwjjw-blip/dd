@@ -17,7 +17,11 @@
 #   D.  Fine-tune direction head (دقائق)
 #   E.  Validation report (~5 ثواني)
 
-set -e
+# D1 fix: set -o pipefail so `cmd | tee log` propagates cmd's failure.
+# Without pipefail, set -e alone is defeated by tee (which almost never
+# fails), so a crashed phase wouldn't abort the pipeline — the script
+# would continue with stale checkpoints from prior runs.
+set -eo pipefail
 
 # ── Configuration ──
 PIPELINE_DIR="${1:-pipeline_clean}"
@@ -85,9 +89,10 @@ python self_supervised/pretrain_lob.py \
     --output "$SSL_OUTPUT_DIR/lob" \
     --epochs 30 \
     --batch-size 8 \
-    --num-workers 2 \
+    --num-workers 0 \
     --lr 1e-5 \
     --train-split "$TRAIN_SPLIT" \
+    --embargo-bars 24 \
     2>&1 | tee "$SSL_OUTPUT_DIR/phase_a_lob.log"
 
 LOB_CKPT="$SSL_OUTPUT_DIR/lob/best_ssl_lob.pt"
@@ -108,9 +113,10 @@ python self_supervised/pretrain_cycle.py \
     --output "$SSL_OUTPUT_DIR/cycle" \
     --epochs 25 \
     --batch-size 32 \
-    --num-workers 2 \
+    --num-workers 0 \
     --lr 2e-5 \
     --train-split "$TRAIN_SPLIT" \
+    --embargo-bars 24 \
     2>&1 | tee "$SSL_OUTPUT_DIR/phase_b_cycle.log"
 
 CYCLE_CKPT="$SSL_OUTPUT_DIR/cycle/best_ssl_cycle.pt"
@@ -131,6 +137,8 @@ python self_supervised/extract_embeddings.py \
     --lob-checkpoint "$LOB_CKPT" \
     --cycle-checkpoint "$CYCLE_CKPT" \
     --output-dir "$SSL_OUTPUT_DIR/embeddings" \
+    --train-split "$TRAIN_SPLIT" \
+    --embargo-bars 24 \
     2>&1 | tee "$SSL_OUTPUT_DIR/phase_c_embeddings.log"
 
 EMBEDDINGS="$SSL_OUTPUT_DIR/embeddings/embeddings.npy"
