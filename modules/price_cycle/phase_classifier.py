@@ -117,9 +117,13 @@ def compute_phase_features(
     volatility_state = (vol_short - vol_long) / np.maximum(vol_long, eps)
 
     # Effort vs Result (Wyckoff): high volume + low price progress = absorption
+    # BUG FIX: previous version used `price_progress.std()` (global, full-series)
+    # → look-ahead leak (every bar "knew" dataset-wide vol). Replace with
+    # causal rolling std over the same feature window.
     price_progress = np.abs(slope)
     effort = vol_sma_short / np.maximum(vol_sma_long, eps)
-    effort_result = effort - price_progress / np.maximum(price_progress.std() + eps, eps)
+    pp_roll_std = _causal_rolling(price_progress, W * 3, "std")
+    effort_result = effort - price_progress / np.maximum(pp_roll_std, eps)
 
     return {
         "trend_slope": np.nan_to_num(slope),

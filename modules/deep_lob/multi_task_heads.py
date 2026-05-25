@@ -129,14 +129,19 @@ class MultiTaskHeads(nn.Module):
         -------
         MultiTaskOutput dataclass
         """
+        # softplus(x) saturates to 0 for x &lt;&lt; 0 under fp16/AMP, causing
+        # log(pred + eps) to permanently produce huge gradients in
+        # next_volatility loss. We add a lower clamp so the activation
+        # never reaches values that would cause log-saturation.
+        # 1e-5 = 0.1 pip in price space, well below realistic ATR floor.
         return MultiTaskOutput(
             direction_logits=self.head_direction(shared_emb),
             next_price=self.head_next_price(shared_emb).squeeze(-1),
             next_imbalance=torch.tanh(self.head_next_imbalance(shared_emb).squeeze(-1)),
-            next_volatility=F.softplus(self.head_next_volatility(shared_emb).squeeze(-1)),
+            next_volatility=F.softplus(self.head_next_volatility(shared_emb).squeeze(-1)).clamp(min=1e-5, max=1.0),
             next_regime_logits=self.head_next_regime(shared_emb),
-            wall_persist=F.softplus(self.head_wall_persist(shared_emb).squeeze(-1)),
-            time_to_event=F.softplus(self.head_time_to_event(shared_emb).squeeze(-1)),
+            wall_persist=F.softplus(self.head_wall_persist(shared_emb).squeeze(-1)).clamp(min=0.0, max=100.0),
+            time_to_event=F.softplus(self.head_time_to_event(shared_emb).squeeze(-1)).clamp(min=0.0, max=100.0),
             shared_embedding=shared_emb,
         )
 
@@ -159,8 +164,9 @@ class MultiTaskHeads(nn.Module):
 
         # Direction (main)
         if targets.direction is not None:
+            tgt_dir = targets.direction.long().clamp(0, cfg.direction_n_classes - 1)
             loss_dir = F.cross_entropy(
-                outputs.direction_logits, targets.direction.long(),
+                outputs.direction_logits, tgt_dir,
                 reduction=reduction,
             )
             losses["direction"] = loss_dir
@@ -188,8 +194,9 @@ class MultiTaskHeads(nn.Module):
 
         # Next regime
         if targets.next_regime is not None:
+            tgt_reg = targets.next_regime.long().clamp(0, cfg.regime_n_classes - 1)
             loss_nr = F.cross_entropy(
-                outputs.next_regime_logits, targets.next_regime.long(),
+                outputs.next_regime_logits, tgt_reg,
                 reduction=reduction,
             )
             losses["next_regime"] = loss_nr

@@ -101,7 +101,11 @@ class EventAggregator(nn.Module):
 
         # Cross-attention: events ↔ orders
         # logits: (B, E, N)
-        temperature = torch.exp(self.log_temperature)
+        # Clamp log_temperature ∈ [-3, 3] → temperature ∈ [0.05, 20] so
+        # exp() drift cannot collapse attention to one-hot (temp→0) or
+        # uniform garbage (temp→∞).
+        log_temp = self.log_temperature.clamp(min=-3.0, max=3.0)
+        temperature = torch.exp(log_temp)
         logits = (queries @ keys.transpose(-2, -1)) * self.scale / temperature
 
         # Mask invalid orders

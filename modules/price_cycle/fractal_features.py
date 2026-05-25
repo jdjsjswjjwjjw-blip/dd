@@ -77,7 +77,13 @@ def hurst_exponent(series: np.ndarray, max_lag: int = 20) -> float:
     log_lags = np.log(valid_lags)
     log_tau = np.log(tau)
     # slope of log_tau vs log_lags = H
-    slope = np.polyfit(log_lags, log_tau, 1)[0]
+    try:
+        slope = np.polyfit(log_lags, log_tau, 1)[0]
+    except (np.linalg.LinAlgError, ValueError):
+        return 0.5
+    # np.clip(NaN, 0, 1) returns NaN — guard explicitly
+    if not np.isfinite(slope):
+        return 0.5
     return float(np.clip(slope, 0.0, 1.0))
 
 

@@ -56,27 +56,35 @@ class BarLevelLSTM(nn.Module):
     def _pool_events(
         self,
         events: torch.Tensor,
+        bar_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Attention-pool events into single bar embedding.
 
         Parameters
         ----------
-        events : (B, E, D)
+        events    : (B, E, D)
+        bar_valid : (B,) bool — True if bar has ≥1 valid order. If False the
+                    bar's events are bias-driven (from empty-bar fallback);
+                    pooling returns a constant zero vector so the LSTM gets
+                    a clean zero input for the masked-out bar.
 
         Returns
         -------
         bar_emb : (B, D)
         """
-        B = events.size(0)
-        # query (1, D) → expand to batch
+        B, E, D = events.shape
         q = self.event_pool_query.expand(B, -1).unsqueeze(1)  # (B, 1, D)
         k = self.event_pool_key(events)                        # (B, E, D)
         v = self.event_pool_value(events)                      # (B, E, D)
 
-        scale = events.size(-1) ** -0.5
+        scale = D ** -0.5
         attn = (q @ k.transpose(-2, -1)) * scale               # (B, 1, E)
         attn = torch.softmax(attn, dim=-1)
         pooled = (attn @ v).squeeze(1)                         # (B, D)
+
+        if bar_valid is not None:
+            # Zero-out pooled embedding for invalid bars (defense-in-depth)
+            pooled = pooled * bar_valid.to(pooled.dtype).unsqueeze(-1)
         return pooled
 
     def forward(
@@ -98,23 +106,28 @@ class BarLevelLSTM(nn.Module):
         """
         B, T, E, D = bar_events_sequence.shape
 
-        # Pool events per bar: (B, T, E, D) → (B, T, D)
+        # Pool events per bar (B, T, E, D) → (B, T, D), with per-bar masking
         bars_flat = bar_events_sequence.reshape(B * T, E, D)
-        bars_pooled = self._pool_events(bars_flat)        # (B*T, D)
+        if bar_mask is not None:
+            bar_valid_flat = bar_mask.reshape(B * T)
+            bars_pooled = self._pool_events(bars_flat, bar_valid_flat)
+        else:
+            bars_pooled = self._pool_events(bars_flat)
         bars_pooled = bars_pooled.reshape(B, T, D)
 
         # LSTM
         sequence_output, (h_n, c_n) = self.lstm(bars_pooled)
         sequence_output = self.ln(sequence_output)
 
-        # Get final state per batch element (respect bar_mask)
+        # Final state per batch element: respect bar_mask
         if bar_mask is not None:
-            # Find last valid index per batch
             valid_counts = bar_mask.sum(dim=1)            # (B,)
+            has_any_valid = valid_counts > 0              # (B,) bool
             last_valid_idx = (valid_counts - 1).clamp(min=0)
-            # Gather
             batch_idx = torch.arange(B, device=sequence_output.device)
             final_state = sequence_output[batch_idx, last_valid_idx]  # (B, output_dim)
+            # If a batch element has NO valid bars, return zero state (no garbage)
+            final_state = final_state * has_any_valid.to(final_state.dtype).unsqueeze(-1)
         else:
             final_state = sequence_output[:, -1, :]
 

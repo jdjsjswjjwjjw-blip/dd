@@ -152,6 +152,12 @@ class OrderEmbedder(nn.Module):
         -------
         embeddings : (B, N, embed_dim)
         """
+        # NaN/Inf sanitization: NaN-cast-to-long produces large garbage ints
+        # on CUDA, then clamp(0, V-1) silently maps to class 0 ("BUY").
+        # Replace NaN/Inf with 0 BEFORE the cast so corruption is visible
+        # (corrupted rows become deterministic padding, not a fake "BUY").
+        order_features = torch.nan_to_num(order_features, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Split features
         sides = order_features[..., 0].long().clamp(0, self.config.side_vocab_size - 1)
         types = order_features[..., 1].long().clamp(0, self.config.type_vocab_size - 1)

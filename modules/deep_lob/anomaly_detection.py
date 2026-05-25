@@ -72,10 +72,22 @@ class MahalanobisAnomalyDetector:
 
         # Regularization (handle singular cov)
         cov_reg = cov + self.regularization * np.eye(X.shape[1])
-        self.cov_inv = np.linalg.inv(cov_reg)
+        # Use pseudo-inverse: more stable when cov is rank-deficient
+        # (small n relative to d, or strongly correlated dims).
+        # SVD-based pinv gracefully handles the ill-conditioned case
+        # whereas plain inv silently returns garbage.
+        try:
+            self.cov_inv = np.linalg.pinv(cov_reg, hermitian=True)
+        except (np.linalg.LinAlgError, TypeError):
+            self.cov_inv = np.linalg.pinv(cov_reg)
+        # Symmetrize to enforce PSD numerically
+        self.cov_inv = 0.5 * (self.cov_inv + self.cov_inv.T)
 
         # Compute training distances → threshold
         self.training_distances = self._distance_batch(X)
+        # If everything degenerated to NaN (rare), reset to a safe constant
+        if not np.all(np.isfinite(self.training_distances)):
+            self.training_distances = np.zeros(X.shape[0])
         self.threshold = float(
             self.training_distances.mean() + self.threshold_sigma * self.training_distances.std()
         )
@@ -85,7 +97,11 @@ class MahalanobisAnomalyDetector:
     def _distance_batch(self, X: np.ndarray) -> np.ndarray:
         """Batch Mahalanobis distance computation."""
         diff = X - self.mean
-        return np.sqrt(np.einsum("ij,jk,ik->i", diff, self.cov_inv, diff))
+        quad = np.einsum("ij,jk,ik->i", diff, self.cov_inv, diff)
+        # Clamp negative quadratic form (only possible from numerical noise
+        # when cov_inv loses PSD-ness) — sqrt of negative would yield NaN.
+        quad = np.maximum(quad, 0.0)
+        return np.sqrt(quad)
 
     def detect(self, embedding: np.ndarray) -> AnomalyResult:
         """Detect anomaly for single embedding.

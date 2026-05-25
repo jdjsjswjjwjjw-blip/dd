@@ -107,12 +107,16 @@ class CrossAttentionFusion(nn.Module):
         self.book_proj = nn.Linear(book_dim, common_dim)
         self.context_proj = nn.Linear(context_dim, common_dim)
 
-        # Cross-attention: book ↔ context (treated as sequence of length 1+1)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=common_dim,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
+        # SEPARATE attention modules for each direction — same module used
+        # for both directions was a logical bug: Q/K/V projections trained
+        # on opposite semantics get averaged.
+        self.attn_book_q = nn.MultiheadAttention(
+            embed_dim=common_dim, num_heads=n_heads,
+            dropout=dropout, batch_first=True,
+        )
+        self.attn_context_q = nn.MultiheadAttention(
+            embed_dim=common_dim, num_heads=n_heads,
+            dropout=dropout, batch_first=True,
         )
 
         # Output projection
@@ -141,26 +145,20 @@ class CrossAttentionFusion(nn.Module):
         -------
         fused : (B, output_dim)
         """
-        B = book_emb.size(0)
-
         # Project to common dim, add sequence dim
         book_seq = self.ln_book(self.book_proj(book_emb)).unsqueeze(1)        # (B, 1, D)
         context_seq = self.ln_context(self.context_proj(context_emb)).unsqueeze(1)  # (B, 1, D)
 
-        # Cross-attention: book queries context
-        book_attended, _ = self.attn(
-            query=book_seq,
-            key=context_seq,
-            value=context_seq,
+        # Book queries context (book learns what to look at in context)
+        book_attended, _ = self.attn_book_q(
+            query=book_seq, key=context_seq, value=context_seq,
         )
-        # Cross-attention: context queries book
-        context_attended, _ = self.attn(
-            query=context_seq,
-            key=book_seq,
-            value=book_seq,
+        # Context queries book (context learns what to look at in book)
+        context_attended, _ = self.attn_context_q(
+            query=context_seq, key=book_seq, value=book_seq,
         )
 
-        # Fuse: book + context_attended-on-book + book_attended-on-context
+        # Fuse: book + book→context attention + context→book attention
         fused_seq = (book_seq + book_attended + context_attended) / 3.0  # (B, 1, D)
         fused = fused_seq.squeeze(1)  # (B, D)
 
