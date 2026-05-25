@@ -153,9 +153,8 @@ ORIGINAL_FEATURES: tuple[str, ...] = (
     'mbp_roll_lob_coverage', 'liquidity_gaps',
     # Session context (وسوم؛ يمكن استبعادها من مدخلات النموذج لاحقًا)
     'is_london', 'is_overlap', 'is_ny',
-    # Volatility / technical (was missing — caused B4/B5 fixes to be invisible
-    # in the saved parquet because reorder_day_trading_columns whitelisted
-    # only ORIGINAL_FEATURES and these weren't in it)
+    # ── Volatility / Technical (computed in add_day_trading_features
+    # but previously DROPPED at save by this whitelist) ──
     'atr_14', 'is_session_break',
     'bar_range', 'body_ratio',
     'rsi_14', 'macd_hist',
@@ -163,6 +162,25 @@ ORIGINAL_FEATURES: tuple[str, ...] = (
     'return_6b', 'return_1h', 'return_4h',
     'volume_ratio_6b', 'volume_ratio_1h', 'volume_ratio_4h',
     'cvd_slope_6b', 'cvd_slope_1h', 'cvd_slope_4h',
+    # ── Seasonal Map (21 features from modules/seasonal_map.py — were
+    # being computed and DROPPED at save) ──
+    'session_phase',
+    'time_since_london_open_min', 'time_to_london_close_min',
+    'time_since_ny_open_min', 'time_to_ny_close_min',
+    'dow_sin', 'dow_cos', 'is_monday', 'is_friday',
+    'dom', 'dom_sin', 'dom_cos',
+    'is_month_end', 'is_month_start',
+    'is_quarter_end', 'is_year_end',
+    'woy_sin', 'woy_cos', 'is_first_week_of_year',
+    'is_dst_transition_week', 'is_event_window',
+    # ── Price Cycle Structural (12 features from
+    # modules/price_cycle/feature_pipeline.py — same issue) ──
+    'cycle_structure_score', 'cycle_bars_since_swing',
+    'cycle_trend_maturity', 'cycle_momentum_decay',
+    'cycle_phase_acc_prob', 'cycle_phase_markup_prob',
+    'cycle_phase_dist_prob', 'cycle_phase_markdown_prob',
+    'cycle_position', 'cycle_hurst',
+    'cycle_fractal_dim', 'cycle_mtf_alignment',
 )
 
 # Alias للمانفيست والعقود — نفس ORIGINAL_FEATURES فقط
