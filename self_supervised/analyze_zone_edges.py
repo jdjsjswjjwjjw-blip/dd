@@ -59,60 +59,54 @@ import pandas as pd
 # Returns + edge computation
 # ════════════════════════════════════════════════════════════════════════════
 
-def _compute_signed_returns(
+def _compute_directional_returns(
     df: pd.DataFrame,
     return_col: str = 'forward_return',
     horizon_bars: int = 12,
     spread_pips: float = 2.0,
     tick_size: float = 0.0001,
 ) -> pd.DataFrame:
-    """Build signed return column: positive iff trade in direction wins.
+    """Build forward return columns for unconditional zone analysis.
 
-    Tries the following return columns in order:
-        1. user-specified --return-col (default: forward_return)
-        2. fwd_ret_clean
-        3. computes from close prices (close[i+horizon] / close[i] - 1)
+    CRITICAL: do NOT sign by bias_label. The bias_label was assigned
+    based on the outcome (LONG if MFE>MAE, SHORT otherwise), so signing
+    by it would yield artifact "win rates" near 100%. The right question
+    is the UNCONDITIONAL forward return at each bar — i.e., "if I trade
+    LONG (or SHORT) on every bar in this zone, what's my expectancy?"
 
-    Then signs by bias_label: LONG (0) keeps sign, SHORT (1) flips.
-    Subtracts spread cost in pips.
+    Adds columns:
+        forward_ret_raw  : raw forward return (close[i+H]/close[i] - 1)
+        long_ret_net     : forward_ret_raw - spread_cost (LONG side)
+        short_ret_net    : -forward_ret_raw - spread_cost (SHORT side)
+        long_ret_pips    : long_ret_net / tick_size
+        short_ret_pips   : short_ret_net / tick_size
     """
     df = df.copy()
 
-    # Source returns
-    src = None
-    for c in [return_col, 'fwd_ret_clean', 'forward_return']:
-        if c in df.columns:
-            vals = pd.to_numeric(df[c], errors='coerce')
-            if vals.notna().sum() > 100:
-                src = c
-                break
-    if src is None:
-        # Build from close
-        close = pd.to_numeric(df['close'], errors='coerce').to_numpy()
-        n = len(close)
-        ret = np.full(n, np.nan)
-        ret[: n - horizon_bars] = (
-            close[horizon_bars:] / np.maximum(close[: n - horizon_bars], 1e-9) - 1.0
-        )
-        df['_computed_fwd_ret'] = ret
-        src = '_computed_fwd_ret'
-    fwd = pd.to_numeric(df[src], errors='coerce')
-
-    bias = df['bias_label'].to_numpy()
-    sign = np.where(bias == 0, 1.0, np.where(bias == 1, -1.0, 0.0))
-    signed_ret = fwd.to_numpy() * sign       # positive iff label-direction wins
-
-    # Subtract spread (in absolute terms, applied per trade)
-    spread_cost = spread_pips * tick_size / np.maximum(
-        pd.to_numeric(df['close'], errors='coerce').to_numpy(), 1e-9
+    # Pick source for forward return — but only as a sanity check; we
+    # ALWAYS recompute from close to avoid label-derived columns.
+    close = pd.to_numeric(df['close'], errors='coerce').to_numpy()
+    n = len(close)
+    ret = np.full(n, np.nan)
+    ret[: n - horizon_bars] = (
+        close[horizon_bars:] / np.maximum(close[: n - horizon_bars], 1e-9) - 1.0
     )
-    signed_ret_net = signed_ret - spread_cost
+    df['forward_ret_raw'] = ret
+    df['_return_src'] = f'close[i+{horizon_bars}]/close[i] - 1 (causal)'
 
-    df['signed_return_gross'] = signed_ret
-    df['signed_return_net']   = signed_ret_net
-    df['signed_return_pips']  = signed_ret_net / tick_size   # in pips
-    df['_return_src'] = src
+    # Spread cost (per trade)
+    spread_cost = spread_pips * tick_size / np.maximum(close, 1e-9)
+    df['long_ret_net']   = ret - spread_cost
+    df['short_ret_net']  = -ret - spread_cost
+    df['long_ret_pips']  = df['long_ret_net'] / tick_size
+    df['short_ret_pips'] = df['short_ret_net'] / tick_size
     return df
+
+
+# Keep the old function as an alias for backward compatibility (it's
+# now considered LEAKY — only useful for sanity-checking the label
+# consistency, NOT for edge discovery).
+_compute_signed_returns = _compute_directional_returns
 
 
 def _bootstrap_ci(arr: np.ndarray, fn=np.mean, n_boot: int = 2000,
@@ -130,52 +124,88 @@ def _bootstrap_ci(arr: np.ndarray, fn=np.mean, n_boot: int = 2000,
 
 
 def _zone_metrics(sub: pd.DataFrame, atr_median_overall: float) -> dict:
-    """Compute edge metrics for one zone subset."""
+    """Compute UNCONDITIONAL edge metrics for one zone subset.
+
+    Tests two strategies independently:
+      • LONG-every-bar: enter LONG at close[i], exit at close[i+H]
+      • SHORT-every-bar: same but short
+
+    For each, reports win-rate, mean pips, Sharpe (bootstrap CI).
+    The better of the two indicates whether the zone has directional
+    bias; if both have negative Sharpe, the zone is range-bound /
+    unprofitable to take a constant direction in.
+
+    Also reports the directional-LABEL distribution (LONG share /
+    SHORT share / NEUTRAL share) as a separate signal — but these
+    metrics are NOT used to compute the trade-side returns.
+    """
     n = len(sub)
     if n == 0:
         return {'n': 0}
 
-    bias = sub['bias_label'].to_numpy()
-    n_long = int((bias == 0).sum())
-    n_short = int((bias == 1).sum())
-    long_share = n_long / max(n, 1)
-    short_share = n_short / max(n, 1)
+    long_pips  = sub['long_ret_pips'].to_numpy()
+    short_pips = sub['short_ret_pips'].to_numpy()
+    # Filter NaN (last horizon bars don't have forward return)
+    long_pips  = long_pips[np.isfinite(long_pips)]
+    short_pips = short_pips[np.isfinite(short_pips)]
+    n_long_bars  = len(long_pips)
+    n_short_bars = len(short_pips)
 
-    ret = sub['signed_return_net'].to_numpy()
-    pips = sub['signed_return_pips'].to_numpy()
-    win_mask = ret > 0
-    win_rate = float(win_mask.mean()) if n > 0 else 0.0
-
-    mean_pips, mp_lo, mp_hi = _bootstrap_ci(pips, fn=np.mean)
-    median_pips = float(np.nanmedian(pips))
-
-    def _sharpe(x):
+    def _sharpe_fn(x):
         x = np.asarray(x, dtype=np.float64)
         x = x[np.isfinite(x)]
         sd = float(np.std(x, ddof=1)) if len(x) > 1 else 0.0
         return float(np.mean(x) / sd) if sd > 0 else 0.0
 
-    sharpe, sh_lo, sh_hi = _bootstrap_ci(pips, fn=_sharpe)
+    def _summary(arr):
+        if len(arr) == 0:
+            return {'n': 0, 'win_rate': 0.0, 'mean_pips': 0.0,
+                    'mean_pips_ci': [0.0, 0.0], 'median_pips': 0.0,
+                    'sharpe': 0.0, 'sharpe_ci': [0.0, 0.0]}
+        wr = float((arr > 0).mean())
+        mp, mp_lo, mp_hi = _bootstrap_ci(arr, fn=np.mean)
+        med = float(np.median(arr))
+        sh, sh_lo, sh_hi = _bootstrap_ci(arr, fn=_sharpe_fn)
+        return {
+            'n': int(len(arr)),
+            'win_rate': float(wr),
+            'mean_pips': float(mp),
+            'mean_pips_ci': [float(mp_lo), float(mp_hi)],
+            'median_pips': float(med),
+            'sharpe': float(sh),
+            'sharpe_ci': [float(sh_lo), float(sh_hi)],
+        }
 
-    edge_score = mean_pips / max(atr_median_overall, 1e-9) if atr_median_overall > 0 else 0.0
+    long_stats  = _summary(long_pips)
+    short_stats = _summary(short_pips)
 
-    # Per-direction win rates
-    long_wins = int(((bias == 0) & win_mask).sum())
-    short_wins = int(((bias == 1) & win_mask).sum())
-    long_wr = long_wins / max(n_long, 1)
-    short_wr = short_wins / max(n_short, 1)
+    # Label distribution (informational only — not used in P&L)
+    if 'bias_label' in sub.columns:
+        bias = sub['bias_label'].to_numpy()
+        n_long_lbl  = int((bias == 0).sum())
+        n_short_lbl = int((bias == 1).sum())
+        n_neut_lbl  = int((bias == 2).sum())
+        n_directional = n_long_lbl + n_short_lbl
+        long_label_share  = n_long_lbl  / max(n, 1)
+        short_label_share = n_short_lbl / max(n, 1)
+        directional_rate  = n_directional / max(n, 1)
+    else:
+        long_label_share = short_label_share = directional_rate = 0.0
+        n_directional = 0
+
+    # Edge score: |best side mean| / atr_median
+    best_mean = max(long_stats['mean_pips'], short_stats['mean_pips'])
+    edge_score = best_mean / max(atr_median_overall / 1e-4, 1e-9) if atr_median_overall > 0 else 0.0
 
     return {
         'n': int(n),
-        'n_long': n_long, 'n_short': n_short,
-        'long_share': float(long_share), 'short_share': float(short_share),
-        'long_win_rate': float(long_wr), 'short_win_rate': float(short_wr),
-        'win_rate': float(win_rate),
-        'mean_pips': float(mean_pips),
-        'mean_pips_ci': [float(mp_lo), float(mp_hi)],
-        'median_pips': float(median_pips),
-        'sharpe': float(sharpe),
-        'sharpe_ci': [float(sh_lo), float(sh_hi)],
+        'directional_rate': float(directional_rate),
+        'long_label_share': float(long_label_share),
+        'short_label_share': float(short_label_share),
+        'long_side': long_stats,
+        'short_side': short_stats,
+        'best_side': 'LONG' if long_stats['sharpe'] >= short_stats['sharpe'] else 'SHORT',
+        'best_sharpe': float(max(long_stats['sharpe'], short_stats['sharpe'])),
         'edge_score': float(edge_score),
     }
 
@@ -267,45 +297,69 @@ def _format_table(rows: list[dict], cols: list[tuple[str, str]]) -> str:
 
 
 def _filter_promising(d: dict, min_n: int = 10) -> list[dict]:
-    """Return list of zone dicts that look like real edges."""
+    """Surface zones where EITHER side (LONG or SHORT) has a positive edge.
+
+    A zone has a real edge if, taking the better side, the bootstrap CI
+    lower bound of Sharpe is > 0 and win rate ≥ 0.52.
+    """
     promising = []
     for category in ('by_session', 'by_hour', 'by_dow', 'by_regime', 'by_session_x_regime'):
         for name, m in d.get(category, {}).items():
             if m['n'] < min_n:
                 continue
-            sh_lo, _ = m['sharpe_ci']
-            mp_lo, _ = m['mean_pips_ci']
-            promising.append({
-                'category': category,
-                'zone': str(name),
-                **m,
-                'ci_lower_sharpe': sh_lo,
-                'ci_lower_pips': mp_lo,
-                'pass': sh_lo > 0 and m['win_rate'] >= 0.52 and m['n'] >= min_n,
-            })
+            for side_name in ('LONG', 'SHORT'):
+                side_key = 'long_side' if side_name == 'LONG' else 'short_side'
+                s = m[side_key]
+                if s['n'] < min_n:
+                    continue
+                sh_lo, _ = s['sharpe_ci']
+                mp_lo, _ = s['mean_pips_ci']
+                promising.append({
+                    'category': category,
+                    'zone': str(name),
+                    'side': side_name,
+                    'n': s['n'],
+                    'directional_rate': m.get('directional_rate', 0.0),
+                    'win_rate': s['win_rate'],
+                    'mean_pips': s['mean_pips'],
+                    'mean_pips_ci': s['mean_pips_ci'],
+                    'sharpe': s['sharpe'],
+                    'sharpe_ci': s['sharpe_ci'],
+                    'ci_lower_sharpe': sh_lo,
+                    'ci_lower_pips': mp_lo,
+                    'pass': sh_lo > 0 and s['win_rate'] >= 0.52 and s['n'] >= min_n,
+                })
     return promising
 
 
 def build_markdown(results: dict, promising: list[dict], extras: dict) -> str:
-    out = ['# Zone Edge Analysis (no-training, descriptive)\n']
+    out = ['# Zone Edge Analysis — Unconditional (no labels, no training)\n']
     out.append(f"**Data**: {extras['data_source']}")
-    out.append(f"**Total directional bars**: {results['overall']['n']}")
-    out.append(f"**Return source column**: `{extras['return_col']}`")
-    out.append(f"**ATR median (pips)**: {extras['atr_median_pips']:.1f}\n")
+    out.append(f"**Bars analyzed**: {extras['n_total']} (forward-return horizon: {extras['horizon_bars']} bars)")
+    out.append(f"**Directional labels in data**: {extras['n_directional']} (informational only — NOT used in P&L)")
+    out.append(f"**Return source**: `{extras['return_col']}`")
+    out.append(f"**ATR median (pips)**: {extras['atr_median_pips']:.1f}")
+    out.append(f"**Spread cost**: {extras['spread_pips']:.1f} pips per trade\n")
+
+    out.append('> **Methodology**: For each zone, compute the forward return '
+               '`close[i+H]/close[i] - 1` on every bar (regardless of label). '
+               'Then evaluate two strategies independently: (1) trade LONG '
+               'every bar, (2) trade SHORT every bar. A real edge means '
+               'one of the sides has Sharpe CI lower bound > 0. The '
+               'bias_label column is NOT used to compute returns (it was '
+               'derived from outcomes — using it would be data snooping).\n')
 
     # Overall
     o = results['overall']
     out.append('## Overall')
-    out.append(f"- n = {o['n']} | LONG = {o['n_long']} | SHORT = {o['n_short']}")
-    out.append(
-        f"- win_rate = {o['win_rate']:.3f} | mean = {o['mean_pips']:+.2f} pips "
-        f"(CI [{o['mean_pips_ci'][0]:+.2f}, {o['mean_pips_ci'][1]:+.2f}])"
-    )
-    out.append(
-        f"- Sharpe = {o['sharpe']:.3f} (CI [{o['sharpe_ci'][0]:.3f}, {o['sharpe_ci'][1]:.3f}])\n"
-    )
+    out.append(f"- n_bars = {o['n']} | directional labels = {o['directional_rate']*100:.1f}%")
+    long_s, short_s = o['long_side'], o['short_side']
+    out.append(f"- LONG  : win={long_s['win_rate']:.3f} | mean={long_s['mean_pips']:+.2f} pips "
+               f"| Sharpe={long_s['sharpe']:+.3f} CI [{long_s['sharpe_ci'][0]:+.3f}, {long_s['sharpe_ci'][1]:+.3f}]")
+    out.append(f"- SHORT : win={short_s['win_rate']:.3f} | mean={short_s['mean_pips']:+.2f} pips "
+               f"| Sharpe={short_s['sharpe']:+.3f} CI [{short_s['sharpe_ci'][0]:+.3f}, {short_s['sharpe_ci'][1]:+.3f}]\n")
 
-    # Categories
+    # Per category
     for cat, title in [
         ('by_session', 'By Session'),
         ('by_regime', 'By Regime'),
@@ -320,66 +374,67 @@ def build_markdown(results: dict, promising: list[dict], extras: dict) -> str:
         for name, m in results[cat].items():
             rows.append({
                 'zone': str(name), 'n': m['n'],
-                'long_%': f"{m['long_share']*100:.0f}",
-                'short_%': f"{m['short_share']*100:.0f}",
-                'win_rate': m['win_rate'],
-                'mean_pips': m['mean_pips'],
-                'sharpe': m['sharpe'],
-                'sharpe_lo': m['sharpe_ci'][0],
+                'long_win': m['long_side']['win_rate'],
+                'long_pips': m['long_side']['mean_pips'],
+                'long_sharpe': m['long_side']['sharpe'],
+                'long_sharpe_lo': m['long_side']['sharpe_ci'][0],
+                'short_win': m['short_side']['win_rate'],
+                'short_pips': m['short_side']['mean_pips'],
+                'short_sharpe': m['short_side']['sharpe'],
+                'short_sharpe_lo': m['short_side']['sharpe_ci'][0],
             })
-        rows = sorted(rows, key=lambda r: -r['sharpe'])
+        rows = sorted(rows, key=lambda r: -max(r['long_sharpe_lo'], r['short_sharpe_lo']))
         out.append(_format_table(rows, [
             ('zone', 'Zone'), ('n', 'n'),
-            ('long_%', 'L%'), ('short_%', 'S%'),
-            ('win_rate', 'Win'), ('mean_pips', 'Pips'),
-            ('sharpe', 'Sharpe'), ('sharpe_lo', 'Sharpe_lo'),
+            ('long_win', 'L-win'), ('long_pips', 'L-pips'),
+            ('long_sharpe', 'L-Sh'), ('long_sharpe_lo', 'L-Sh_lo'),
+            ('short_win', 'S-win'), ('short_pips', 'S-pips'),
+            ('short_sharpe', 'S-Sh'), ('short_sharpe_lo', 'S-Sh_lo'),
         ]))
         out.append('')
 
-    # Promising edges (passing filter)
+    # Statistically promising
     passing = [p for p in promising if p['pass']]
     out.append('## ⭐ Statistically Promising Edges')
-    out.append(f"_Filters: n ≥ 10, win_rate ≥ 0.52, sharpe CI lower bound > 0._\n")
+    out.append(f"_Filters: n ≥ 10, win_rate ≥ 0.52, Sharpe CI lower bound > 0_\n")
     if not passing:
-        out.append('_None found — no zone passes statistical significance on this sample size._\n')
+        out.append('_No zone passes statistical significance — market appears '
+                   'efficient on this sample at the chosen horizon. Try a '
+                   'different horizon (--horizon-bars) or larger dataset._\n')
     else:
         passing = sorted(passing, key=lambda p: -p['ci_lower_sharpe'])
         rows = []
         for p in passing:
             rows.append({
-                'category': p['category'],
-                'zone': p['zone'], 'n': p['n'],
-                'win_rate': p['win_rate'],
+                'category': p['category'], 'zone': p['zone'], 'side': p['side'],
+                'n': p['n'], 'win_rate': p['win_rate'],
                 'mean_pips': p['mean_pips'],
-                'sharpe': p['sharpe'],
-                'sharpe_lo': p['ci_lower_sharpe'],
+                'sharpe': p['sharpe'], 'sharpe_lo': p['ci_lower_sharpe'],
             })
         out.append(_format_table(rows, [
-            ('category', 'Category'), ('zone', 'Zone'), ('n', 'n'),
-            ('win_rate', 'Win'), ('mean_pips', 'Pips'),
+            ('category', 'Category'), ('zone', 'Zone'), ('side', 'Side'),
+            ('n', 'n'), ('win_rate', 'Win'), ('mean_pips', 'Pips'),
             ('sharpe', 'Sharpe'), ('sharpe_lo', 'Sharpe_lo'),
         ]))
         out.append('')
 
-    # Top 5 anti-edges (consistently losing zones)
+    # Anti-edges
     anti = sorted(
-        [p for p in promising if p['sharpe'] < 0 and p['n'] >= 10],
+        [p for p in promising if p['sharpe'] < 0],
         key=lambda p: p['sharpe'],
     )[:5]
     if anti:
-        out.append('## ⚠️ Anti-Edges (zones to AVOID)')
+        out.append('## ⚠️ Anti-Edges (zones to AVOID for this side)')
         rows = []
         for p in anti:
             rows.append({
-                'category': p['category'],
-                'zone': p['zone'], 'n': p['n'],
-                'win_rate': p['win_rate'],
-                'mean_pips': p['mean_pips'],
-                'sharpe': p['sharpe'],
+                'category': p['category'], 'zone': p['zone'], 'side': p['side'],
+                'n': p['n'], 'win_rate': p['win_rate'],
+                'mean_pips': p['mean_pips'], 'sharpe': p['sharpe'],
             })
         out.append(_format_table(rows, [
-            ('category', 'Category'), ('zone', 'Zone'), ('n', 'n'),
-            ('win_rate', 'Win'), ('mean_pips', 'Pips'),
+            ('category', 'Category'), ('zone', 'Zone'), ('side', 'Side'),
+            ('n', 'n'), ('win_rate', 'Win'), ('mean_pips', 'Pips'),
             ('sharpe', 'Sharpe'),
         ]))
         out.append('')
@@ -427,8 +482,8 @@ def main():
     if n_directional < 30:
         print(f'⚠️  Only {n_directional} directional bars — analysis will be noisy')
 
-    # Compute signed returns
-    df = _compute_signed_returns(
+    # Compute UNCONDITIONAL forward returns (no label-based signing)
+    df = _compute_directional_returns(
         df,
         return_col=args.return_col,
         horizon_bars=args.horizon_bars,
@@ -438,7 +493,9 @@ def main():
     return_src = df['_return_src'].iloc[0] if '_return_src' in df.columns else args.return_col
     print(f"Return source: {return_src}")
 
-    df_dir = df[directional_mask].copy()
+    # Analyze on ALL bars (not just directional) — the strategy is
+    # "trade every bar in this zone", not "trade only labeled bars".
+    df_for_zones = df.copy()
 
     # ATR median (for edge_score normalization)
     if 'atr_14' in df.columns:
@@ -450,7 +507,7 @@ def main():
     print(f"ATR median: {atr_median_pips:.1f} pips\n")
     print(f"🔍 Slicing by zones...")
 
-    results = analyze_all_zones(df_dir, atr_median)
+    results = analyze_all_zones(df_for_zones, atr_median)
     promising = _filter_promising(results, min_n=args.min_n)
 
     # ── Outputs ──
@@ -459,6 +516,7 @@ def main():
         'return_col': return_src,
         'atr_median_pips': atr_median_pips,
         'spread_pips': args.spread_pips,
+        'horizon_bars': args.horizon_bars,
         'n_total': n_total,
         'n_directional': n_directional,
     }
@@ -488,19 +546,19 @@ def main():
 
     # Summary print
     print()
-    print('═' * 60)
-    print('Top 10 zones by Sharpe (lower-CI > 0 = statistically positive):')
-    print('═' * 60)
+    print('═' * 78)
+    print('Top 10 zones by Sharpe lower-CI (statistically positive UNCONDITIONAL edge):')
+    print('═' * 78)
     passing = sorted([p for p in promising if p['pass']], key=lambda p: -p['ci_lower_sharpe'])
     if not passing:
-        print('  (none passing significance filter)')
+        print('  (none — market efficient on this sample/horizon)')
     else:
         for p in passing[:10]:
-            print(f"  [{p['category']:18s}] {p['zone']:30s} "
+            print(f"  [{p['category']:20s}] {p['zone']:28s} {p['side']:5s} "
                   f"n={p['n']:4d}  win={p['win_rate']:.2f}  "
                   f"pips={p['mean_pips']:+5.2f}  "
                   f"sharpe={p['sharpe']:+.2f} [lo={p['ci_lower_sharpe']:+.2f}]")
-    print('═' * 60)
+    print('═' * 78)
 
 
 if __name__ == '__main__':
