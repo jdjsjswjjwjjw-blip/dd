@@ -192,6 +192,19 @@ class HierarchicalLOBTransformer(nn.Module):
                 torch.cat([bar_final_state, lob_emb], dim=-1)
             )
         else:
+            if self._use_lob_image and lob_tensor is None:
+                # Audit guard (Issue #10): silent fall-through is a foot-gun
+                # when the model was configured to use LOB but the caller
+                # forgot to pass lob_tensor. Warn once per forward.
+                import warnings
+                warnings.warn(
+                    "HierarchicalLOBTransformer was configured with "
+                    "lob_image.enabled=True but forward() was called WITHOUT "
+                    "lob_tensor. The LOB CNN branch is bypassed and the model "
+                    "behaves like the OrderBatch-only variant. "
+                    "Pass lob_tensor=batch['lob_image'] to use the full model.",
+                    RuntimeWarning, stacklevel=2,
+                )
             lob_emb = None
             book_emb = bar_final_state
 

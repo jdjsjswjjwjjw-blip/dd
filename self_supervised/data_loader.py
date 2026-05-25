@@ -574,8 +574,10 @@ class SSLDataset(Dataset):
         cycle_window = np.nan_to_num(cycle_window, nan=0.0, posinf=0.0, neginf=0.0)
 
         # LOB image tensor — (T, P, C) shape, used by the new LOB CNN branch
-        # in HierarchicalLOBTransformer. Defensive sanitization.
-        lob_image = np.nan_to_num(lob_window, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        # in HierarchicalLOBTransformer. Already sanitized at line ~519;
+        # we just ensure dtype is float32 (mmap files default to whatever
+        # was saved, may be float64).
+        lob_image = lob_window.astype(np.float32, copy=False)
 
         return {
             'order_features': torch.from_numpy(order_features),

@@ -250,11 +250,27 @@ def finalize_daytrade_parquet_export(df: pd.DataFrame) -> pd.DataFrame:
     """
     يقيّد ملف day_trading_features.parquet إلى ORIGINAL_FEATURES + أعمدة التسميات/الميتادات.
     أي عمود مشتط خارج هذه القائمة يُسقَط من التصدير (قد يبقى في preflight فقط).
+
+    Audit guard (Issue #24): emit a loud warning when an expected ORIGINAL_FEATURE
+    is missing from the input. Previously such columns were silently filled with
+    zeros — if e.g. add_seasonal_features raised, the model would train on
+    21 zero columns without anyone noticing.
     """
     out = df.copy()
+    missing_before_fill: list[str] = []
     for col in ORIGINAL_FEATURES:
         if col not in out.columns:
+            missing_before_fill.append(col)
             out[col] = np.float64(0.0)
+    if missing_before_fill:
+        n = len(missing_before_fill)
+        sample = missing_before_fill[:8]
+        print(
+            f"  ⚠️  finalize: {n} ORIGINAL_FEATURES missing — filling with zeros.\n"
+            f"     Examples: {sample}\n"
+            f"     Likely cause: an upstream feature builder raised silently. "
+            f"Check the pipeline log for warnings (seasonal_map/price_cycle/...)."
+        )
     feat_ordered = [c for c in ORIGINAL_FEATURES if c in out.columns]
     meta_ordered = [c for c in DAY_TRADE_PARQUET_METADATA_COLS if c in out.columns and c not in set(feat_ordered)]
     return out[feat_ordered + meta_ordered].copy()
@@ -1918,7 +1934,9 @@ def build_rolling_lob_tensors_from_mbp(
     levels: int = 10,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    لكل شمعة i: tensor (lookback, 20, 3) حيث البعد الزمني = شموع سابقة حقيقية.
+    لكل شمعة i: tensor (lookback, 20, 9) حيث البعد الزمني = شموع سابقة حقيقية.
+    9 channels: depth, trade_imb, trade_vol, bid_depth, ask_depth,
+                buy_vol, sell_vol, wall_flag, depth_velocity.
     لكل شمعة مصدر: لقطة MBP ذات أقصى |imbalance| داخل الشمعة + بصمة تداول كاملة بنفس الهندسة.
     """
     bars = df_bars.sort_values('ts_event').reset_index(drop=True)

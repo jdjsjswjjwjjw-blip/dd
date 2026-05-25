@@ -162,6 +162,23 @@ def check_data_quality(df: pd.DataFrame):
         _assert(1 <= n_breaks <= 30,
                 f"is_session_break count = {n_breaks} (expected ~8-15 for 3 months)")
 
+    # Audit guard (Issue #24): catch silently-zero-filled features that
+    # finalize_daytrade_parquet_export added when an upstream builder
+    # failed (e.g. seasonal_map raising). Sample a few key features and
+    # assert they have nonzero variance.
+    degenerate_samples = []
+    for col in ('time_since_london_open_min', 'dow_sin', 'session_phase',
+                'cycle_structure_score', 'cycle_hurst',
+                'rsi_14', 'macd_hist'):
+        if col not in df.columns:
+            continue
+        v = pd.to_numeric(df[col], errors='coerce').dropna()
+        if len(v) > 100 and float(v.std()) < 1e-9:
+            degenerate_samples.append(col)
+    _assert(len(degenerate_samples) == 0,
+            f"All sampled features have nonzero variance "
+            f"(degenerate = all-zero or constant: {degenerate_samples})")
+
 
 def check_lob_tensors(lob_path: str, df_n: int):
     """[3] LOB tensors: shape (N, T=50, P=20, C=9)."""

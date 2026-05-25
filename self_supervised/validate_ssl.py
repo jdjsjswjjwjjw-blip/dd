@@ -390,7 +390,6 @@ def main():
     # vector aligned to the calendar — set prob=0.0 (don't trade) on
     # non-directional bars.
     # Build a calendar-aligned prob/pred array for the holdout window.
-    holdout_calendar_idx = np.arange(split_calendar_idx, n)
     cal_df = df.iloc[split_calendar_idx:].reset_index(drop=True).copy()
 
     cal_probs = np.zeros((len(cal_df), 2), dtype=np.float32)
