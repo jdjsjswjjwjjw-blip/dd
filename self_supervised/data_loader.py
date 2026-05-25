@@ -333,6 +333,27 @@ class SSLDataset(Dataset):
         print(f"     valid samples: {self.n_samples:,} "
               f"(idx {self.min_idx}..{self.max_idx}, embargo={self.embargo_bars})")
 
+        # ── Segment-aware sample filter ──
+        # If the parquet contains `is_session_break` (= weekend gaps and
+        # quarterly-rollover gaps), filter out samples whose lookback window
+        # OR forward-target window crosses a break. Prevents cross-segment
+        # feature pollution (ATR rolling, LOB tensor history, cycle features)
+        # that would otherwise mix data from two different contracts.
+        self._build_segment_mask(n_total)
+        # Build the final list of valid sample indices
+        candidate = np.arange(self.min_idx, self.max_idx, dtype=np.int64)
+        if self._segment_clean is not None:
+            keep = self._segment_clean[candidate]
+            self._valid_indices = candidate[keep]
+        else:
+            self._valid_indices = candidate
+        self.n_samples = len(self._valid_indices)
+        if self._segment_clean is not None:
+            dropped = (self.max_idx - self.min_idx) - self.n_samples
+            print(f"     segment filter: dropped {dropped:,} samples whose "
+                  f"lookback/forward window crosses a session break")
+            print(f"     final valid samples: {self.n_samples:,}")
+
         # Stats fit window: defaults to this Dataset's own range
         self.stats_min_idx = stats_min_idx if stats_min_idx is not None else self.min_idx
         self.stats_max_idx = stats_max_idx if stats_max_idx is not None else self.max_idx
@@ -365,6 +386,43 @@ class SSLDataset(Dataset):
         # Fit z-score on TRAIN slice only (S1 fix)
         self._compute_context_stats()
         self._precompute_targets()
+
+    def _build_segment_mask(self, n_total: int) -> None:
+        """Compute per-bar mask: True iff the bar can be used as a sample
+        without its lookback window (T bars back) or its forward target
+        window (24 bars ahead) crossing a session break.
+
+        Session breaks are emitted by prepare_day_trading wherever the
+        inter-bar timestamp gap exceeds 3× the modal bar duration. This
+        captures both weekend gaps AND the inter-quarter gaps when the
+        user concatenates multiple contracts with deliberate cuts.
+
+        If the parquet has no `is_session_break` column, no filtering is
+        applied (= legacy behavior).
+        """
+        if 'is_session_break' not in self.df.columns:
+            self._segment_clean = None
+            return
+        breaks = self.df['is_session_break'].astype(bool).to_numpy()
+        if not breaks.any():
+            self._segment_clean = None
+            return
+
+        L = int(self.lookback_bars)
+        H = int(self.embargo_bars)
+        # cumulative count of breaks up to index i (inclusive)
+        break_cs = np.concatenate([[0], np.cumsum(breaks)]).astype(np.int64)
+        clean = np.zeros(n_total, dtype=bool)
+        for i in range(n_total):
+            # Lookback window = [max(0, i-L), i]; forward = [i, i+H]
+            lo_lb = max(0, i - L)
+            hi_fwd = min(n_total, i + H + 1)
+            n_breaks_lb = int(break_cs[i + 1] - break_cs[lo_lb])
+            n_breaks_fwd = int(break_cs[hi_fwd] - break_cs[i + 1])
+            # A break AT index i itself disqualifies (it IS the break point)
+            clean[i] = (n_breaks_lb == 0 and n_breaks_fwd == 0)
+        self._segment_clean = clean
+
 
     def _compute_context_stats(self):
         """Fit mu/sigma on the train slice [stats_min_idx, stats_max_idx).
@@ -511,7 +569,12 @@ class SSLDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, item: int) -> dict:
-        idx = self.min_idx + item
+        # Use the segment-filtered index list when present; otherwise
+        # fall back to the linear (min_idx + item) mapping.
+        if self._segment_clean is not None:
+            idx = int(self._valid_indices[item])
+        else:
+            idx = self.min_idx + item
 
         lob_window = np.asarray(self.lob_tensors[idx], dtype=np.float32)
 

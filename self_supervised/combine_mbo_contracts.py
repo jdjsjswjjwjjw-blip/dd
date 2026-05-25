@@ -266,15 +266,123 @@ def combine_contracts(
     return meta
 
 
+def _apply_offsets_to_mbp(
+    input_paths: list[str],
+    output_path: str,
+    audit_path: str,
+) -> dict:
+    """Apply MBO-derived back-adjustment offsets to MBP files.
+
+    Reads roll timestamps and cumulative offsets from the MBO combiner's
+    .audit.json, then back-adjusts every price column in the MBP files
+    (price, bid_px_*, ask_px_*). Sizes are unchanged.
+
+    Use case: when you have BOTH MBO and MBP per contract and want a
+    coherent back-adjusted continuous series of both. Always run the MBO
+    combine first to determine the canonical roll points and offsets.
+    """
+    print(f"═══ Applying MBO-derived offsets to {len(input_paths)} MBP files ═══")
+    print(f"  Audit:  {audit_path}")
+    if not Path(audit_path).exists():
+        raise FileNotFoundError(f"audit file not found: {audit_path}")
+    with open(audit_path) as f:
+        audit = json.load(f)
+    cumulative_offsets = audit['cumulative_offsets']
+    roll_timestamps = [pd.to_datetime(t) for t in audit['roll_timestamps']]
+    if len(cumulative_offsets) != len(input_paths):
+        raise ValueError(
+            f"audit has {len(cumulative_offsets)} contract offsets but "
+            f"{len(input_paths)} MBP files provided. Order must match the "
+            f"MBO inputs."
+        )
+
+    # Sort MBP files by first timestamp (same ordering logic as MBO)
+    mbp_dfs = []
+    for i, path in enumerate(input_paths):
+        print(f"  📂 {path}")
+        df = pd.read_parquet(path)
+        df['ts_event'] = pd.to_datetime(df['ts_event'])
+        if df['ts_event'].dt.tz is not None:
+            df['ts_event'] = df['ts_event'].dt.tz_convert('UTC').dt.tz_localize(None)
+        df = df.sort_values('ts_event').reset_index(drop=True)
+        print(f"     {len(df):,} rows | {df['ts_event'].iloc[0]} → {df['ts_event'].iloc[-1]}")
+        mbp_dfs.append(df)
+    mbp_dfs.sort(key=lambda d: d['ts_event'].iloc[0])
+
+    price_cols = ['price'] + \
+        [f'bid_px_{i:02d}' for i in range(10)] + \
+        [f'ask_px_{i:02d}' for i in range(10)]
+
+    # Walk segments with roll-window cuts (mirror combine_contracts)
+    pieces = []
+    for i, df in enumerate(mbp_dfs):
+        lo = roll_timestamps[i - 1] if i > 0 else pd.Timestamp.min
+        hi = roll_timestamps[i] if i < len(mbp_dfs) - 1 else pd.Timestamp.max
+        offset = float(cumulative_offsets[i])
+        piece = df.loc[(df['ts_event'] >= lo) & (df['ts_event'] < hi)].copy()
+        n_adjusted = 0
+        for c in price_cols:
+            if c in piece.columns:
+                piece[c] = pd.to_numeric(piece[c], errors='coerce') + offset
+                n_adjusted += 1
+        piece['is_roll'] = 0
+        if i > 0 and len(piece) > 0:
+            piece.loc[piece.index[0], 'is_roll'] = 1
+        pieces.append(piece)
+        print(f"  Contract {i}: window [{lo}, {hi}) → {len(piece):,} rows "
+              f"(offset {offset:+.5f} on {n_adjusted} price cols)")
+
+    combined = pd.concat(pieces, ignore_index=True).sort_values('ts_event').reset_index(drop=True)
+
+    # Continuity sanity at the boundaries (bid_px_00 ideally)
+    roll_idx = combined.index[combined['is_roll'] == 1].tolist()
+    print()
+    print(f"  Continuity check (bid_px_00) at {len(roll_idx)} roll(s):")
+    if 'bid_px_00' in combined.columns:
+        for ri in roll_idx:
+            if ri > 0:
+                p_before = float(combined['bid_px_00'].iloc[ri - 1])
+                p_after = float(combined['bid_px_00'].iloc[ri])
+                gap_ticks = (p_after - p_before) / 0.0001
+                mark = '✅' if abs(gap_ticks) < 50 else '⚠️'
+                print(f"    {mark} {combined['ts_event'].iloc[ri]}: "
+                      f"{p_before:.5f} → {p_after:.5f} (gap {gap_ticks:+.1f} ticks)")
+
+    print()
+    print(f"  💾 Writing {len(combined):,} rows → {output_path}")
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(output_path, index=False)
+    print(f"     File size: {Path(output_path).stat().st_size / 1e9:.2f} GB")
+
+    out_meta = {
+        'kind': 'mbp',
+        'inputs': list(input_paths),
+        'mbo_audit': audit_path,
+        'cumulative_offsets': cumulative_offsets,
+        'roll_timestamps': [str(t) for t in roll_timestamps],
+        'n_rows': int(len(combined)),
+    }
+    meta_path = Path(output_path).with_suffix('.audit.json')
+    with open(meta_path, 'w') as f:
+        json.dump(out_meta, f, indent=2)
+    print(f"     Meta: {meta_path}")
+    return out_meta
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--inputs', required=True, nargs='+',
-                  help='List of MBO contract parquet files (any order)')
+                  help='List of MBO (or MBP) parquet files in chronological order')
     p.add_argument('--output', required=True, help='Combined continuous parquet')
+    p.add_argument('--kind', default='mbo', choices=['mbo', 'mbp'],
+                  help='File type — mbo computes offsets, mbp applies them')
     p.add_argument('--roll-policy', default='volume', choices=['volume', 'date'],
-                  help='How to detect roll points: by volume crossover or fixed dates')
+                  help='How to detect roll points (mbo only): volume crossover or fixed dates')
     p.add_argument('--roll-dates', nargs='*', default=None,
                   help='Required if --roll-policy date: N-1 dates for N contracts')
+    p.add_argument('--use-offsets-from', default=None,
+                  help='REQUIRED for --kind mbp: path to MBO combiner .audit.json '
+                       'whose offsets+roll_timestamps will be applied to MBP price columns')
     p.add_argument('--window-minutes', type=int, default=30,
                   help='Window around roll for computing offset (default 30 min)')
     args = p.parse_args()
@@ -283,12 +391,18 @@ def main():
         print("❌ Need at least 2 input contracts to combine")
         sys.exit(1)
 
-    combine_contracts(
-        args.inputs, args.output,
-        roll_policy=args.roll_policy,
-        roll_dates=args.roll_dates,
-        window_minutes=args.window_minutes,
-    )
+    if args.kind == 'mbo':
+        combine_contracts(
+            args.inputs, args.output,
+            roll_policy=args.roll_policy,
+            roll_dates=args.roll_dates,
+            window_minutes=args.window_minutes,
+        )
+    else:
+        if not args.use_offsets_from:
+            print("❌ --kind mbp requires --use-offsets-from <mbo_audit.json>")
+            sys.exit(1)
+        _apply_offsets_to_mbp(args.inputs, args.output, args.use_offsets_from)
 
 
 if __name__ == '__main__':

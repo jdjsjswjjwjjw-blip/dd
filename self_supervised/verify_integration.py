@@ -268,6 +268,21 @@ def check_data_loader_handoff(features_path: str, lob_path: str,
     _assert(gap >= 50,
             f"Embargo gap (holdout_min - train_max) = {gap} bars ≥ 50")
 
+    # Segment filter: when is_session_break is present, samples crossing
+    # a break must be filtered out. Confirm the filter actually ran AND
+    # didn't reject everything.
+    if train_ds._segment_clean is not None:
+        n_filtered = (train_ds.max_idx - train_ds.min_idx) - train_ds.n_samples
+        _assert(n_filtered > 0,
+                f"Segment filter active: dropped {n_filtered} samples whose "
+                f"lookback/forward crosses a session break")
+        _assert(train_ds.n_samples >= 100,
+                f"Segment-filtered train still has ≥100 samples "
+                f"(got {train_ds.n_samples})")
+    else:
+        _warn("Parquet has no `is_session_break` column — segment filter not "
+              "engaged. Acceptable for single-contract continuous data.")
+
     # Train/holdout share normalization stats (S1 fix)
     same_mu = np.allclose(train_ds.context_mu, holdout_ds.context_mu)
     same_sg = np.allclose(train_ds.context_sigma, holdout_ds.context_sigma)
