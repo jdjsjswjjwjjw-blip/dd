@@ -497,11 +497,15 @@ def main():
     # "trade every bar in this zone", not "trade only labeled bars".
     df_for_zones = df.copy()
 
-    # ATR median (for edge_score normalization)
-    if 'atr_14' in df.columns:
-        atr_median = float(pd.to_numeric(df['atr_14'], errors='coerce').median())
-    else:
-        atr_median = 0.0030
+    # ATR median (for edge_score normalization) — try multiple column names
+    atr_median = 0.0030
+    for c in ('atr_14', 'atr', 'micro_atr', 'micro_atr_max'):
+        if c in df.columns:
+            vals = pd.to_numeric(df[c], errors='coerce')
+            if vals.notna().sum() > 100:
+                atr_median = float(vals.median())
+                print(f"ATR source: {c}")
+                break
     atr_median_pips = atr_median / args.tick_size
 
     print(f"ATR median: {atr_median_pips:.1f} pips\n")

@@ -153,6 +153,16 @@ ORIGINAL_FEATURES: tuple[str, ...] = (
     'mbp_roll_lob_coverage', 'liquidity_gaps',
     # Session context (وسوم؛ يمكن استبعادها من مدخلات النموذج لاحقًا)
     'is_london', 'is_overlap', 'is_ny',
+    # Volatility / technical (was missing — caused B4/B5 fixes to be invisible
+    # in the saved parquet because reorder_day_trading_columns whitelisted
+    # only ORIGINAL_FEATURES and these weren't in it)
+    'atr_14', 'is_session_break',
+    'bar_range', 'body_ratio',
+    'rsi_14', 'macd_hist',
+    'vwap_dist', 'vwap_dist_1h_roll', 'lob_imbalance',
+    'return_6b', 'return_1h', 'return_4h',
+    'volume_ratio_6b', 'volume_ratio_1h', 'volume_ratio_4h',
+    'cvd_slope_6b', 'cvd_slope_1h', 'cvd_slope_4h',
 )
 
 # Alias للمانفيست والعقود — نفس ORIGINAL_FEATURES فقط

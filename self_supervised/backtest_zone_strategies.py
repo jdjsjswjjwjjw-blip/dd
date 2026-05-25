@@ -159,7 +159,7 @@ def build_targets(
 ) -> dict[str, np.ndarray]:
     """Compute TP/SL price arrays for both sides."""
     close = pd.to_numeric(df['close'], errors='coerce').to_numpy(dtype=np.float64)
-    atr = pd.to_numeric(df.get('atr_14', np.nan), errors='coerce').to_numpy(dtype=np.float64)
+    atr = _get_atr_series(df, verbose=False)
 
     # Always SL at fixed R (risk anchor)
     sl_px_long = close - stop_r * atr
@@ -237,7 +237,27 @@ def _assign_session(df: pd.DataFrame) -> pd.Series:
     return out
 
 
-def _bootstrap_ci(arr: np.ndarray, fn=np.mean, n_boot: int = 2000,
+def _get_atr_series(df: pd.DataFrame, verbose: bool = False) -> np.ndarray:
+    """Find ATR column under any of the known names; compute from H/L/C as fallback."""
+    for c in ('atr_14', 'atr', 'micro_atr', 'micro_atr_max'):
+        if c in df.columns:
+            arr = pd.to_numeric(df[c], errors='coerce').to_numpy(dtype=np.float64)
+            if np.isfinite(arr).sum() > 100:
+                if verbose:
+                    print(f"  ATR source: {c} (median={np.nanmedian(arr) / 1e-4:.1f} pips)")
+                return arr
+    if verbose:
+        print(f"  ⚠️  no ATR column found; computing from HLC (rolling 14)")
+    high = pd.to_numeric(df['high'], errors='coerce')
+    low = pd.to_numeric(df['low'], errors='coerce')
+    close = pd.to_numeric(df['close'], errors='coerce')
+    prev = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev).abs(),
+        (low - prev).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(14, min_periods=1).mean().to_numpy(dtype=np.float64)
                   ci: float = 0.95, seed: int = 42) -> tuple[float, float, float]:
     arr = np.asarray(arr, dtype=np.float64)
     arr = arr[np.isfinite(arr)]
@@ -304,7 +324,7 @@ def side_metrics(pnl_R: np.ndarray, outcome: np.ndarray, atr_pips: np.ndarray) -
 
 def zone_metrics(df: pd.DataFrame, sim: dict) -> dict:
     """Per-zone metrics for both sides."""
-    atr_pips = pd.to_numeric(df['atr_14'], errors='coerce').to_numpy() / 1e-4
+    atr_pips = _get_atr_series(df) / 1e-4
     long_m = side_metrics(sim['long_pnl_R'], sim['long_outcome'], atr_pips)
     short_m = side_metrics(sim['short_pnl_R'], sim['short_outcome'], atr_pips)
     return {
@@ -431,7 +451,7 @@ def main():
     close = pd.to_numeric(df['close'], errors='coerce').to_numpy()
     high = pd.to_numeric(df['high'], errors='coerce').to_numpy()
     low = pd.to_numeric(df['low'], errors='coerce').to_numpy()
-    atr = pd.to_numeric(df['atr_14'], errors='coerce').to_numpy()
+    atr = _get_atr_series(df, verbose=True)
 
     print(f"🎯 Simulating {len(df):,} LONG + SHORT trades...")
     sim = simulate_trades(
