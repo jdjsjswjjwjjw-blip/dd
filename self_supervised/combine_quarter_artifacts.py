@@ -2,7 +2,7 @@
 self_supervised/combine_quarter_artifacts.py
 ═══════════════════════════════════════════════════════════════════
 دمج كل الـ SSL artifacts بين الربعين في خطوة واحدة:
-  • bars parquet            (مع carry-only price offset + is_roll marker)
+  • bars parquet            (price offset + is_roll + is_session_break marker)
   • lob_tensors npy         (np.concatenate axis=0 — bar-aligned)
   • order_features npy      (np.concatenate axis=0 — bar-aligned)
   • order_masks npy         (np.concatenate axis=0 — bar-aligned)
@@ -16,27 +16,47 @@ self_supervised/combine_quarter_artifacts.py
 ده بيتجنب:
   ‣ تحميل MBO files العملاقة في الـ RAM
   ‣ double-sort على ملايين الـ ticks
-  ‣ تشويه back-adjustment للـ gap الكبير بين الربعين (~25-30 يوم)
   ‣ مشاكل alignment بين bar indices والـ npy arrays
 
-بيضمن:
-  ‣ carry-only price adjustment صح (40 pips افتراضي للـ 6B)
-  ‣ is_roll=1 + is_session_break=1 عند كل حد ربع
-  ‣ alignment محفوظ بين bars/lob/orders
-  ‣ خاصية الـ segment-aware filter في data_loader شغّالة
+الـ overlap modes (CRITICAL لمعالجة rollover):
+──────────────────────────────────────────────
+  auto    — افتراضي. كشف الـ overlap تلقائياً:
+            • لو فيه overlap (داتا الربعين فيها أيام مشتركة):
+              ▸ يحدد roll day = أول يوم volume_Q2 > volume_Q1
+              ▸ يشيل Q1 الميت (bars بعد roll_day، low volume)
+              ▸ يشيل Q2 الرفيع (bars قبل roll_day، thin)
+              ▸ يحسب real offset من ±24h window حوالين roll_day
+              ▸ continuity gap بعد adjust = حركة سوق حقيقية فقط (تقريباً صفر)
+            • لو مفيش overlap (الداتا متقطعة):
+              ▸ fallback لـ carry-only (40 pips افتراضي للـ 6B)
+              ▸ continuity gap = real market drift (لا يمكن استرجاعه)
+
+  overlap — يطلب overlap (يطفي error لو مش موجود). الأفضل لو الداتا كاملة.
+  carry   — يفرض carry-only حتى لو فيه overlap.
+
+ليه overlap mode أفضل:
+─────────────────────────
+بدون overlap = آخر 15 يوم من العقد بـ low liquidity (prices noisy/wrong).
+مع overlap = الـ pipeline يستبدل تلقائياً للعقد التاني عند نقطة الـ volume
+crossover، وبيمسح الـ dying tail. ده بالظبط اللي بتعمله الـ exchange
+official continuous contract methodology.
 
 الاستخدام:
+    # داتا كاملة بـ overlap (مفضّل):
     python self_supervised/combine_quarter_artifacts.py \\
         --quarter-dirs /workspace/clean/q1_6BH5 /workspace/clean/q2_6BM5 \\
         --output-dir /workspace/clean/combined_6m \\
-        --bars-name day_trading_features.parquet \\
-        --lob-name lob_tensors.npy \\
-        --order-features-name order_features.npy \\
-        --order-masks-name order_masks.npy \\
+        --overlap-mode auto
+
+    # داتا متقطعة (آخر 15 يوم محذوفة):
+    python self_supervised/combine_quarter_artifacts.py \\
+        --quarter-dirs /workspace/clean/q1_6BH5 /workspace/clean/q2_6BM5 \\
+        --output-dir /workspace/clean/combined_6m \\
+        --overlap-mode carry \\
         --carry-pips-per-quarter 40
 
 كل quarter-dir لازم يحتوي على:
-    <bars-name>          (parquet)
+    <bars-name>          (parquet — لازم يحتوي على volume column)
     <lob-name>           (npy: shape (N_bars, T, P, C))
     <order-features-name> (npy: shape (N_bars, T, N_orders, F))
     <order-masks-name>    (npy: shape (N_bars, T, N_orders))
@@ -133,14 +153,80 @@ def _load_quarter(qdir: Path, names: dict) -> dict:
     return out
 
 
+def _detect_roll_day_by_volume(
+    old_bars: pd.DataFrame, new_bars: pd.DataFrame,
+) -> tuple[pd.Timestamp | None, pd.DataFrame, pd.DataFrame]:
+    """For overlapping quarters: find the day where new contract's daily
+    volume first exceeds old contract's daily volume. Returns (roll_ts,
+    overlap_old_daily_vol, overlap_new_daily_vol) for diagnostics.
+
+    Returns (None, ...) if no overlap or no crossover found.
+    """
+    if 'volume' not in old_bars.columns or 'volume' not in new_bars.columns:
+        return None, None, None
+
+    old_day = old_bars['ts_event'].dt.floor('1D')
+    new_day = new_bars['ts_event'].dt.floor('1D')
+
+    overlap_start = max(old_day.min(), new_day.min())
+    overlap_end = min(old_day.max(), new_day.max())
+    if overlap_start > overlap_end:
+        # No calendar overlap between quarters
+        return None, None, None
+
+    # Daily volume per contract within overlap
+    old_in = old_bars.loc[(old_day >= overlap_start) & (old_day <= overlap_end)]
+    new_in = new_bars.loc[(new_day >= overlap_start) & (new_day <= overlap_end)]
+    if len(old_in) == 0 or len(new_in) == 0:
+        return None, None, None
+
+    v_old = old_in.groupby(old_in['ts_event'].dt.floor('1D'))['volume'].sum()
+    v_new = new_in.groupby(new_in['ts_event'].dt.floor('1D'))['volume'].sum()
+
+    # Find first day where new > old
+    common_days = sorted(set(v_old.index) & set(v_new.index))
+    if not common_days:
+        return None, v_old, v_new
+    for d in common_days:
+        if float(v_new.get(d, 0)) > float(v_old.get(d, 0)):
+            return d, v_old, v_new
+    # Crossover never happened in overlap — use last common day
+    return common_days[-1], v_old, v_new
+
+
+def _compute_overlap_offset(
+    old_bars: pd.DataFrame, new_bars: pd.DataFrame, roll_day: pd.Timestamp,
+    window_hours: int = 24,
+) -> float:
+    """Compute REAL contract carry from overlap window around roll_day.
+    Uses median mid prices in [roll_day - 24h, roll_day + 24h].
+    """
+    win = pd.Timedelta(hours=window_hours)
+    lo, hi = roll_day - win, roll_day + win
+    old_win = old_bars.loc[(old_bars['ts_event'] >= lo) & (old_bars['ts_event'] <= hi)]
+    new_win = new_bars.loc[(new_bars['ts_event'] >= lo) & (new_bars['ts_event'] <= hi)]
+    if len(old_win) == 0 or len(new_win) == 0:
+        return float('nan')
+    return float(_midprice(new_win).median() - _midprice(old_win).median())
+
+
 def combine_artifacts(
     quarter_dirs: list[Path],
     output_dir: Path,
     names: dict,
     carry_pips_per_quarter: float = 40.0,
     auto_carry: bool = False,
+    overlap_mode: str = 'auto',
 ) -> dict:
-    """Combine bars + lob + orders across N quarters with carry-only adjust."""
+    """Combine bars + lob + orders across N quarters.
+
+    overlap_mode:
+      'auto'    — detect overlap; if present, use volume-crossover roll
+                  + real offset + drop dying/thin wings.
+                  If no overlap, fall back to carry-only.
+      'overlap' — REQUIRE overlap; error if none.
+      'carry'   — force carry-only regardless of overlap.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ─── 1. Load all quarters ──────────────────────────────────────────
@@ -158,64 +244,141 @@ def combine_artifacts(
     quarters = [quarters[i] for i in order]
     quarter_dirs = [quarter_dirs[i] for i in order]
 
-    # ─── 3. Compute cumulative carry offsets ───────────────────────────
-    print(f"  ─── Computing boundary offsets ───")
+    # ─── 3. Compute cumulative offsets + per-quarter keep-masks ─────────
+    print(f"  ─── Computing boundary offsets (mode={overlap_mode}) ───")
     cumulative_offsets = [0.0] * len(quarters)
     boundary_info = []
     boundary_minutes_window = 60
+
+    # keep_masks[i] = boolean mask over quarter i's bars (True = keep)
+    # Default: keep everything (overwritten if overlap-based trimming runs)
+    keep_masks = [np.ones(len(q['bars']), dtype=bool) for q in quarters]
+    # roll_indices[i] = ts where Q[i] ends and Q[i+1] begins (after trim)
+    roll_timestamps = [None] * (len(quarters) - 1)
 
     for i in range(len(quarters) - 2, -1, -1):
         old_bars = quarters[i]['bars']
         new_bars = quarters[i + 1]['bars']
 
-        # Sample boundary midprices (last hour of old, first hour of new)
-        old_end_ts = old_bars['ts_event'].iloc[-1] - pd.Timedelta(minutes=boundary_minutes_window)
-        new_start_ts = new_bars['ts_event'].iloc[0] + pd.Timedelta(minutes=boundary_minutes_window)
+        # Try overlap-based detection if requested
+        roll_day = None
+        v_old_d = v_new_d = None
+        if overlap_mode in ('auto', 'overlap'):
+            roll_day, v_old_d, v_new_d = _detect_roll_day_by_volume(old_bars, new_bars)
 
-        old_window = old_bars.loc[old_bars['ts_event'] >= old_end_ts]
-        new_window = new_bars.loc[new_bars['ts_event'] <= new_start_ts]
+        used_method = None
+        if roll_day is not None:
+            # ─── OVERLAP MODE: trim dying/thin wings + real offset ───────
+            print(f"    boundary {i}→{i+1}: OVERLAP detected")
+            print(f"      common days: {len(set(v_old_d.index) & set(v_new_d.index))}")
+            print(f"      roll day (volume crossover): {roll_day}")
 
-        old_mid_med = float(_midprice(old_window).median())
-        new_mid_med = float(_midprice(new_window).median())
-        gap_days = (new_bars['ts_event'].iloc[0] - old_bars['ts_event'].iloc[-1]).days
-        raw_gap = new_mid_med - old_mid_med
-        raw_gap_pips = raw_gap / TICK_SIZE
+            # Real offset from ±24h window where both contracts active
+            real_offset = _compute_overlap_offset(
+                old_bars, new_bars, roll_day, window_hours=24,
+            )
+            if np.isnan(real_offset):
+                print(f"      ⚠️  offset window empty — falling back to carry-only")
+                roll_day = None  # trigger carry-only branch below
+            else:
+                offset = real_offset
+                offset_pips = offset / TICK_SIZE
+                print(f"      real offset (from overlap): {offset_pips:+.1f} pips")
 
-        if auto_carry:
-            carry = raw_gap
-            carry_pips = raw_gap_pips
-            method = 'auto-panama (FULL gap — UNSAFE for >7d gap)'
-        else:
-            sign = 1.0 if raw_gap >= 0 else -1.0
-            carry_pips = sign * carry_pips_per_quarter
-            carry = carry_pips * TICK_SIZE
-            method = f'carry-only ({carry_pips:+.0f} pips)'
+                # Trim:
+                #   old: drop bars STRICTLY AFTER roll_day (dying contract)
+                #   new: drop bars STRICTLY BEFORE roll_day (thin contract)
+                # Roll_day itself goes to new (front-month perspective at roll)
+                old_keep = old_bars['ts_event'] < roll_day
+                new_keep = new_bars['ts_event'] >= roll_day
+                n_old_dropped = (~old_keep).sum()
+                n_new_dropped = (~new_keep).sum()
+                print(f"      trimmed: Q{i+1} dying tail = {n_old_dropped:,} bars dropped")
+                print(f"      trimmed: Q{i+2} thin head  = {n_new_dropped:,} bars dropped")
 
-        cumulative_offsets[i] = carry + cumulative_offsets[i + 1]
+                keep_masks[i] &= old_keep.values
+                keep_masks[i + 1] &= new_keep.values
+                cumulative_offsets[i] = offset + cumulative_offsets[i + 1]
+                roll_timestamps[i] = roll_day
+                used_method = 'overlap-volume-crossover'
 
-        print(f"    boundary {i}→{i+1}: gap={gap_days}d")
-        print(f"      old_mid={old_mid_med:.5f}  new_mid={new_mid_med:.5f}")
-        print(f"      raw_gap={raw_gap_pips:+.1f} pips (carry + drift)")
-        print(f"      applied: {method}")
+                boundary_info.append({
+                    'old_dir': str(quarter_dirs[i]),
+                    'new_dir': str(quarter_dirs[i + 1]),
+                    'mode': used_method,
+                    'roll_day': str(roll_day),
+                    'real_offset_pips': offset_pips,
+                    'applied_offset_pips': offset_pips,
+                    'old_dying_dropped': int(n_old_dropped),
+                    'new_thin_dropped': int(n_new_dropped),
+                    'overlap_days': len(set(v_old_d.index) & set(v_new_d.index)),
+                })
+
+        if roll_day is None:
+            # ─── FALLBACK: no overlap → carry-only ───────────────────────
+            if overlap_mode == 'overlap':
+                raise RuntimeError(
+                    f"--overlap-mode=overlap requires overlap between Q{i+1} and Q{i+2}, "
+                    f"but none was found. Use 'auto' or 'carry' instead."
+                )
+            old_end_ts = old_bars['ts_event'].iloc[-1] - pd.Timedelta(minutes=boundary_minutes_window)
+            new_start_ts = new_bars['ts_event'].iloc[0] + pd.Timedelta(minutes=boundary_minutes_window)
+            old_window = old_bars.loc[old_bars['ts_event'] >= old_end_ts]
+            new_window = new_bars.loc[new_bars['ts_event'] <= new_start_ts]
+            old_mid_med = float(_midprice(old_window).median())
+            new_mid_med = float(_midprice(new_window).median())
+            gap_days = (new_bars['ts_event'].iloc[0] - old_bars['ts_event'].iloc[-1]).days
+            raw_gap = new_mid_med - old_mid_med
+            raw_gap_pips = raw_gap / TICK_SIZE
+
+            if auto_carry:
+                carry = raw_gap
+                carry_pips = raw_gap_pips
+                used_method = 'auto-panama-FULL-GAP-UNSAFE'
+            else:
+                sign = 1.0 if raw_gap >= 0 else -1.0
+                carry_pips = sign * carry_pips_per_quarter
+                carry = carry_pips * TICK_SIZE
+                used_method = f'carry-only({carry_pips_per_quarter:.0f}pips)'
+
+            cumulative_offsets[i] = carry + cumulative_offsets[i + 1]
+            roll_timestamps[i] = new_bars['ts_event'].iloc[0]
+
+            print(f"    boundary {i}→{i+1}: NO overlap (gap={gap_days}d)")
+            print(f"      raw_gap={raw_gap_pips:+.1f} pips (includes drift)")
+            print(f"      applied: {used_method} → {carry_pips:+.1f} pips")
+
+            boundary_info.append({
+                'old_dir': str(quarter_dirs[i]),
+                'new_dir': str(quarter_dirs[i + 1]),
+                'mode': used_method,
+                'gap_days': gap_days,
+                'raw_gap_pips': raw_gap_pips,
+                'applied_offset_pips': carry_pips,
+            })
+
         print(f"      cum offset for Q{i+1}: {cumulative_offsets[i]/TICK_SIZE:+.1f} pips")
-
-        boundary_info.append({
-            'old_dir': str(quarter_dirs[i]),
-            'new_dir': str(quarter_dirs[i + 1]),
-            'gap_days': gap_days,
-            'raw_gap_pips': raw_gap_pips,
-            'applied_carry_pips': carry_pips,
-            'roll_ts': str(new_bars['ts_event'].iloc[0]),
-        })
     print()
 
-    # ─── 4. Apply offsets to bars + mark is_roll ───────────────────────
-    print(f"  ─── Applying offsets to bar prices ───")
+    # ─── 4. Apply keep_masks (trim wings) + offsets + is_roll mark ─────
+    print(f"  ─── Applying keep-masks + offsets to bar prices ───")
     bar_pieces = []
-    for i, q in enumerate(quarters):
-        bars = q['bars'].copy()
-        offset = cumulative_offsets[i]
+    trimmed_npy = {key: [] for key in ('lob', 'order_features', 'order_masks')}
 
+    for i, q in enumerate(quarters):
+        mask = keep_masks[i]
+        n_total = len(q['bars'])
+        n_kept = int(mask.sum())
+        if n_kept < n_total:
+            print(f"    Q{i+1}: trimmed {n_total - n_kept:,} bars ({n_kept:,} kept)")
+        bars = q['bars'].loc[mask].copy().reset_index(drop=True)
+
+        # Apply trim to npy too (alignment preserved by construction)
+        for key in trimmed_npy.keys():
+            if q.get(key) is not None:
+                trimmed_npy[key].append(q[key][mask])
+
+        offset = cumulative_offsets[i]
         if abs(offset) > 0:
             adjusted_cols = []
             for c in bars.columns:
@@ -253,10 +416,10 @@ def combine_artifacts(
     else:
         print(f"    ✅ ts monotonic (no sort needed)")
 
-    # Concat npy artifacts
+    # Concat trimmed npy artifacts (already aligned to keep_masks)
     npy_combined = {}
     for key in ('lob', 'order_features', 'order_masks'):
-        arrs = [q[key] for q in quarters if q[key] is not None]
+        arrs = trimmed_npy[key]
         if len(arrs) != len(quarters):
             print(f"    ⚠️  {key}: skipped (not all quarters have it)")
             continue
@@ -271,6 +434,12 @@ def combine_artifacts(
                     f"different lookback/n_orders settings between quarters!"
                 )
         combined = np.concatenate(arrs, axis=0)
+        # Sanity: combined npy first-dim must equal combined_bars row count
+        if combined.shape[0] != len(combined_bars):
+            raise RuntimeError(
+                f"{key} combined first dim ({combined.shape[0]}) != combined_bars "
+                f"length ({len(combined_bars)}) — alignment broken!"
+            )
         print(f"    {key}: combined shape={combined.shape} ({combined.nbytes / 1e9:.2f} GB)")
         npy_combined[key] = combined
 
@@ -321,12 +490,14 @@ def combine_artifacts(
     # Metadata
     meta = {
         'inputs': [str(q) for q in quarter_dirs],
-        'method': 'auto-panama' if auto_carry else 'carry-only',
+        'overlap_mode': overlap_mode,
+        'auto_carry': auto_carry,
         'carry_pips_per_quarter': carry_pips_per_quarter,
         'cumulative_offsets_pips': [o / TICK_SIZE for o in cumulative_offsets],
         'cumulative_offsets': [float(o) for o in cumulative_offsets],
         'boundaries': boundary_info,
-        'n_bars_per_quarter': [len(q['bars']) for q in quarters],
+        'n_bars_per_quarter_input': [len(q['bars']) for q in quarters],
+        'n_bars_per_quarter_kept': [int(m.sum()) for m in keep_masks],
         'n_bars_combined': int(len(combined_bars)),
         'ts_range': [str(combined_bars['ts_event'].iloc[0]),
                      str(combined_bars['ts_event'].iloc[-1])],
@@ -338,11 +509,15 @@ def combine_artifacts(
     print(f"    💾 {meta_path.name}")
 
     print()
-    print(f"  ⚠️  NOTE: only carry was applied to old-contract prices.")
-    print(f"     The remaining gap at each roll boundary is REAL market drift")
-    print(f"     during the gap days — NOT a price error. The is_session_break=1")
-    print(f"     marker at boundary tells the SSL data_loader to block lookbacks")
-    print(f"     from crossing the gap (via segment-aware filter).")
+    overlap_used = any(b.get('mode') == 'overlap-volume-crossover' for b in boundary_info)
+    if overlap_used:
+        print(f"  ✅ Used overlap-based volume crossover: REAL contract offsets,")
+        print(f"     dying-tail Q-N and thin-head Q-(N+1) bars trimmed automatically.")
+        print(f"     Continuity gap at boundary should be tiny (true market move only).")
+    else:
+        print(f"  ⚠️  No overlap found — fell back to carry-only adjustment.")
+        print(f"     Remaining gap at boundary is REAL market drift during the cut.")
+    print(f"     is_session_break=1 + is_roll=1 markers prevent lookbacks crossing.")
 
     return meta
 
@@ -361,9 +536,17 @@ def main():
     p.add_argument('--order-masks-name', default='order_masks.npy',
                    help='Order masks filename (set to NONE to skip)')
     p.add_argument('--carry-pips-per-quarter', type=float, default=40.0,
-                   help='Contract carry per quarter in pips (6B: ~30-60)')
+                   help='Contract carry per quarter in pips (6B: ~30-60). '
+                        'Used only when no overlap exists between quarters.')
     p.add_argument('--auto-carry', action='store_true',
-                   help='UNSAFE: use full price gap (includes market drift)')
+                   help='UNSAFE: use full price gap as offset (includes market drift). '
+                        'Only valid in carry mode (no overlap).')
+    p.add_argument('--overlap-mode', default='auto',
+                   choices=['auto', 'overlap', 'carry'],
+                   help='auto: detect overlap, use volume crossover if present, '
+                        'else fall back to carry-only. '
+                        'overlap: REQUIRE overlap (error if none — best for FULL data). '
+                        'carry: force carry-only regardless of overlap.')
     args = p.parse_args()
 
     if len(args.quarter_dirs) < 2:
@@ -383,6 +566,7 @@ def main():
         names,
         carry_pips_per_quarter=args.carry_pips_per_quarter,
         auto_carry=args.auto_carry,
+        overlap_mode=args.overlap_mode,
     )
 
 
