@@ -1128,17 +1128,42 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = DAY_TRADE_DEFAULT_BA
     )
     size_s = pd.to_numeric(df[size_col], errors='coerce').fillna(0.0).astype(np.float64)
 
+    # ── B1 fix: OHLC must come from TRADE events only ──
+    # Previously bars OHLC were computed from `df['price'].resample(freq)` —
+    # i.e. across ALL MBO rows (ADD / MODIFY / CANCEL / TRADE). Each MBO
+    # row has a price (= the order's price). `high='max'` therefore
+    # returned the highest LIMIT-ORDER price posted in the bar, typically
+    # several ticks above last trade. Same for `low`. Bar range / ATR
+    # were systematically inflated; MFE/MAE labels used inflated TP/SL
+    # distances; regime classification was distorted.
+    # Standard quant practice: OHLC of a price bar is computed from
+    # TRADE prints only. Volume is sum of TRADE sizes only.
+    is_trade_tick = action_s.isin(TRADE_ACTIONS)
+    if is_trade_tick.any():
+        trade_prices = pd.to_numeric(df.loc[is_trade_tick, 'price'], errors='coerce')
+        trade_sizes = size_s.where(is_trade_tick, 0.0)
+    else:
+        # Pathological feed with no trade actions tagged — fall back to all
+        # rows so the pipeline doesn't silently produce empty bars.
+        print("⚠️  aggregate_mbo_to_bars: no rows tagged as TRADE action; "
+              "OHLC will be derived from all MBO events (legacy behaviour).")
+        trade_prices = pd.to_numeric(df['price'], errors='coerce')
+        trade_sizes = size_s
+
     def _resample_num(col: str, how: str, default: float = 0.0) -> pd.Series:
         rs = _tick_resample_optional(df, freq, col, how)
         if rs is None:
             return pd.Series(default, index=bars.index, dtype=np.float64)
         return pd.to_numeric(rs, errors='coerce').reindex(bars.index).fillna(default).astype(np.float64)
 
-    # OHLCV
-    bars = df['price'].resample(freq).agg(
+    # OHLCV — trades only
+    bars = trade_prices.resample(freq).agg(
         open='first', high='max', low='min', close='last'
     )
-    bars['volume'] = size_s.resample(freq).sum()
+    bars['volume'] = trade_sizes.resample(freq).sum()
+    # Forward-fill any quote-only bars (no trades that interval) — they
+    # retain the last trade price for open=high=low=close; volume=0.
+    bars[['open', 'high', 'low', 'close']] = bars[['open', 'high', 'low', 'close']].ffill()
 
     # CVD
     has_tick_cvd = 'cvd' in df.columns
@@ -1363,12 +1388,47 @@ def add_day_trading_features(df: pd.DataFrame, freq: str = DAY_TRADE_DEFAULT_BAR
     body = (df['close'] - df['open']).abs()
     df['body_ratio'] = (body / df['bar_range'].clip(lower=1e-8)).clip(0, 1)
 
-    # ATR
+    # ── B5 fix: session-gap aware True Range ──
+    # GBPUSD futures (6B) trade ~Sun 18:00 ET → Fri 17:00 ET. Friday close →
+    # Sunday open is a ~65h gap. Previously |high - close.shift(1)| treated
+    # this gap as a single bar interval, inflating ATR at the first Sunday
+    # bar by orders of magnitude. Holidays + DST transitions amplify the bug.
+    # Detect "session breaks" as inter-bar gaps > 3× the modal gap, and
+    # NaN-out the cross-gap True Range components for those bars (the bar's
+    # TR falls back to its own H-L, which is the correct local volatility).
+    ts = pd.to_datetime(df['ts_event'])
+    bar_dt = ts.diff().dt.total_seconds()
+    median_dt = float(bar_dt.dropna().median()) if bar_dt.notna().any() else 0.0
+    if median_dt > 0:
+        # Anything >3x the typical inter-bar spacing is a session gap.
+        session_break = (bar_dt > median_dt * 3.0).fillna(False)
+    else:
+        session_break = pd.Series(False, index=df.index)
+    df['is_session_break'] = session_break.astype(np.int8)
+
+    # ── B4 fix: ATR with proper min_periods ──
+    # min_periods=1 produced ATR(1)=TR(1), ATR(2)=mean(TR1, TR2), etc., for
+    # the first 13 bars after every gap. Downstream code (label_by_outcome,
+    # assign_regime_label, TP/SL distances) used these tiny-sample averages
+    # as if they were real ATR(14). Now: require full 14 samples; before
+    # then ATR is NaN and downstream code must handle it.
     hl   = df['high'] - df['low']
-    hcp  = (df['high'] - df['close'].shift(1)).abs()
-    lcp  = (df['low']  - df['close'].shift(1)).abs()
-    tr   = pd.concat([hl, hcp, lcp], axis=1).max(axis=1)
-    df['atr_14'] = tr.rolling(14, min_periods=1).mean()
+    prev_close = df['close'].shift(1)
+    hcp  = (df['high'] - prev_close).abs()
+    lcp  = (df['low']  - prev_close).abs()
+    # Mask out cross-session-break components: weekend gap pretending to be
+    # a 15m move would make TR explode.
+    hcp = hcp.where(~session_break, np.nan)
+    lcp = lcp.where(~session_break, np.nan)
+    tr = pd.concat([hl, hcp, lcp], axis=1).max(axis=1)
+    # Causal rolling ATR(14); NaN for bars 0..12 — must be handled downstream
+    df['atr_14'] = tr.rolling(14, min_periods=14).mean()
+    # Provide a warm-up fallback so legacy callers don't crash; expanding
+    # mean is statistically biased low for small windows but at least
+    # finite and clearly distinguishable from the true ATR.
+    df['atr_14_warmup'] = tr.expanding(min_periods=1).mean()
+    df['atr_14'] = df['atr_14'].fillna(df['atr_14_warmup'])
+    df.drop(columns=['atr_14_warmup'], inplace=True, errors='ignore')
 
     wb_1h = max(2, _bars_for_target_minutes(freq, 60))
     df = add_rolling_vwap_dist_features(

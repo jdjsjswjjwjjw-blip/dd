@@ -419,7 +419,15 @@ class SSLDataset(Dataset):
             np.isfinite(log_ret), np.clip(log_ret, -0.1, 0.1), 0.0,
         )
         self.next_price = log_ret_clipped.astype(np.float32)
-        self.next_price_valid = np.isfinite(log_ret)
+        valid_mask = np.isfinite(log_ret)
+        # Session-break aware (B5 propagation): next_price[i] looks at
+        # close[i+1]; if bar i+1 is the first bar after a session break,
+        # the return is a 65h weekend jump treated as a 15m target → exclude.
+        if 'is_session_break' in self.df.columns:
+            sb = self.df['is_session_break'].astype(bool).to_numpy()
+            valid_mask[:-1] &= ~sb[1:]
+            # First bar of dataset (no prev) — also invalid for next_price
+        self.next_price_valid = valid_mask
 
         # next_imbalance — uses obi[i+1]
         obi_col = 'obi_net' if 'obi_net' in self.df.columns else 'order_flow_imbalance'
