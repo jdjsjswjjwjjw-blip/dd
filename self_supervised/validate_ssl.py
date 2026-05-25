@@ -267,7 +267,9 @@ def main():
     p.add_argument('--train-split', type=float, default=0.75)
     p.add_argument('--horizon-bars', type=int, default=12,
                   help='Trade horizon in CALENDAR bars (not directional rows)')
-    p.add_argument('--confidence-threshold', type=float, default=0.55)
+    p.add_argument('--confidence-threshold', type=float, default=0.51,
+                  help='Trade if max(prob) >= threshold. Default 0.51 (any lean). '
+                       'Use 0.55+ to restrict to higher-confidence signals.')
     p.add_argument('--spread-ticks', type=float, default=2.0)
     p.add_argument('--tick-size', type=float, default=0.0001)
     p.add_argument('--fees-atr-proxy', type=float, default=0.15)
@@ -347,6 +349,24 @@ def main():
         logits = model(torch.from_numpy(X_norm.astype(np.float32)).to(device))
         probs = F.softmax(logits, dim=-1).cpu().numpy()
         preds = probs.argmax(axis=1)
+
+    # ── Probability distribution (key diagnostic for tiny holdouts) ──
+    max_probs = probs.max(axis=1)
+    prob_stats = {
+        'min': float(max_probs.min()),
+        'p25': float(np.percentile(max_probs, 25)),
+        'p50': float(np.percentile(max_probs, 50)),
+        'p75': float(np.percentile(max_probs, 75)),
+        'max': float(max_probs.max()),
+        'mean': float(max_probs.mean()),
+        'frac_above_threshold': float((max_probs >= args.confidence_threshold).mean()),
+    }
+    print(f"\n📊 Confidence distribution (max_prob):")
+    print(f"   min={prob_stats['min']:.3f} | p25={prob_stats['p25']:.3f} | "
+          f"median={prob_stats['p50']:.3f} | p75={prob_stats['p75']:.3f} | "
+          f"max={prob_stats['max']:.3f}")
+    print(f"   mean={prob_stats['mean']:.3f} | "
+          f"frac ≥ {args.confidence_threshold} = {prob_stats['frac_above_threshold']*100:.1f}%")
 
     # ── Metric 1: Accuracy + CI ──
     acc_info = compute_accuracy(preds, y_holdout)
@@ -503,6 +523,7 @@ def main():
             'calendar_idx': int(split_calendar_idx),
             'calendar_ts': str(pd.Timestamp(ts[split_calendar_idx])),
         },
+        'prob_stats': prob_stats,
         'config': {
             'horizon_bars': int(args.horizon_bars),
             'confidence_threshold': float(args.confidence_threshold),

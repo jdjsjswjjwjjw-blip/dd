@@ -606,9 +606,12 @@ def main():
     ckpt = torch.load(args.direction_head, map_location=device, weights_only=False)
     print(f"   df: {len(df)} rows, embeddings: {embeddings.shape}")
 
-    # Direction head
-    direction_head = DirectionHead(ckpt['input_dim']).to(device)
-    direction_head.load_state_dict(ckpt['model_state_dict'])
+    # Direction head — read hidden_dim/dropout from checkpoint (S8 fix)
+    hidden_dim = int(ckpt.get('hidden_dim', 64))
+    dropout = float(ckpt.get('dropout', 0.3))
+    direction_head = DirectionHead(ckpt['input_dim'], hidden_dim=hidden_dim, dropout=dropout).to(device)
+    direction_head.load_state_dict(ckpt['model_state_dict'], strict=True)
+    direction_head.eval()
     mu, sigma = ckpt['mu'], ckpt['sigma']
 
     # ── Filter to directional rows ──
