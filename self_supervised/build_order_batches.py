@@ -76,10 +76,24 @@ def _build_bar_orders(
             np.zeros(n_orders_max, dtype=bool),
         )
 
-    # خد آخر n_orders_max لو أكتر
+    # SUBSAMPLING STRATEGY (B7 fix):
+    # Previous version kept only the LAST n_orders_max ticks — biased
+    # toward end-of-bar microstructure, undercount icebergs whose hits
+    # span the full bar (news/London-open conditions).
+    #
+    # New: stratified sampling — keep the first event, the last event,
+    # and uniformly-spaced indices in between. Preserves temporal coverage
+    # for repeat_count / level_hits aggregations.
     if n_actual > n_orders_max:
-        mbo_bar = mbo_bar.iloc[-n_orders_max:]
-        n_actual = n_orders_max
+        keep = np.linspace(0, n_actual - 1, n_orders_max).round().astype(np.int64)
+        keep = np.unique(keep)
+        # Backfill if rounding produced duplicates
+        if len(keep) < n_orders_max:
+            extra = np.setdiff1d(np.arange(n_actual), keep)
+            need = n_orders_max - len(keep)
+            keep = np.sort(np.concatenate([keep, extra[:need]]))
+        mbo_bar = mbo_bar.iloc[keep[:n_orders_max]]
+        n_actual = len(mbo_bar)
 
     # Vectorized extraction
     sides = mbo_bar['side'].astype(str).map(SIDE_MAP).fillna(2).to_numpy(dtype=np.float32)
@@ -226,24 +240,32 @@ def build_order_batches(
     )
 
     # ── Build per-bar OrderBatches ──
-    print(f"\n🔄 Building OrderBatches for {n_bars:,} bars...")
+    # CRITICAL CAUSALITY FIX (S4):
+    # Previously, for bar i the order tensor at lag = lookback_bars-1 covered
+    # the SAME bar i (src_bar_ts == bar_ts). Since the SSL targets at i are
+    # forward (next_price = close[i+1]/close[i] etc.), feeding the closing
+    # ticks of bar i — which determine close[i] — leaks information a
+    # real-time agent could not have committed to at decision time.
+    #
+    # Fix: shift the lookback so the LAST slot is bar i-1 (the last fully
+    # completed past bar). Lookback covers [i-lookback .. i-1] inclusive.
+    print(f"\n🔄 Building OrderBatches for {n_bars:,} bars (strictly past)...")
 
-    # Optimization: pre-group MBO by bar boundaries
     df_mbo['bar_floor'] = df_mbo['ts_event'].dt.floor(freq)
-
-    # Build a dict: bar_floor → DataFrame
     print(f"   Grouping MBO by bar...")
     mbo_by_bar = {k: v for k, v in df_mbo.groupby('bar_floor')}
     print(f"   {len(mbo_by_bar)} unique bar groups")
 
     log_every = max(n_bars // 20, 100)
+    bar_duration_ns = int(freq_td.total_seconds() * 1_000_000_000)
     for bi in range(n_bars):
         bar_ts = df_bars['ts_event'].iloc[bi]
         bar_close = float(df_bars['close'].iloc[bi]) if 'close' in df_bars.columns else 0.0
 
-        # For each lookback bar (most recent first)
+        # Bars i-lookback .. i-1 (most recent past first at lag=lookback_bars-1)
         for lag in range(lookback_bars):
-            src_bar_ts = bar_ts - freq_td * (lookback_bars - 1 - lag)
+            offset = lookback_bars - lag       # 1 = previous bar, lookback_bars = oldest
+            src_bar_ts = bar_ts - freq_td * offset
             src_bar_floor = src_bar_ts.floor(freq)
             mbo_in_bar = mbo_by_bar.get(src_bar_floor)
             if mbo_in_bar is None or len(mbo_in_bar) == 0:
@@ -255,7 +277,7 @@ def build_order_batches(
             orders, mask = _build_bar_orders(
                 mbo_in_bar, mid_price, bar_start_ns,
                 n_orders_max=n_orders_max, tick_size=tick_size,
-                bar_duration_ns=int(freq_td.total_seconds() * 1_000_000_000),
+                bar_duration_ns=bar_duration_ns,
             )
             order_features[bi, lag] = orders
             order_masks[bi, lag] = mask
