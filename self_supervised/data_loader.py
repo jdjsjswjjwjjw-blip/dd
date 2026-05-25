@@ -37,6 +37,75 @@ REGIME_TO_CODE = {
     'low_liquidity': 3,
 }
 
+# ════════════════════════════════════════════════════════════════════════════
+# LEAKAGE BLACKLISTS — columns / prefixes that must NEVER enter context
+# features for SSL.
+#
+# Three categories:
+#   1. Future-looking labels (computed by walking forward from bar i)
+#   2. Derived label diagnostics (depend on labels above)
+#   3. Metadata / housekeeping (not features)
+#
+# Maintain fail-closed: if you add a new column to the parquet that depends
+# on FUTURE bars, append it to one of these sets. Anything not in here is
+# assumed past-only / causal.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Exact column names that are forward-looking labels or label-derived
+_LEAKAGE_COLS_EXACT: frozenset[str] = frozenset({
+    # Targets / labels
+    'bias_label', 'bias_label_detail', 'soft_label', 'soft_label_long',
+    'soft_label_short', 'path_outcome', 'neutral_reason', 'neutral_type',
+    'conf_target', 'event_label_tier', 'event_direction',
+    # Forward returns / horizons (computed by looking i+1..i+H)
+    'forward_return', 'fwd_ret_clean', 'effective_horizon',
+    'label_horizon_steps', 'label_confidence', 'label_dynamic_threshold',
+    'label_stability', 'label_end_ts',
+    # Sampling weights derived from labels
+    'soft_sample_weight', 'mc_sample_weight', 'sample_weight',
+    # Outcome flags (forward window)
+    'adverse_path_flag', 'timeout_move_exceeded_band', 'signal_quality',
+    'trade_duration',
+    # Direction-of-event (after label decision)
+    'kalman_direction',
+    # Split markers (not features)
+    'is_train_slice', 'is_holdout_slice', 'is_purged_slice', 'dataset_slice',
+    # State labels (categorical, used elsewhere)
+    'regime_label', 'regime_cluster', 'market_state_label', 'market_state_code',
+    'tradability_label',
+    # Event-flagging (we keep is_event out because event detection often uses
+    # forward signal in some pipelines; safer to exclude than to gamble)
+    'is_event', 'event_flag', 'event_score', 'train_event_flag',
+    # Timestamps
+    'ts_event',
+    # Cycle phase probabilities — these go in cycle_window or are SSL TARGETS,
+    # not in context. Including them in context would let the LOB model
+    # cheat by reading the cycle SSL target's input directly.
+    'cycle_phase_acc_prob', 'cycle_phase_markup_prob',
+    'cycle_phase_dist_prob', 'cycle_phase_markdown_prob',
+    'cycle_position',
+})
+
+# Any column whose name starts with one of these prefixes is excluded
+_LEAKAGE_PREFIXES: tuple[str, ...] = (
+    'label_',      # any label_* — by convention all are forward-looking
+    'soft_label',  # soft_label_*
+    'forward_',    # forward_return etc.
+    'fwd_',        # fwd_ret_clean
+    'mfe_',        # max favourable excursion — forward only
+    'mae_',        # max adverse excursion — forward only
+)
+
+
+def _is_leakage_column(col: str) -> bool:
+    """True iff column should be excluded from SSL context features."""
+    if col in _LEAKAGE_COLS_EXACT:
+        return True
+    for pfx in _LEAKAGE_PREFIXES:
+        if col.startswith(pfx):
+            return True
+    return False
+
 
 def _build_context_features(
     df_row: pd.Series, available_cols: list[str], target_dim: int = 138,
@@ -85,8 +154,8 @@ def _lob_tensor_to_orders_vectorized(
     return order_features, order_masks
 
 
-def _compute_phase_target(df: pd.DataFrame, idx: int) -> int:
-    """Wyckoff phase target من cycle_phase_*_prob columns (PR #18 features)."""
+def _compute_phase_target_at(df: pd.DataFrame, idx: int) -> int:
+    """Wyckoff phase computed AT bar idx (used by next-bar shift below)."""
     probs = []
     for name in ('acc', 'markup', 'dist', 'markdown'):
         col = f'cycle_phase_{name}_prob'
@@ -96,8 +165,8 @@ def _compute_phase_target(df: pd.DataFrame, idx: int) -> int:
     return int(np.argmax(probs))
 
 
-def _compute_swing_target(df: pd.DataFrame, idx: int) -> int:
-    """Swing direction target."""
+def _compute_swing_target_at(df: pd.DataFrame, idx: int) -> int:
+    """Swing direction AT bar idx (used by next-bar shift below)."""
     score = float(df.iloc[idx].get('cycle_structure_score', 0.0))
     if score > 0.3:
         return 0  # up
@@ -106,48 +175,67 @@ def _compute_swing_target(df: pd.DataFrame, idx: int) -> int:
     return 2  # neutral
 
 
-def _compute_maturity_target(df: pd.DataFrame, idx: int) -> int:
-    """Trend maturity target."""
+def _compute_maturity_target_at(df: pd.DataFrame, idx: int) -> int:
+    """Trend maturity AT bar idx (used by next-bar shift below)."""
     mat = float(df.iloc[idx].get('cycle_trend_maturity', 0.0))
     return int(np.clip(round(mat * 2.0), 0, 2))
 
 
-def _compute_wall_persist_array(df: pd.DataFrame, lookahead: int = 12) -> np.ndarray:
-    """عدد bars حتى OBI يقلب الإشارة — vectorized."""
+def _compute_wall_persist_array(
+    df: pd.DataFrame, lookahead: int = 12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bars until OBI direction flips.
+
+    Returns (wall_persist, valid_mask):
+        wall_persist : (n,) float — bars-to-flip, capped at lookahead
+        valid_mask   : (n,) bool — True iff the lookahead window is fully
+                       within the dataset AND we have a non-zero direction.
+
+    Bars whose full lookahead window would extend past the end of the
+    dataset have valid_mask=False — they should be excluded from training
+    so the truncated target doesn't bias the model.
+    """
     n = len(df)
-    if 'obi_direction' not in df.columns:
-        return np.zeros(n, dtype=np.float32)
-    obi = df['obi_direction'].to_numpy(dtype=np.int8)
     wall = np.zeros(n, dtype=np.float32)
-    for i in range(n - 1):
+    valid = np.zeros(n, dtype=bool)
+    if 'obi_direction' not in df.columns:
+        return wall, valid
+    obi = df['obi_direction'].to_numpy(dtype=np.int8)
+    for i in range(n):
         cur = int(obi[i])
         if cur == 0:
             continue
-        end = min(i + lookahead, n)
+        end = i + 1 + lookahead
+        if end > n:  # incomplete lookahead — invalid
+            continue
         future = obi[i + 1: end]
         flip_mask = future != cur
-        if flip_mask.any():
-            wall[i] = float(np.argmax(flip_mask) + 1)
-        else:
-            wall[i] = float(end - i - 1)
-    return wall
+        wall[i] = float(np.argmax(flip_mask) + 1) if flip_mask.any() else float(lookahead)
+        valid[i] = True
+    return wall, valid
 
 
-def _compute_time_to_event_array(df: pd.DataFrame, lookahead: int = 24) -> np.ndarray:
-    """عدد bars حتى next is_event=1 — vectorized."""
+def _compute_time_to_event_array(
+    df: pd.DataFrame, lookahead: int = 24,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bars until next is_event=1.
+
+    Returns (tte, valid_mask). Same boundary semantics as wall_persist.
+    """
     n = len(df)
-    if 'is_event' not in df.columns:
-        return np.full(n, float(lookahead), dtype=np.float32)
-    is_event = df['is_event'].astype(bool).to_numpy()
     tte = np.full(n, float(lookahead), dtype=np.float32)
-    for i in range(n - 1):
-        end = min(i + lookahead, n)
+    valid = np.zeros(n, dtype=bool)
+    if 'is_event' not in df.columns:
+        return tte, valid
+    is_event = df['is_event'].astype(bool).to_numpy()
+    for i in range(n):
+        end = i + 1 + lookahead
+        if end > n:
+            continue
         future = is_event[i + 1: end]
-        if future.any():
-            tte[i] = float(np.argmax(future) + 1)
-        else:
-            tte[i] = float(end - i - 1)
-    return tte
+        tte[i] = float(np.argmax(future) + 1) if future.any() else float(lookahead)
+        valid[i] = True
+    return tte, valid
 
 
 class SSLDataset(Dataset):
@@ -172,18 +260,31 @@ class SSLDataset(Dataset):
         lob_tensors_path: str,
         lob_timestamps_path: Optional[str] = None,
         *,
-        order_batches_dir: Optional[str] = None,   # ← NEW: real orders dir
+        order_batches_dir: Optional[str] = None,
         lookback_bars: int = 50,
         n_orders: int = 20,
         context_dim: int = 138,
         min_idx: Optional[int] = None,
         max_idx: Optional[int] = None,
+        # Train-period bounds for fitting normalization stats. If None,
+        # defaults to (lookback_bars, max_idx) — i.e. only this Dataset's
+        # own sample range. CRITICAL: pass an explicit train range when
+        # building a holdout Dataset, so holdout doesn't compute its own
+        # stats over leaked future data.
+        stats_min_idx: Optional[int] = None,
+        stats_max_idx: Optional[int] = None,
+        # Right-edge embargo: drop the last `embargo_bars` valid sample
+        # indices because their forward-looking targets (next_price,
+        # wall_persist@12, time_to_event@24) reach beyond the parquet end.
+        # Must be ≥ max(target_lookahead, 1).
+        embargo_bars: int = 24,
     ):
         self.lookback_bars = lookback_bars
         self.n_orders = n_orders
         self.context_dim = context_dim
         self.order_batches_dir = order_batches_dir
         self.use_real_orders = order_batches_dir is not None
+        self.embargo_bars = int(embargo_bars)
 
         print(f"  📂 Loading {features_parquet}...")
         self.df = pd.read_parquet(features_parquet)
@@ -198,7 +299,7 @@ class SSLDataset(Dataset):
                 f"Length mismatch: df={len(self.df)} vs lob={len(self.lob_tensors)}"
             )
 
-        # ── NEW: Load real OrderBatches if provided ──
+        # ── Load real OrderBatches if provided ──
         if self.use_real_orders:
             ob_features = os.path.join(order_batches_dir, 'order_features.npy')
             ob_masks = os.path.join(order_batches_dir, 'order_masks.npy')
@@ -212,129 +313,184 @@ class SSLDataset(Dataset):
                 self.order_masks_arr = np.load(ob_masks, mmap_mode='r')
                 print(f"     order_features: {self.order_features_arr.shape}")
                 print(f"     order_masks: {self.order_masks_arr.shape}")
-                # Override n_orders to match
                 self.n_orders = self.order_features_arr.shape[2]
                 print(f"     ✅ Real orders mode enabled (n_orders={self.n_orders})")
 
+        # Sample boundaries: clip max_idx by embargo so all forward-looking
+        # targets are fully observable. lookback_bars guards the left edge.
+        n_total = len(self.df)
         self.min_idx = max(lookback_bars, min_idx or 0)
-        self.max_idx = min(len(self.df) - 25, max_idx or len(self.df))
+        upper_bound = n_total - self.embargo_bars
+        self.max_idx = min(upper_bound, max_idx if max_idx is not None else upper_bound)
         self.n_samples = max(0, self.max_idx - self.min_idx)
-        print(f"     valid samples: {self.n_samples:,} (idx {self.min_idx}..{self.max_idx})")
+        print(f"     valid samples: {self.n_samples:,} "
+              f"(idx {self.min_idx}..{self.max_idx}, embargo={self.embargo_bars})")
 
-        # Precompute regime codes
+        # Stats fit window: defaults to this Dataset's own range
+        self.stats_min_idx = stats_min_idx if stats_min_idx is not None else self.min_idx
+        self.stats_max_idx = stats_max_idx if stats_max_idx is not None else self.max_idx
+        if self.stats_max_idx <= self.stats_min_idx:
+            raise ValueError(
+                f"Stats window is empty: [{self.stats_min_idx}..{self.stats_max_idx}]. "
+                f"Pass valid stats_min_idx/stats_max_idx for the train slice."
+            )
+
+        # Regime codes (causal, computed across full series — OK because
+        # assign_regime_label is one-sided rolling)
         if 'regime_label' in self.df.columns:
-            self.regime_codes = self.df['regime_label'].astype(str).map(REGIME_TO_CODE).fillna(1).astype(np.int64).to_numpy()
+            self.regime_codes = (
+                self.df['regime_label'].astype(str).map(REGIME_TO_CODE)
+                .fillna(1).astype(np.int64).to_numpy()
+            )
         else:
-            self.regime_codes = np.ones(len(self.df), dtype=np.int64)
+            self.regime_codes = np.ones(n_total, dtype=np.int64)
 
-        # Identify context feature columns
-        exclude_cols = {
-            'ts_event', 'label_end_ts', 'bias_label', 'path_outcome',
-            'neutral_reason', 'soft_label', 'conf_target', 'event_label_tier',
-            'is_event', 'train_event_flag', 'regime_label', 'regime_cluster',
-            'market_state_label', 'market_state_code', 'neutral_type',
-            'tradability_label', 'event_direction', 'kalman_direction',
-        }
+        # ── Context feature columns: blacklist-driven, fail-closed ──
         numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
-        self.context_cols = [c for c in numeric_cols if c not in exclude_cols][:context_dim]
-        print(f"     context features: {len(self.context_cols)} (capped at {context_dim})")
+        excluded = [c for c in numeric_cols if _is_leakage_column(c)]
+        kept = [c for c in numeric_cols if not _is_leakage_column(c)]
+        self.context_cols = kept[:context_dim]
+        print(f"     context features: {len(self.context_cols)} (capped at {context_dim}, "
+              f"excluded {len(excluded)} leakage-prone)")
+        if len(self.context_cols) == 0:
+            raise RuntimeError("No causal context features available — check blacklist.")
 
-        # Compute z-score normalization stats for context features
-        # (يمنع gradient explosions من cvd/cumulative values)
+        # Fit z-score on TRAIN slice only (S1 fix)
         self._compute_context_stats()
-
         self._precompute_targets()
 
     def _compute_context_stats(self):
-        """Compute mean/std لكل context column للـ z-score normalization."""
-        ctx_data = np.zeros((len(self.df), len(self.context_cols)), dtype=np.float64)
+        """Fit mu/sigma on the train slice [stats_min_idx, stats_max_idx).
+
+        Previously fit on the full DataFrame — this leaked holdout
+        distribution statistics into the training normalizer.
+        """
+        a, b = self.stats_min_idx, self.stats_max_idx
+        n_fit = b - a
+        ctx_data = np.zeros((n_fit, len(self.context_cols)), dtype=np.float64)
         for j, col in enumerate(self.context_cols):
-            vals = pd.to_numeric(self.df[col], errors='coerce').fillna(0.0).to_numpy()
-            ctx_data[:, j] = np.clip(vals, -1e9, 1e9)  # safety clip
+            vals = pd.to_numeric(self.df[col].iloc[a:b], errors='coerce').fillna(0.0).to_numpy()
+            ctx_data[:, j] = np.clip(vals, -1e9, 1e9)
         self.context_mu = ctx_data.mean(axis=0).astype(np.float32)
         self.context_sigma = ctx_data.std(axis=0).astype(np.float32)
-        # Avoid division by zero
         self.context_sigma = np.maximum(self.context_sigma, 1e-6)
-        print(f"     context stats: mu range=[{self.context_mu.min():.3e}, {self.context_mu.max():.3e}], "
+        print(f"     stats fit on idx [{a}..{b}] (n={n_fit}): "
+              f"mu range=[{self.context_mu.min():.3e}, {self.context_mu.max():.3e}], "
               f"sigma range=[{self.context_sigma.min():.3e}, {self.context_sigma.max():.3e}]")
 
     def _precompute_targets(self):
-        """Precompute SSL targets للسرعة."""
+        """Precompute SSL targets. All forward-looking targets are shifted
+        by +1 (or by the appropriate lookahead) and out-of-bounds bars are
+        marked invalid via the corresponding *_valid masks. Bars whose
+        targets cross the dataset's right edge will be filtered out of the
+        sampler so the model never trains on a truncated/synthetic target.
+        """
         n = len(self.df)
-        print(f"  ⚙️  Precomputing SSL targets...")
+        print(f"  ⚙️  Precomputing SSL targets (causal, embargo-aware)...")
 
         def _safe_col(col_name, fallback=0.0, dtype=np.float32):
-            """Safely extract numeric column or fallback array."""
             if col_name in self.df.columns:
                 return pd.to_numeric(self.df[col_name], errors='coerce').fillna(fallback).to_numpy(dtype=dtype)
             return np.full(n, fallback, dtype=dtype)
 
-        close = pd.to_numeric(self.df['close'], errors='coerce').to_numpy(dtype=np.float64)
-        # Clip close لـ range معقول (يحمي من corrupted OHLCV)
-        close = np.where(np.isfinite(close) & (close > 0), close, np.nan)
-        # Use forward-fill for any NaN
+        # ── close — CAUSAL handling only: ffill (past→present), no bfill ──
+        # bfill would copy a FUTURE close into a past NaN position, causing
+        # `next_price[i-1] = log(close[i]/close[i-1])` to encode a real
+        # forward return from close[i+k] when close[i] is missing.
+        close_raw = pd.to_numeric(self.df['close'], errors='coerce').to_numpy(dtype=np.float64)
+        close = np.where(np.isfinite(close_raw) & (close_raw > 0), close_raw, np.nan)
         if np.any(np.isnan(close)):
-            close_series = pd.Series(close).ffill().bfill().fillna(1.0)
-            close = close_series.to_numpy(dtype=np.float64)
-        log_ret = np.zeros(n, dtype=np.float32)
-        log_ret[:-1] = np.log(np.maximum(close[1:], 1e-9) / np.maximum(close[:-1], 1e-9)).astype(np.float32)
-        # Clip to ±10% per bar (يمنع corrupted ticks من تخريب)
-        log_ret = np.clip(log_ret, -0.1, 0.1).astype(np.float32)
-        self.next_price = log_ret
+            close_filled = pd.Series(close).ffill().to_numpy(dtype=np.float64)
+            # Leading NaN (before first valid close) — keep NaN; the
+            # next_price valid_mask below will drop these bars.
+            close = close_filled
 
+        # next_price[i] = log(close[i+1] / close[i]). Last bar invalid.
+        log_ret = np.full(n, np.nan, dtype=np.float64)
+        valid_pair = np.isfinite(close[:-1]) & np.isfinite(close[1:]) & (close[:-1] > 0) & (close[1:] > 0)
+        log_ret[:-1] = np.where(
+            valid_pair,
+            np.log(np.maximum(close[1:], 1e-9) / np.maximum(close[:-1], 1e-9)),
+            np.nan,
+        )
+        # Clip extreme returns (±10% per bar = ±1000 pip — protect from
+        # MBO corruption; real GBPUSD 15m bars never move this much)
+        log_ret_clipped = np.where(
+            np.isfinite(log_ret), np.clip(log_ret, -0.1, 0.1), 0.0,
+        )
+        self.next_price = log_ret_clipped.astype(np.float32)
+        self.next_price_valid = np.isfinite(log_ret)
+
+        # next_imbalance — uses obi[i+1]
         obi_col = 'obi_net' if 'obi_net' in self.df.columns else 'order_flow_imbalance'
         obi = _safe_col(obi_col, fallback=0.0)
         obi = np.clip(obi, -1.0, 1.0)
         next_obi = np.zeros(n, dtype=np.float32)
         next_obi[:-1] = obi[1:]
         self.next_imbalance = next_obi
+        self.next_imbalance_valid = np.zeros(n, dtype=bool)
+        self.next_imbalance_valid[:-1] = True
 
+        # next_volatility — uses atr[i+1]
         atr_col = 'atr_14' if 'atr_14' in self.df.columns else 'atr'
         atr = _safe_col(atr_col, fallback=0.001)
-        # Clip ATR لـ range معقول (0.0001 = 1 pip, 0.05 = 500 pip)
         atr = np.clip(atr, 1e-5, 0.05).astype(np.float32)
         next_atr = np.zeros(n, dtype=np.float32)
         next_atr[:-1] = atr[1:]
         self.next_volatility = np.maximum(next_atr, 1e-6)
+        self.next_volatility_valid = np.zeros(n, dtype=bool)
+        self.next_volatility_valid[:-1] = True
 
+        # next_regime
         next_regime = np.ones(n, dtype=np.int64)
         next_regime[:-1] = self.regime_codes[1:]
         self.next_regime = next_regime
+        self.next_regime_valid = np.zeros(n, dtype=bool)
+        self.next_regime_valid[:-1] = True
 
-        self.wall_persist = _compute_wall_persist_array(self.df)
-        self.time_to_event = _compute_time_to_event_array(self.df)
+        # wall_persist & time_to_event with proper boundary handling
+        self.wall_persist, self.wall_persist_valid = _compute_wall_persist_array(self.df)
+        self.time_to_event, self.time_to_event_valid = _compute_time_to_event_array(self.df)
 
-        # Cycle targets
+        # ── Cycle targets: NEXT bar (not current). The current bar's
+        # cycle_phase_*_prob is already excluded from context features —
+        # but to fully kill the identity-mapping risk we predict bar i+1.
         phase = np.zeros(n, dtype=np.int64)
         swing = np.zeros(n, dtype=np.int64)
         maturity = np.zeros(n, dtype=np.int64)
         cycle_pos = np.zeros(n, dtype=np.float32)
-        for i in range(n):
-            phase[i] = _compute_phase_target(self.df, i)
-            swing[i] = _compute_swing_target(self.df, i)
-            maturity[i] = _compute_maturity_target(self.df, i)
-            cycle_pos[i] = float(self.df.iloc[i].get('cycle_position', 0.0))
+        cycle_valid = np.zeros(n, dtype=bool)
+        for i in range(n - 1):  # last bar invalid (no i+1)
+            tgt_idx = i + 1
+            phase[i] = _compute_phase_target_at(self.df, tgt_idx)
+            swing[i] = _compute_swing_target_at(self.df, tgt_idx)
+            maturity[i] = _compute_maturity_target_at(self.df, tgt_idx)
+            cycle_pos[i] = float(self.df.iloc[tgt_idx].get('cycle_position', 0.0))
+            cycle_valid[i] = True
         self.phase_target = phase
         self.swing_target = swing
         self.maturity_target = maturity
         self.cycle_position_target = np.nan_to_num(cycle_pos, nan=0.0, posinf=1.0, neginf=-1.0)
+        self.cycle_valid = cycle_valid
 
-        # Final NaN/Inf sanitization على كل targets قبل التدريب
-        self.next_price = np.nan_to_num(self.next_price, nan=0.0, posinf=0.1, neginf=-0.1)
-        self.next_imbalance = np.nan_to_num(self.next_imbalance, nan=0.0, posinf=1.0, neginf=-1.0)
-        self.next_volatility = np.nan_to_num(self.next_volatility, nan=1e-4, posinf=0.05, neginf=1e-6)
-        self.wall_persist = np.nan_to_num(self.wall_persist, nan=0.0, posinf=12.0, neginf=0.0)
-        self.time_to_event = np.nan_to_num(self.time_to_event, nan=24.0, posinf=24.0, neginf=0.0)
-
-        # تحقق نهائي
-        all_clean = (
-            np.isfinite(self.next_price).all() and np.isfinite(self.next_imbalance).all()
-            and np.isfinite(self.next_volatility).all() and np.isfinite(self.wall_persist).all()
-            and np.isfinite(self.time_to_event).all() and np.isfinite(self.cycle_position_target).all()
+        # Final all-finite check on float targets
+        all_finite = (
+            np.isfinite(self.next_price).all()
+            and np.isfinite(self.next_imbalance).all()
+            and np.isfinite(self.next_volatility).all()
+            and np.isfinite(self.wall_persist).all()
+            and np.isfinite(self.time_to_event).all()
+            and np.isfinite(self.cycle_position_target).all()
         )
-        if not all_clean:
-            print(f"     🚨 WARNING: targets still have NaN/Inf after sanitization!")
-        print(f"     ✅ SSL targets ready (10 tasks × {n:,} bars), all finite={all_clean}")
+        if not all_finite:
+            raise RuntimeError("SSL targets contain NaN/Inf after computation — bug.")
+
+        n_valid_price = int(self.next_price_valid[self.min_idx:self.max_idx].sum())
+        n_valid_wall = int(self.wall_persist_valid[self.min_idx:self.max_idx].sum())
+        n_valid_tte = int(self.time_to_event_valid[self.min_idx:self.max_idx].sum())
+        n_valid_cyc = int(self.cycle_valid[self.min_idx:self.max_idx].sum())
+        print(f"     ✅ Targets ready. Valid in sample range: "
+              f"price={n_valid_price}, wall={n_valid_wall}, tte={n_valid_tte}, cycle={n_valid_cyc}")
 
     def __len__(self) -> int:
         return self.n_samples
@@ -378,7 +534,13 @@ class SSLDataset(Dataset):
         # Final safety net عشان مفيش NaN يوصل للموديل
         context = np.nan_to_num(context, nan=0.0, posinf=5.0, neginf=-5.0)
 
-        # Cycle window
+        # ── Cycle window: strictly past, EXCLUSIVE of idx ──
+        # Previous version included idx itself, and the cycle target was
+        # computed from columns AT idx (cycle_phase_*_prob[idx]) — an
+        # identity mapping. Now: window is bars [idx-T .. idx-1], target
+        # is at idx+1 (set in _precompute_targets). The cycle_phase_*_prob
+        # columns are ALSO excluded from the LOB context features (see
+        # _LEAKAGE_COLS_EXACT), so the model has no path to cheat.
         cycle_cols = [
             'open', 'high', 'low', 'close', 'volume',
             'cycle_structure_score', 'cycle_trend_maturity',
@@ -388,8 +550,8 @@ class SSLDataset(Dataset):
         ]
         avail_cycle = [c for c in cycle_cols if c in self.df.columns]
         T = lob_window.shape[0]
-        start = max(0, idx - T + 1)
-        end = idx + 1
+        start = max(0, idx - T)
+        end = idx                                   # exclusive of current bar
         cycle_window = self.df[avail_cycle].iloc[start:end].to_numpy(dtype=np.float32)
         if cycle_window.shape[0] < T:
             pad = np.zeros((T - cycle_window.shape[0], cycle_window.shape[1]), dtype=np.float32)
@@ -402,6 +564,7 @@ class SSLDataset(Dataset):
             'bar_mask': torch.from_numpy(bar_mask),
             'context': torch.from_numpy(context),
             'cycle_window': torch.from_numpy(cycle_window),
+            # Targets
             'next_price': torch.tensor(self.next_price[idx], dtype=torch.float32),
             'next_imbalance': torch.tensor(self.next_imbalance[idx], dtype=torch.float32),
             'next_volatility': torch.tensor(self.next_volatility[idx], dtype=torch.float32),
@@ -412,6 +575,16 @@ class SSLDataset(Dataset):
             'maturity_target': torch.tensor(self.maturity_target[idx], dtype=torch.long),
             'swing_target': torch.tensor(self.swing_target[idx], dtype=torch.long),
             'cycle_position_target': torch.tensor(self.cycle_position_target[idx], dtype=torch.float32),
+            # Per-target validity flags (1.0 = use this sample's loss for the
+            # corresponding head; 0.0 = mask out — target is truncated /
+            # missing). Training loop should weight per-task losses by these.
+            'next_price_valid': torch.tensor(float(self.next_price_valid[idx]), dtype=torch.float32),
+            'next_imbalance_valid': torch.tensor(float(self.next_imbalance_valid[idx]), dtype=torch.float32),
+            'next_volatility_valid': torch.tensor(float(self.next_volatility_valid[idx]), dtype=torch.float32),
+            'next_regime_valid': torch.tensor(float(self.next_regime_valid[idx]), dtype=torch.float32),
+            'wall_persist_valid': torch.tensor(float(self.wall_persist_valid[idx]), dtype=torch.float32),
+            'time_to_event_valid': torch.tensor(float(self.time_to_event_valid[idx]), dtype=torch.float32),
+            'cycle_valid': torch.tensor(float(self.cycle_valid[idx]), dtype=torch.float32),
         }
 
 
@@ -420,43 +593,78 @@ def build_ssl_loaders(
     lob_tensors_path: str,
     lob_timestamps_path: Optional[str] = None,
     *,
-    order_batches_dir: Optional[str] = None,    # ← NEW: real orders
+    order_batches_dir: Optional[str] = None,
     batch_size: int = 32,
     train_split: float = 0.75,
     num_workers: int = 0,
     lookback_bars: int = 50,
+    embargo_bars: int = 24,
     seed: int = 42,
 ) -> tuple[DataLoader, DataLoader]:
-    """Build train + holdout SSL data loaders بـ time-based split.
+    """Build train + holdout SSL data loaders with a purged-embargo time split.
 
-    train_split=0.75 يعني أول 75% train، آخر 25% holdout.
-    لا random shuffle عبر الـ split — للحفاظ على causality.
+    Three protections against train/holdout leakage:
 
-    order_batches_dir: لو متوفر، يستخدم real orders من MBO خام بدل pseudo-orders.
-        مهم لـ iceberg detection و الحفاظ على معلومات order_id/action.
+    1. **Time-based split** (no random shuffle across the boundary)
+       Train idx ∈ [lookback_bars, split_idx - embargo_bars);
+       Holdout idx ∈ [split_idx + lookback_bars, n - embargo_bars).
+
+    2. **Lookback embargo** — holdout's first valid sample is shifted right
+       by `lookback_bars` so its input window doesn't reach back into the
+       training period. Without this, the first 50 holdout samples would
+       have 49/50 input bars belonging to the training set.
+
+    3. **Target-horizon embargo** — train's last valid sample is shifted
+       left by `embargo_bars` so its forward-looking targets
+       (next_price, wall_persist@12, time_to_event@24) don't reach into
+       the holdout period.
+
+    Both datasets fit z-score stats on the TRAIN slice only (passed
+    explicitly via stats_min_idx/stats_max_idx).
     """
-    df = pd.read_parquet(features_parquet)
-    n = len(df)
-    split_idx = int(n * train_split)
-    del df
+    df_for_n = pd.read_parquet(features_parquet, columns=['close'])
+    n = len(df_for_n)
+    del df_for_n
 
-    print(f"⚙️  Building SSL data loaders...")
-    print(f"   Time split: train [0..{split_idx}], holdout [{split_idx}..{n}]")
-    print(f"   Order mode: {'REAL (from MBO)' if order_batches_dir else 'pseudo (from LOB tensor)'}")
+    split_idx = int(n * train_split)
+
+    train_lo = lookback_bars
+    train_hi = max(train_lo + 1, split_idx - embargo_bars)
+    holdout_lo = split_idx + lookback_bars
+    holdout_hi = max(holdout_lo + 1, n - embargo_bars)
+
+    if train_hi <= train_lo:
+        raise ValueError(f"Train slice empty after embargo: [{train_lo}..{train_hi}]")
+    if holdout_hi <= holdout_lo:
+        raise ValueError(f"Holdout slice empty after embargo: [{holdout_lo}..{holdout_hi}]")
+
+    print(f"⚙️  Building SSL data loaders (purged-embargo split)")
+    print(f"   Total bars:  {n}")
+    print(f"   Train:       idx [{train_lo}..{train_hi}) — {train_hi - train_lo:,} samples")
+    print(f"   ── gap (lookback+embargo) ──")
+    print(f"   Holdout:     idx [{holdout_lo}..{holdout_hi}) — {holdout_hi - holdout_lo:,} samples")
+    print(f"   Order mode:  {'REAL (from MBO)' if order_batches_dir else 'pseudo (from LOB tensor)'}")
 
     train_ds = SSLDataset(
         features_parquet, lob_tensors_path, lob_timestamps_path,
         order_batches_dir=order_batches_dir,
         lookback_bars=lookback_bars,
-        min_idx=lookback_bars,
-        max_idx=split_idx,
+        min_idx=train_lo,
+        max_idx=train_hi,
+        stats_min_idx=train_lo,
+        stats_max_idx=train_hi,
+        embargo_bars=embargo_bars,
     )
     holdout_ds = SSLDataset(
         features_parquet, lob_tensors_path, lob_timestamps_path,
         order_batches_dir=order_batches_dir,
         lookback_bars=lookback_bars,
-        min_idx=split_idx,
-        max_idx=n - 25,
+        min_idx=holdout_lo,
+        max_idx=holdout_hi,
+        # CRITICAL: holdout uses TRAIN stats (else leak)
+        stats_min_idx=train_lo,
+        stats_max_idx=train_hi,
+        embargo_bars=embargo_bars,
     )
 
     train_loader = DataLoader(
