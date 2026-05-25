@@ -75,7 +75,6 @@ def main():
     print(f"═══ Direction Head Fine-Tuning ═══")
     print(f"Device: {device}")
 
-    # Load data
     print(f"Loading features from {args.features}...")
     df = pd.read_parquet(args.features)
     print(f"   {len(df):,} rows")
@@ -84,30 +83,58 @@ def main():
     embeddings = np.load(args.embeddings)
     print(f"   shape={embeddings.shape}")
 
+    # Optional validity mask (recommended path — emitted by extract_embeddings)
+    valid_path = Path(args.embeddings).parent / 'embedding_valid.npy'
+    if valid_path.exists():
+        embedding_valid = np.load(valid_path)
+        print(f"   embedding_valid: {int(embedding_valid.sum())} / {len(embedding_valid)} valid")
+    else:
+        # Conservative fallback: any row containing NaN → invalid
+        embedding_valid = np.isfinite(embeddings).all(axis=1)
+        print(f"   embedding_valid: derived from NaN-check "
+              f"({int(embedding_valid.sum())} / {len(embedding_valid)} valid)")
+
     if len(df) != len(embeddings):
         raise ValueError(f"Length mismatch: df={len(df)} embeddings={len(embeddings)}")
 
-    # Filter for directional labels (LONG=0, SHORT=1)
+    # ── A4 FIX: calendar-based split BEFORE directional filter ──
+    # Previous version: directional_mask first, then int(len(X)*0.75) split.
+    # Because directional rows are sparse and unevenly distributed in time,
+    # the boundary "75% of directional rows" did NOT correspond to a fixed
+    # calendar cutoff — train and val rows were calendar-interleaved.
+    # Now: pick a CALENDAR cutoff time, then filter directional+valid rows
+    # on each side. This matches the SSL train/holdout boundary in time.
+    ts = pd.to_datetime(df['ts_event']).to_numpy()
+    n_total = len(df)
+    split_calendar_idx = int(n_total * args.train_split)
+    split_ts = ts[split_calendar_idx]
+    print(f"   Calendar split @ row {split_calendar_idx} = {pd.Timestamp(split_ts)}")
+
+    # Build full per-row mask: directional + embedding-valid
     bias = df['bias_label'].to_numpy()
     directional_mask = (bias == 0) | (bias == 1)
+    base_mask = directional_mask & embedding_valid
+
+    train_row_mask = base_mask & (np.arange(n_total) < split_calendar_idx)
+    val_row_mask   = base_mask & (np.arange(n_total) >= split_calendar_idx)
+
+    X_train = embeddings[train_row_mask].astype(np.float32)
+    y_train = bias[train_row_mask].astype(np.int64)
+    X_val = embeddings[val_row_mask].astype(np.float32)
+    y_val = bias[val_row_mask].astype(np.int64)
+
     n_directional = int(directional_mask.sum())
-    print(f"   Directional rows: {n_directional} ({n_directional/len(df)*100:.1f}%)")
-    if n_directional < 50:
-        print(f"❌ FATAL: less than 50 directional rows — cannot train")
-        sys.exit(1)
-
-    X = embeddings[directional_mask].astype(np.float32)
-    y = bias[directional_mask].astype(np.int64)
-    print(f"   X shape: {X.shape} | y distribution: LONG={int((y==0).sum())}, SHORT={int((y==1).sum())}")
-
-    # Time-based split
-    split_idx = int(len(X) * args.train_split)
-    X_train, y_train = X[:split_idx], y[:split_idx]
-    X_val, y_val = X[split_idx:], y[split_idx:]
+    print(f"   Directional rows: {n_directional} ({n_directional/n_total*100:.1f}%)")
     print(f"   Train: {len(X_train)} | Val: {len(X_val)}")
+    print(f"   y_train: LONG={int((y_train==0).sum())}, SHORT={int((y_train==1).sum())}")
+    print(f"   y_val:   LONG={int((y_val==0).sum())}, SHORT={int((y_val==1).sum())}")
 
+    if len(X_train) < 30:
+        print(f"❌ FATAL: less than 30 train rows after calendar+valid filter")
+        sys.exit(1)
     if len(X_val) < 10:
-        print(f"⚠️  Very few validation samples ({len(X_val)}) — results unreliable")
+        print(f"⚠️  Very few validation samples ({len(X_val)}) — bootstrap CIs in "
+              f"validation will be wide. Results indicative only.")
 
     # Normalize features
     mu = X_train.mean(axis=0)
@@ -204,12 +231,22 @@ def main():
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             patience = 0
+            # S8 fix: save the architecture hyperparameters so validate_ssl
+            # can reconstruct the model with the right hidden_dim and
+            # dropout. Previously these defaulted to (64, 0.3) at load
+            # time → shape mismatch on state_dict when training used
+            # --hidden-dim 128.
             torch.save({
                 'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
                 'mu': mu, 'sigma': sigma,
                 'input_dim': input_dim,
+                'hidden_dim': args.hidden_dim,
+                'dropout': args.dropout,
                 'epoch': epoch + 1,
                 'val_acc': val_acc,
+                'split_calendar_idx': int(split_calendar_idx),
+                'split_ts': str(pd.Timestamp(split_ts)),
             }, Path(args.output) / 'best_direction_head.pt')
         else:
             patience += 1
