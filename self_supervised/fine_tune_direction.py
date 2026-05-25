@@ -152,7 +152,7 @@ def main():
     )
 
     # Build direction head
-    input_dim = X.shape[1]
+    input_dim = X_train.shape[1]
     model = DirectionHead(input_dim, args.hidden_dim, args.dropout).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"   Direction head parameters: {n_params:,} (input_dim={input_dim})")
