@@ -52,6 +52,7 @@ from .transformer_blocks import LOBTransformerEncoder
 from .event_aggregator import EventAggregator
 from .bar_lstm import BarLevelLSTM
 from .context_encoder import ContextEncoder, CrossAttentionFusion
+from .lob_image_encoder import LOBImageEncoder, LOBImageEncoderConfig
 from .multi_task_heads import MultiTaskHeads, MultiTaskOutput
 
 
@@ -80,6 +81,30 @@ class HierarchicalLOBTransformer(nn.Module):
         # Stage 5: Context encoder
         self.context_encoder = ContextEncoder(config.context_encoder)
 
+        # Stage 5b (NEW): 2D CNN over the 9-channel LOB tensor — captures
+        # complementary signal that the order-level transformer can't
+        # easily see (e.g. cumulative depth across price levels, wall
+        # patterns, depth velocity).
+        self._use_lob_image = bool(getattr(config, 'lob_image', None)
+                                   and config.lob_image.enabled)
+        if self._use_lob_image:
+            lob_cfg = LOBImageEncoderConfig(
+                in_channels=config.lob_image.in_channels,
+                lob_embed_dim=config.lob_image.lob_embed_dim,
+                hidden_channels=tuple(config.lob_image.hidden_channels),
+                dropout=config.lob_image.dropout,
+            )
+            self.lob_image_encoder = LOBImageEncoder(lob_cfg)
+            # Project bar_final + lob_image into a combined "book_emb" of
+            # bar_lstm.output_dim (so the existing fusion math is unchanged).
+            self.book_combine = nn.Linear(
+                self.bar_lstm.output_dim + lob_cfg.lob_embed_dim,
+                self.bar_lstm.output_dim,
+            )
+        else:
+            self.lob_image_encoder = None
+            self.book_combine = None
+
         # Stage 6: Cross-attention fusion
         self.fusion = CrossAttentionFusion(
             book_dim=self.bar_lstm.output_dim,
@@ -98,6 +123,7 @@ class HierarchicalLOBTransformer(nn.Module):
         order_masks: torch.Tensor,
         bar_mask: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
+        lob_tensor: Optional[torch.Tensor] = None,
         return_intermediates: bool = False,
     ) -> MultiTaskOutput | tuple[MultiTaskOutput, dict]:
         """Full forward pass.
@@ -108,6 +134,8 @@ class HierarchicalLOBTransformer(nn.Module):
         order_masks    : (B, T, N) bool — valid order indicators
         bar_mask       : (B, T) bool    — valid bar indicators
         context        : (B, n_context) — 138 existing features
+        lob_tensor     : (B, T, P=20, C=9) — rolling LOB image (optional;
+                          required when config.lob_image.enabled)
 
         Returns
         -------
@@ -157,6 +185,16 @@ class HierarchicalLOBTransformer(nn.Module):
         bar_sequence_output, bar_final_state = self.bar_lstm(events, bar_mask)
         # bar_final_state : (B, output_dim_lstm)
 
+        # ── Stage 4b: LOB image branch (NEW, optional) ─────────────────────
+        if self._use_lob_image and lob_tensor is not None:
+            lob_emb = self.lob_image_encoder(lob_tensor)   # (B, lob_embed_dim)
+            book_emb = self.book_combine(
+                torch.cat([bar_final_state, lob_emb], dim=-1)
+            )
+        else:
+            lob_emb = None
+            book_emb = bar_final_state
+
         # ── Stage 5: Context encoding ──────────────────────────────────────
         if context is None:
             # Use zeros if context not provided (backward compat)
@@ -168,7 +206,7 @@ class HierarchicalLOBTransformer(nn.Module):
         context_emb = self.context_encoder(context)  # (B, context_dim)
 
         # ── Stage 6: Fusion ────────────────────────────────────────────────
-        shared = self.fusion(bar_final_state, context_emb)  # (B, shared_dim)
+        shared = self.fusion(book_emb, context_emb)  # (B, shared_dim)
 
         # ── Stage 7: Multi-task heads ──────────────────────────────────────
         outputs = self.heads(shared)
@@ -179,6 +217,8 @@ class HierarchicalLOBTransformer(nn.Module):
                 "attentions": attentions,
                 "event_assignment": self.event_aggregator.get_last_assignment(),
                 "events": events,
+                "lob_image_embedding": lob_emb,
+                "book_embedding": book_emb,
                 "bar_sequence": bar_sequence_output,
                 "bar_final": bar_final_state,
                 "context_embedding": context_emb,

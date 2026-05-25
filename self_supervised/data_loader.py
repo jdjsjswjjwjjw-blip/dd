@@ -573,12 +573,17 @@ class SSLDataset(Dataset):
             cycle_window = np.concatenate([pad, cycle_window], axis=0)
         cycle_window = np.nan_to_num(cycle_window, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # LOB image tensor — (T, P, C) shape, used by the new LOB CNN branch
+        # in HierarchicalLOBTransformer. Defensive sanitization.
+        lob_image = np.nan_to_num(lob_window, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
         return {
             'order_features': torch.from_numpy(order_features),
             'order_masks': torch.from_numpy(order_masks),
             'bar_mask': torch.from_numpy(bar_mask),
             'context': torch.from_numpy(context),
             'cycle_window': torch.from_numpy(cycle_window),
+            'lob_image': torch.from_numpy(lob_image),
             # Targets
             'next_price': torch.tensor(self.next_price[idx], dtype=torch.float32),
             'next_imbalance': torch.tensor(self.next_imbalance[idx], dtype=torch.float32),

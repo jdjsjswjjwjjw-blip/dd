@@ -239,6 +239,21 @@ class TrainingConfig:
 
 
 @dataclass
+class LOBImageEncoderConfigDC:
+    """2D CNN encoder for the 9-channel rolling LOB tensor.
+
+    Consumes the (T, P, C=9) LOB image alongside the OrderBatch path.
+    If `enabled=False`, the model ignores lob_tensor input entirely and
+    behaves like the OrderBatch-only architecture.
+    """
+    enabled: bool = True
+    in_channels: int = 9
+    lob_embed_dim: int = 32
+    hidden_channels: tuple = (32, 64, 96)
+    dropout: float = 0.1
+
+
+@dataclass
 class DeepLOBConfig:
     """Top-level configuration for Hierarchical LOB Transformer + MTL."""
 
@@ -247,12 +262,13 @@ class DeepLOBConfig:
     event_aggregator: EventAggregatorConfig = field(default_factory=EventAggregatorConfig)
     bar_lstm: BarLSTMConfig = field(default_factory=BarLSTMConfig)
     context_encoder: ContextEncoderConfig = field(default_factory=ContextEncoderConfig)
+    lob_image: LOBImageEncoderConfigDC = field(default_factory=LOBImageEncoderConfigDC)
     multi_task_heads: MultiTaskHeadsConfig = field(default_factory=MultiTaskHeadsConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     # Model name (for checkpoint identification)
-    model_name: str = "hierarchical_lob_transformer_mtl_v1"
-    version: int = 1
+    model_name: str = "hierarchical_lob_transformer_mtl_v2_9ch"
+    version: int = 2
 
     def __post_init__(self):
         # Cross-component validation

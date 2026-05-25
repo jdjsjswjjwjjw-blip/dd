@@ -174,6 +174,7 @@ def main():
                 batch['order_masks'].to(device),
                 batch['bar_mask'].to(device),
                 batch['context'].to(device),
+                lob_tensor=batch['lob_image'].to(device) if 'lob_image' in batch else None,
             )
             outs_cycle = cycle_model(batch['cycle_window'].to(device))
 

@@ -171,6 +171,7 @@ def train_epoch(model, loader, optimizer, device, scaler, scheduler,
             'order_masks':    batch['order_masks'].to(device, non_blocking=True),
             'bar_mask':       batch['bar_mask'].to(device, non_blocking=True),
             'context':        batch['context'].to(device, non_blocking=True),
+            'lob_tensor':     batch['lob_image'].to(device, non_blocking=True),
         }
 
         optimizer.zero_grad(set_to_none=True)
@@ -256,6 +257,7 @@ def eval_epoch(model, loader, device, config_weights, use_amp: bool) -> dict:
             'order_masks':    batch['order_masks'].to(device, non_blocking=True),
             'bar_mask':       batch['bar_mask'].to(device, non_blocking=True),
             'context':        batch['context'].to(device, non_blocking=True),
+            'lob_tensor':     batch['lob_image'].to(device, non_blocking=True),
         }
         if use_amp:
             with torch.amp.autocast('cuda', dtype=torch.float16):

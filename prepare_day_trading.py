@@ -1827,6 +1827,87 @@ def _trade_footprint_bar(
     return buy_fp, sell_fp
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# 9-channel LOB representation
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Channel layout per (T-bar, P-level=20):
+#   ch0  depth_log         log1p(size at level)                  [keep — original ch0]
+#   ch1  trade_imbalance   (buy_vol - sell_vol)/(buy + sell)     [keep — original ch1]
+#   ch2  trade_vol_log     log1p(total trade vol at level)       [keep — original ch2]
+#   ch3  bid_depth_log     log1p(bid_sz at level, zero at ask)   [NEW separated bid]
+#   ch4  ask_depth_log     log1p(ask_sz at level, zero at bid)   [NEW separated ask]
+#   ch5  buy_vol_log       log1p(buy trade vol at level)         [NEW separated buy]
+#   ch6  sell_vol_log      log1p(sell trade vol at level)        [NEW separated sell]
+#   ch7  wall_flag         1.0 if size > 3× per-snapshot median  [NEW wall detection]
+#   ch8  depth_velocity    (depth_now - depth_prev)/max(prev,1)  [NEW temporal δ]
+#
+# Levels 0..9  = bid side (reversed: 0 = deepest bid, 9 = best bid)
+# Levels 10..19 = ask side (10 = best ask, 19 = deepest ask)
+N_LOB_CHANNELS = 9
+
+
+def _build_9ch_snapshot(
+    depth_combined: np.ndarray,     # (P=20,) log1p of bid+ask sizes
+    raw_depth_combined: np.ndarray, # (P=20,) raw bid+ask sizes (no log)
+    bid_sz_row: np.ndarray,         # (n_levels=10,) raw bid sizes, best..deepest
+    ask_sz_row: np.ndarray,         # (n_levels=10,) raw ask sizes, best..deepest
+    full_buy: np.ndarray,           # (P=20,) raw buy trade vol per level
+    full_sell: np.ndarray,          # (P=20,) raw sell trade vol per level
+    prev_raw_depth: np.ndarray | None,  # (P=20,) raw depth at previous snapshot
+    levels: int,
+    wall_factor: float = 3.0,
+) -> np.ndarray:
+    """Compose 9-channel feature for ONE snapshot. Returns (P, 9)."""
+    P = depth_combined.shape[0]
+    out = np.zeros((P, N_LOB_CHANNELS), dtype=np.float32)
+
+    # ch0 — combined depth (original)
+    out[:, 0] = depth_combined.astype(np.float32)
+
+    # ch1 — trade imbalance per level
+    tot_fp_raw = full_buy + full_sell
+    imb = np.divide(full_buy - full_sell, np.maximum(tot_fp_raw, 1e-9))
+    out[:, 1] = imb.astype(np.float32)
+
+    # ch2 — total trade vol (original)
+    out[:, 2] = np.log1p(np.maximum(tot_fp_raw, 0.0)).astype(np.float32)
+
+    # ch3 — bid_depth_log (zero at ask levels)
+    bid_depth = np.zeros(P, dtype=np.float32)
+    # bid levels are P=0..9, reversed (deepest..best); bid_sz_row is best..deepest
+    bid_depth[:levels] = np.log1p(np.maximum(bid_sz_row[::-1].astype(np.float32), 0.0))
+    out[:, 3] = bid_depth
+
+    # ch4 — ask_depth_log (zero at bid levels)
+    ask_depth = np.zeros(P, dtype=np.float32)
+    ask_depth[levels:] = np.log1p(np.maximum(ask_sz_row.astype(np.float32), 0.0))
+    out[:, 4] = ask_depth
+
+    # ch5 — buy_vol_log (mostly at ask side)
+    out[:, 5] = np.log1p(np.maximum(full_buy.astype(np.float32), 0.0))
+
+    # ch6 — sell_vol_log (mostly at bid side)
+    out[:, 6] = np.log1p(np.maximum(full_sell.astype(np.float32), 0.0))
+
+    # ch7 — wall_flag: large size relative to snapshot median (excludes zeros)
+    nz = raw_depth_combined[raw_depth_combined > 0]
+    if len(nz) > 0:
+        med = float(np.median(nz))
+        threshold = wall_factor * med
+        out[:, 7] = (raw_depth_combined > threshold).astype(np.float32)
+
+    # ch8 — depth_velocity vs previous snapshot
+    if prev_raw_depth is not None:
+        delta = raw_depth_combined - prev_raw_depth
+        denom = np.maximum(prev_raw_depth, 1.0)
+        out[:, 8] = (delta / denom).astype(np.float32)
+        # Clip extreme jumps (orderbook reset events)
+        out[:, 8] = np.clip(out[:, 8], -10.0, 10.0)
+
+    return out
+
+
 def build_rolling_lob_tensors_from_mbp(
     df_mbo: pd.DataFrame,
     df_mbp: pd.DataFrame,
@@ -1911,10 +1992,13 @@ def build_rolling_lob_tensors_from_mbp(
     T = int(max(lookback_bars, 1))
     bar_ns = np.timedelta64(int(_bar_period_seconds(freq) * 1e9), 'ns')
 
-    bar_snapshots: list[tuple[np.ndarray, np.ndarray, np.ndarray] | None] = []
+    # bar_snapshots[bi] = (snap_9ch, raw_depth) or None
+    # snap_9ch is (P, 9) float32; raw_depth needed for velocity in next bar
+    bar_snapshots: list[tuple[np.ndarray, np.ndarray] | None] = []
     ts_bar = bars['ts_event'].to_numpy(dtype='datetime64[ns]', copy=False)
 
     bars_with_snapshot = 0
+    prev_raw_depth: np.ndarray | None = None
     for bi in range(n_bars):
         t0 = ts_bar[bi]
         t1 = t0 + bar_ns
@@ -1928,7 +2012,7 @@ def build_rolling_lob_tensors_from_mbp(
         a_depth_row = ask_sz[idx_m].sum(axis=1)
         tot_d = b_depth_row + a_depth_row + 1e-9
         imb_mag = np.abs((b_depth_row - a_depth_row) / tot_d)
-        # FIX #6: دمج أعلى 3 لقطات مرجّحة بـ |imbalance| (أقل ضوضاء من قمة واحدة)
+        # Blend top-3 imbalance-weighted snapshots
         order = np.argsort(-imb_mag)
         top_k = int(min(3, len(order)))
         top_local = order[:top_k].astype(np.int64, copy=False)
@@ -1936,47 +2020,58 @@ def build_rolling_lob_tensors_from_mbp(
         w_sum = float(np.sum(w_raw))
         blend_w = (w_raw / w_sum) if w_sum > 1e-12 else (np.ones(top_k, dtype=np.float64) / max(top_k, 1))
 
-        depth_acc = np.zeros(n_lv2, dtype=np.float64)
+        raw_depth_acc = np.zeros(n_lv2, dtype=np.float64)
+        bid_sz_acc = np.zeros(levels, dtype=np.float64)
+        ask_sz_acc = np.zeros(levels, dtype=np.float64)
         bid0_acc = 0.0
         ask0_acc = 0.0
         for wi, jloc in zip(blend_w, top_local):
             row_idx = int(idx_m[jloc])
-            raw = np.concatenate([bid_sz[row_idx][::-1], ask_sz[row_idx]], axis=0)
-            depth_acc += float(wi) * np.maximum(raw.astype(np.float64), 0.0)
+            bid_row = np.maximum(bid_sz[row_idx].astype(np.float64), 0.0)
+            ask_row = np.maximum(ask_sz[row_idx].astype(np.float64), 0.0)
+            raw = np.concatenate([bid_row[::-1], ask_row], axis=0)
+            raw_depth_acc += float(wi) * raw
+            bid_sz_acc += float(wi) * bid_row
+            ask_sz_acc += float(wi) * ask_row
             if bid_px.shape[1]:
                 bid0_acc += float(wi) * float(bid_px[row_idx, 0])
             if ask_px.shape[1]:
                 ask0_acc += float(wi) * float(ask_px[row_idx, 0])
-        depth_feat = np.log1p(depth_acc).astype(np.float32)
+        depth_combined = np.log1p(raw_depth_acc).astype(np.float32)
         bid0 = float(bid0_acc)
         ask0 = float(ask0_acc)
+
+        # Trade footprint within this bar window
         lo_t = int(np.searchsorted(mbo_ts, t0, side='left'))
         hi_t = int(np.searchsorted(mbo_ts, t1, side='left'))
         buy_fp, sell_fp = _trade_footprint_bar(
-            lo_t,
-            hi_t,
-            mbo_ts=mbo_ts,
-            mbo_action=mbo_action,
-            mbo_side=mbo_side,
-            mbo_price=mbo_price,
-            mbo_size=mbo_size,
-            bid0=bid0,
-            ask0=ask0,
-            levels=levels,
-            tick_med=tick_med,
-            fallback_tick=fallback_tick,
+            lo_t, hi_t,
+            mbo_ts=mbo_ts, mbo_action=mbo_action, mbo_side=mbo_side,
+            mbo_price=mbo_price, mbo_size=mbo_size,
+            bid0=bid0, ask0=ask0,
+            levels=levels, tick_med=tick_med, fallback_tick=fallback_tick,
         )
         full_buy = np.zeros(n_lv2, dtype=np.float32)
         full_sell = np.zeros(n_lv2, dtype=np.float32)
         full_buy[levels:] = buy_fp.astype(np.float32, copy=False)
         full_sell[:levels] = sell_fp[::-1].astype(np.float32, copy=False)
-        tot_fp_raw = full_buy + full_sell
-        imb_fp = (full_buy - full_sell) / np.maximum(tot_fp_raw, np.float32(1e-9))
-        tot_fp = np.log1p(np.maximum(tot_fp_raw, np.float32(0.0))).astype(np.float32)
-        bar_snapshots.append((depth_feat, imb_fp.astype(np.float32, copy=False), tot_fp))
+
+        # Compose 9-channel snapshot
+        snap_9ch = _build_9ch_snapshot(
+            depth_combined=depth_combined,
+            raw_depth_combined=raw_depth_acc.astype(np.float32),
+            bid_sz_row=bid_sz_acc.astype(np.float32),
+            ask_sz_row=ask_sz_acc.astype(np.float32),
+            full_buy=full_buy,
+            full_sell=full_sell,
+            prev_raw_depth=prev_raw_depth,
+            levels=levels,
+        )
+        bar_snapshots.append((snap_9ch, raw_depth_acc.astype(np.float32)))
+        prev_raw_depth = raw_depth_acc.astype(np.float32)
         bars_with_snapshot += 1
 
-    tensors = np.zeros((n_bars, T, n_lv2, 3), dtype=np.float32)
+    tensors = np.zeros((n_bars, T, n_lv2, N_LOB_CHANNELS), dtype=np.float32)
     timestamps = np.zeros(n_bars, dtype='datetime64[ns]')
     roll_cov = np.zeros(n_bars, dtype=np.float32)
 
@@ -1990,10 +2085,8 @@ def build_rolling_lob_tensors_from_mbp(
             snap = bar_snapshots[src]
             if snap is None:
                 continue
-            depth_feat, imb_fp, tot_fp = snap
-            tensors[bi, lag, :, 0] = depth_feat
-            tensors[bi, lag, :, 1] = imb_fp
-            tensors[bi, lag, :, 2] = tot_fp
+            snap_9ch, _ = snap
+            tensors[bi, lag, :, :] = snap_9ch
             filled += 1
         roll_cov[bi] = float(filled) / float(T)
 
@@ -2055,12 +2148,22 @@ def build_rolling_lob_tensors_mbo_only(
     c1_arr = bt / tick_med
     c2_arr = st / tick_med
 
-    feats: list[tuple[float, float, float] | None] = [
-        (float(imb_arr[i]), float(c1_arr[i]), float(c2_arr[i])) if bool(has_ticks[i]) else None
+    # MBO-only fallback: we don't have book depth, so most channels are
+    # degenerate. We emit zeros for book-specific channels (ch0, ch3, ch4,
+    # ch7, ch8) and fill the trade/flow channels (ch1, ch2, ch5, ch6) with
+    # bar-level aggregates broadcast across all P levels.
+    feats: list[tuple[float, float, float, float, float] | None] = [
+        (
+            float(imb_arr[i]),                        # trade imbalance
+            float(np.log1p(tot_v[i])),                # total trade vol log
+            float(np.log1p(bv[i])),                   # buy vol log
+            float(np.log1p(sv[i])),                   # sell vol log
+            float(c1_arr[i] - c2_arr[i]),             # placeholder velocity-ish
+        ) if bool(has_ticks[i]) else None
         for i in range(n_bars)
     ]
 
-    tensors = np.zeros((n_bars, T, n_levels, 3), dtype=np.float32)
+    tensors = np.zeros((n_bars, T, n_levels, N_LOB_CHANNELS), dtype=np.float32)
     timestamps = bars['ts_event'].to_numpy(dtype='datetime64[ns]', copy=False)
     roll_cov = np.zeros(n_bars, dtype=np.float32)
 
@@ -2073,10 +2176,20 @@ def build_rolling_lob_tensors_mbo_only(
             f = feats[src]
             if f is None:
                 continue
-            imb, c1, c2 = f
-            tensors[bi, lag, :, 0] = np.float32(imb)
-            tensors[bi, lag, :, 1] = np.float32(c1)
-            tensors[bi, lag, :, 2] = np.float32(c2)
+            imb, tvol, bvol, svol, vel = f
+            # ch0: depth — degenerate (no MBP), zero
+            # ch1: trade imbalance
+            tensors[bi, lag, :, 1] = np.float32(imb)
+            # ch2: total trade vol log
+            tensors[bi, lag, :, 2] = np.float32(tvol)
+            # ch3, ch4: bid/ask depth — degenerate without MBP
+            # ch5: buy trade vol log
+            tensors[bi, lag, :, 5] = np.float32(bvol)
+            # ch6: sell trade vol log
+            tensors[bi, lag, :, 6] = np.float32(svol)
+            # ch7: wall flag — degenerate
+            # ch8: depth velocity — approximate with vol-imbalance velocity
+            tensors[bi, lag, :, 8] = np.float32(vel)
             filled += 1
         roll_cov[bi] = float(filled) / float(T)
 
