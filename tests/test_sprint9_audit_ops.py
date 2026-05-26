@@ -94,6 +94,7 @@ class TestBacktestSmokeHarness(unittest.TestCase):
         self.assertIn("--n-rows", res.stdout)
 
 
+@unittest.skip("tools/paper_dry_run.py archived (depends on legacy V19 paper_v19)")
 class TestPaperDryRun(unittest.TestCase):
     def test_synthetic_bars(self):
         from tools.paper_dry_run import synthetic_bars

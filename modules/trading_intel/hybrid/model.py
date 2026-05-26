@@ -140,12 +140,25 @@ class HybridModel(nn.Module):
     ) -> HybridOutput:
         cfg = self.config
 
-        # Verify shapes
+        # Verify shapes — fail loudly with helpful messages so a caller
+        # using a different feature count than configured catches the
+        # mismatch at call site, not deep inside the MLP.
         B = daytrade_features.shape[0]
-        assert daytrade_features.shape == (B, cfg.daytrade_feature_dim), \
-            f"daytrade_features shape mismatch: {tuple(daytrade_features.shape)}"
-        assert ssl_embedding.shape == (B, cfg.ssl_embed_dim), \
-            f"ssl_embedding shape mismatch: {tuple(ssl_embedding.shape)}"
+        if daytrade_features.shape != (B, cfg.daytrade_feature_dim):
+            raise AssertionError(
+                f"daytrade_features shape {tuple(daytrade_features.shape)} "
+                f"does not match HybridConfig.daytrade_feature_dim="
+                f"{cfg.daytrade_feature_dim}. Rebuild HybridConfig with the "
+                f"actual feature count (e.g. cfg = HybridConfig("
+                f"daytrade_feature_dim={daytrade_features.shape[1]}, ...))."
+            )
+        if ssl_embedding.shape != (B, cfg.ssl_embed_dim):
+            raise AssertionError(
+                f"ssl_embedding shape {tuple(ssl_embedding.shape)} does not "
+                f"match HybridConfig.ssl_embed_dim={cfg.ssl_embed_dim}. "
+                f"Check that the SSL embeddings file dimension matches "
+                f"the config you trained with."
+            )
 
         # CNN embedding optional
         if cfg.cnn_embed_dim > 0:

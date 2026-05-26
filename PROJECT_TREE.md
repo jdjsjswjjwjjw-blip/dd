@@ -56,13 +56,15 @@ from modules.trading_intel import (
 
 ## 🗄️ ARCHIVED (`_archive/`)
 
-87 .py files moved with `git mv` (history preserved). Nothing deleted.
+110+ .py files moved with `git mv` (history preserved). Nothing deleted.
 
 | Subdir | What's there | Why archived |
 |---|---|---|
-| `_archive/legacy_v19/` | V19 backtest/train/predict/walkforward + stage1/2/3 + V19 tests | Old V19 pipeline |
+| `_archive/legacy_v19/` | V19 backtest/train/predict/walkforward + stage1/2/3 + V19 tests + tools/paper_dry_run.py + tests that depend on archived V19 code (paper_live_bridge_wiring, full_pipeline, integration_bridge, production_integration, statistical_validation_layer, per_regime_discovery, feature_enrichment, label_engine_v2, daytrade_labeling_fix, smoke_imports) | Old V19 pipeline; tests can't run without V19 code |
+| `_archive/dead_modules/` | `feature_enrichment.py`, `statistical_validation_layer.py` (relied on v19_2 via sys.path hack, 0 active importers) | Broken / dead |
+| `_archive/dead_modules/quantum/` | 4 quantum_* dirs (20 files, ~600 LOC) — completely self-referencing, no active importer + 4 quantum test files | Unmaintained dead code |
 | `_archive/diagnostics/` | 21 one-shot analysis scripts | Diagnostic, ran once |
-| `_archive/unused_empty_dirs/` | discovery/, dl_pipeline/, simulators/, deployment/ | Only had `__init__.py` |
+| `_archive/unused_empty_dirs/` | discovery/, dl_pipeline/, simulators/, deployment/, core/ | Only had `__init__.py` |
 | `_archive/v19_2_dir/` | 20 .py older fork | Historical |
 | `_archive/v20_dir/` | 2 .py aborted prototype | Aborted |
 | `_archive/variants/` | prepare_day_trading_enriched.py | Experimental |

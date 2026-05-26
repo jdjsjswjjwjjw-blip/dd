@@ -65,11 +65,21 @@ class TestForwardPass(unittest.TestCase):
 
 class TestBackwardPass(unittest.TestCase):
     def test_gradient_flow_full_targets(self):
-        """مع targets كاملة، كل parameter يجب أن يحصل على gradient."""
+        """مع targets كاملة، كل parameter يجب أن يحصل على gradient.
+
+        We disable the LOB image encoder here because _make_batch() doesn't
+        produce a lob_tensor — leaving the CNN branch enabled would result
+        in its params never receiving gradients (correct behavior of a
+        bypassed branch, but it would fail this assertion). A separate
+        test would be needed to exercise the LOB CNN branch with a real
+        lob_tensor input.
+        """
         from modules.deep_lob import (
             DeepLOBConfig, HierarchicalLOBTransformer, MultiTaskTargets,
         )
-        model = HierarchicalLOBTransformer(DeepLOBConfig.small_dev())
+        cfg = DeepLOBConfig.small_dev()
+        cfg.lob_image.enabled = False
+        model = HierarchicalLOBTransformer(cfg)
         feats, masks, bar_mask, ctx = _make_batch()
 
         out = model(feats, masks, bar_mask, ctx)
@@ -161,8 +171,14 @@ class TestCheckpointing(unittest.TestCase):
 
 class TestParameterCount(unittest.TestCase):
     def test_count_parameters_breakdown(self):
+        """Component sum must match total. We disable lob_image to avoid
+        counting its params here; gradient flow with lob_image is exercised
+        separately by test_gradient_flow_full_targets (with lob_tensor
+        supplied)."""
         from modules.deep_lob import DeepLOBConfig, HierarchicalLOBTransformer
-        model = HierarchicalLOBTransformer(DeepLOBConfig.small_dev())
+        cfg = DeepLOBConfig.small_dev()
+        cfg.lob_image.enabled = False  # match the components we sum below
+        model = HierarchicalLOBTransformer(cfg)
         counts = model.count_parameters()
         for key in ("order_embedder", "order_transformer", "event_aggregator",
                     "bar_lstm", "context_encoder", "fusion", "heads", "total"):
