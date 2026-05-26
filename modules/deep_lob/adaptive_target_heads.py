@@ -79,6 +79,9 @@ class AdaptiveTargetOutput:
            elevated → 0.5  ×
            extreme  → 0.0  × (skip trade)
         Returns (B,) scale factor.
+
+        Guards against NaN logits — any NaN in probs collapses to 0
+        (skip trade rather than gamble on an unstable prediction).
         """
         probs = self.regime_risk_probs()
         # Expected scale = P(normal)*1 + P(elevated)*0.5 + P(extreme)*0
@@ -89,6 +92,10 @@ class AdaptiveTargetOutput:
         # If extreme prob > threshold_extreme, force skip
         force_skip = probs[:, 2] > threshold_extreme
         expected = torch.where(force_skip, torch.zeros_like(expected), expected)
+        # Defensive: any NaN → 0 (skip). Better safe than wrong-sized.
+        expected = torch.where(
+            torch.isnan(expected), torch.zeros_like(expected), expected,
+        )
         return torch.clamp(expected * base_scale, min=min_scale, max=base_scale)
 
 

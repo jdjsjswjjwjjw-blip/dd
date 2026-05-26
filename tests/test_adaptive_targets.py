@@ -275,3 +275,47 @@ class TestDecisionPolicy:
         assert set(out.keys()) == {'take_trade', 'direction',
                                     'position_size_scale', 'tp_mult',
                                     'sl_mult', 'reason'}
+
+    def test_regime_out_of_bounds_clamps(self):
+        """Defensive: regime > 2 should not crash (MEDIUM-1 from review)."""
+        d = decide(**self._kwargs(adaptive_regime_risk=5))  # out of bounds
+        # Should clamp to 2 (extreme) and skip
+        assert d.reason == "regime_extreme"
+
+    def test_position_size_scale_nan_handling(self):
+        """NaN logits → expected = 0 (skip rather than gamble) (MEDIUM-3)."""
+        cfg = AdaptiveTargetConfig(shared_dim=4)
+        model = AdaptiveTargetHeads(cfg)
+        # Manually inject NaN by feeding NaN through the backbone
+        emb = torch.tensor([[float('nan'), 0.0, 0.0, 0.0],
+                            [1.0, 2.0, 3.0, 4.0]])
+        out = model(emb)
+        scale = out.position_size_scale()
+        # First row (NaN) → 0 ; second (clean) → finite, in [0,1]
+        assert scale[0].item() == 0.0
+        assert 0.0 <= scale[1].item() <= 1.0
+
+
+# ════════════════════════════════════════════════════════════════════
+# Numerical-stability fixes
+# ════════════════════════════════════════════════════════════════════
+class TestNumericalStabilityFixes:
+    def test_trade_imbalance_no_blowup_tiny_volume(self):
+        """1 share traded must not blow up the imbalance ratio (MEDIUM-4)."""
+        from modules.lob_features_v2 import build_lob_tensor_v2_for_bar
+        T, P = 5, 20
+        half = P // 2
+        raw_depth = np.ones((T, P)) * 10
+        depth_log = np.log1p(raw_depth)
+        bid_sz = np.ones((T, half))
+        ask_sz = np.ones((T, half))
+        # Tiny trade volume (way below 1.0 floor)
+        buy = np.full((T, P), 0.01)
+        sell = np.full((T, P), 0.01)
+        out = build_lob_tensor_v2_for_bar(
+            raw_depth, depth_log, bid_sz, ask_sz, buy, sell,
+        )
+        # Trade imbalance should be a sane ratio (in [-1, 1]), not ±inf or NaN
+        imb = out[:, :, 1]
+        assert np.isfinite(imb).all()
+        assert (imb >= -1.0).all() and (imb <= 1.0).all()

@@ -233,8 +233,10 @@ def build_lob_tensor_v2_for_bar(
     out[:, :, CH.DEPTH_LOG] = depth_log_seq.astype(np.float32)
 
     tot_fp_raw = buy_vol_seq + sell_vol_seq
+    # Use 1.0 as the minimum denominator (= 1 share traded). 1e-9 made
+    # the ratio blow up when total volume was a single tick.
     out[:, :, CH.TRADE_IMB] = np.divide(
-        buy_vol_seq - sell_vol_seq, np.maximum(tot_fp_raw, 1e-9),
+        buy_vol_seq - sell_vol_seq, np.maximum(tot_fp_raw, 1.0),
     ).astype(np.float32)
     out[:, :, CH.TRADE_VOL] = np.log1p(np.maximum(tot_fp_raw, 0.0)).astype(np.float32)
 

@@ -124,6 +124,10 @@ def decide(
     """Apply the decision tree. Returns a TradeDecision."""
     P = policy or TradeDecisionPolicy()
 
+    # Defensive clamps for upstream out-of-bounds values
+    regime_clamped = max(0, min(int(adaptive_regime_risk), 2))
+    bucket_clamped = max(0, min(int(adaptive_bucket), len(P.bucket_size_scale) - 1))
+
     # ── Gate 0: day_trade rule must flag an event ──
     if int(rule_event_flag) != 1:
         return TradeDecision(
@@ -133,7 +137,7 @@ def decide(
         )
 
     # ── Gate 1: regime extreme → skip outright (criterion 4) ──
-    if int(adaptive_regime_risk) == 2:
+    if regime_clamped == 2:
         return TradeDecision(
             take_trade=False, direction=0, position_size_scale=0.0,
             tp_mult=P.bucket_tp_mult[0], sl_mult=P.tight_sl_mult,
@@ -179,11 +183,10 @@ def decide(
         )
 
     # ── Compute position size scale (criterion 4 + bucket-boost) ──
-    bucket = int(adaptive_bucket)
-    bucket = max(0, min(bucket, len(P.bucket_size_scale) - 1))
+    bucket = bucket_clamped
     base_size = P.bucket_size_scale[bucket]
-    # Apply regime cap
-    regime = int(adaptive_regime_risk)
+    # Use the already-clamped regime value
+    regime = regime_clamped
     if regime == 1:
         regime_factor = P.regime_elevated_scale
     elif regime == 2:

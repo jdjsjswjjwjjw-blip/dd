@@ -81,14 +81,18 @@ def _build_event_label(df: pd.DataFrame) -> np.ndarray:
 def _build_direction_label(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """3-way label: 0=LONG, 1=SHORT, 2=NEUTRAL.
 
-    Returns (label, valid). Only event_flag=1 rows are valid for training the
-    direction head (NEUTRAL events are filtered).
+    Returns (label, valid). Only event_flag=1 AND non-zero direction rows are
+    valid for training. Rows that are filtered out get label=-1 so any code
+    that accidentally consumes them without checking `valid` will crash with
+    a clear CE error instead of silently treating them as NEUTRAL.
     """
     ev = df['event_flag'].fillna(0).astype(int).to_numpy()
     dir_raw = df['event_direction'].fillna(0).astype(int).to_numpy()  # 1/-1/0
     label = np.where(dir_raw == 1, 0,
                      np.where(dir_raw == -1, 1, 2)).astype(np.int64)
     valid = (ev == 1) & (dir_raw != 0)
+    # Sentinel -1 for invalid rows — surfaces silent leakage as a CE error
+    label = np.where(valid, label, -1).astype(np.int64)
     return label, valid
 
 
@@ -187,6 +191,12 @@ def train(args):
         split_desc = f"calendar @ {args.train_split} (train→{int(train_mask.sum())} val→{int(val_mask.sum())})"
     print(f"Split: {split_desc}")
 
+    if train_mask.sum() == 0 or val_mask.sum() == 0:
+        raise ValueError(
+            f"Empty split: train={int(train_mask.sum())}, val={int(val_mask.sum())}. "
+            f"Check that dataset_slice contains both 'train' and 'holdout' rows, "
+            f"or use --train-split with a non-extreme value."
+        )
     if train_mask.sum() < 200 or val_mask.sum() < 50:
         print("⚠️  Very few samples; results may be noisy.")
 
@@ -312,7 +322,7 @@ def train(args):
 
         if val_loss.item() < best_val_loss:
             best_val_loss = val_loss.item()
-            torch.save({
+            ckpt = {
                 'state_dict': model.state_dict(),
                 'config': cfg.__dict__,
                 'epoch': epoch,
@@ -320,7 +330,10 @@ def train(args):
                 'feature_cols': feature_cols,
                 'norm_daytrade': {'mu': mu_d.tolist(), 'sigma': sig_d.tolist()},
                 'norm_ssl': {'mu': mu_s.tolist(), 'sigma': sig_s.tolist()},
-            }, out_dir / 'best_hybrid.pt')
+            }
+            if cnn_emb_norm is not None:
+                ckpt['norm_cnn'] = {'mu': mu_c.tolist(), 'sigma': sig_c.tolist()}
+            torch.save(ckpt, out_dir / 'best_hybrid.pt')
             patience_left = args.patience
         else:
             patience_left -= 1
