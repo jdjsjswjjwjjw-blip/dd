@@ -67,8 +67,25 @@ def simulate(
     commission_per_side: float = 0.50,
     contracts: int = 1,
     starting_equity: float = 100_000.0,
+    # ── strict-mode knobs (anti-leakage) ──
+    entry_at_next_open: bool = False,
+    stop_slippage_pips: float = 0.0,
+    latency_bars: int = 0,
+    cooldown_bars: int = 1,
+    require_open_col: bool = False,
 ) -> tuple[pd.DataFrame, pd.Series, dict]:
     """Walk through bars; for each event, simulate a trade and track equity.
+
+    Strict-mode flags (all OFF by default to preserve original behavior):
+      • entry_at_next_open  — enter at open[i+1+latency_bars] not close[i].
+                              avoids any "same-bar" leakage where event_flag
+                              might have been computed using close[i] itself.
+      • stop_slippage_pips  — penalty in pips when SL is hit (real stops
+                              fill below the level in fast moves).
+      • latency_bars        — extra bars between signal and entry (sim latency).
+      • cooldown_bars       — bars to wait after exit before allowing a new
+                              trade. Default 1.
+      • require_open_col    — fail if 'open' column missing (next-bar mode).
 
     Returns:
         trades_df    — per-trade detail rows
@@ -80,6 +97,12 @@ def simulate(
     high = df['high'].to_numpy(np.float64)
     low = df['low'].to_numpy(np.float64)
     close = df['close'].to_numpy(np.float64)
+    if 'open' in df.columns:
+        open_p = df['open'].to_numpy(np.float64)
+    elif require_open_col:
+        raise ValueError("'open' column required for entry_at_next_open mode")
+    else:
+        open_p = close.copy()  # fall back to close as proxy
     atr = df['atr_14'].to_numpy(np.float64)
     ts = df['ts_event'].to_numpy()
     event_flag = df['event_flag'].fillna(0).astype(np.int8).to_numpy()
@@ -97,6 +120,11 @@ def simulate(
         else:
             horizon_bars = 6
     print(f"  horizon_bars used: {horizon_bars}")
+    print(f"  entry mode: {'open[i+1+lat]' if entry_at_next_open else 'close[i] (legacy)'}")
+    if entry_at_next_open:
+        print(f"  latency_bars: {latency_bars}  cooldown_bars: {cooldown_bars}")
+    if stop_slippage_pips > 0:
+        print(f"  stop slippage: {stop_slippage_pips} pips (penalty on SL/sl_first)")
 
     # round-trip cost per contract in $
     rt_cost_pips = spread_pips + 2 * slippage_pips_per_side
@@ -118,16 +146,28 @@ def simulate(
             continue
 
         d = int(event_dir[i])  # +1 long, -1 short
-        entry = float(close[i])
         atr_i = float(atr[i])
+
+        # ── Determine entry bar & price ──
+        if entry_at_next_open:
+            entry_bar = i + 1 + latency_bars
+            if entry_bar >= n:
+                continue
+            if not np.isfinite(open_p[entry_bar]):
+                continue
+            entry = float(open_p[entry_bar])
+        else:
+            entry_bar = i
+            entry = float(close[i])
+
         tp = entry + d * tp_mult * atr_i
         sl = entry - d * sl_mult * atr_i
 
-        # Walk forward
+        # Walk forward (start from bar AFTER entry_bar)
         exit_price = None
         exit_reason = 'timeout'
-        exit_bar = i + horizon_bars
-        for j in range(i + 1, min(i + 1 + horizon_bars, n)):
+        exit_bar = entry_bar + horizon_bars
+        for j in range(entry_bar + 1, min(entry_bar + 1 + horizon_bars, n)):
             hi, lo = high[j], low[j]
             if not (np.isfinite(hi) and np.isfinite(lo)):
                 continue
@@ -140,25 +180,29 @@ def simulate(
                 hit_sl = hi >= sl
             if hit_tp and hit_sl:
                 # Both touched same bar — conservative: assume SL hit first
-                exit_price = sl
+                # with stop slippage applied (real stops fill worse)
+                exit_price = sl - d * stop_slippage_pips * TICK_SIZE
                 exit_reason = 'sl_first'
                 exit_bar = j
                 break
             if hit_tp:
-                exit_price = tp
+                exit_price = tp  # limit-order fills exact at TP (best case)
                 exit_reason = 'tp'
                 exit_bar = j
                 break
             if hit_sl:
-                exit_price = sl
+                exit_price = sl - d * stop_slippage_pips * TICK_SIZE
                 exit_reason = 'sl'
                 exit_bar = j
                 break
         if exit_price is None:
-            # timeout
-            exit_price = float(close[min(i + horizon_bars, n - 1)])
+            # timeout — exit at close of last bar in horizon
+            exit_idx = min(entry_bar + horizon_bars, n - 1)
+            if not np.isfinite(close[exit_idx]):
+                continue
+            exit_price = float(close[exit_idx])
             exit_reason = 'timeout'
-            exit_bar = min(i + horizon_bars, n - 1)
+            exit_bar = exit_idx
 
         # P&L
         pips = (exit_price - entry) * d / TICK_SIZE
@@ -166,11 +210,13 @@ def simulate(
         net_dollars = gross_dollars - rt_cost_dollars * contracts
 
         trades.append({
-            'ts_entry': pd.Timestamp(ts[i]),
+            'ts_signal': pd.Timestamp(ts[i]),
+            'ts_entry': pd.Timestamp(ts[entry_bar]),
             'ts_exit': pd.Timestamp(ts[exit_bar]),
-            'entry_bar': i,
+            'signal_bar': i,
+            'entry_bar': entry_bar,
             'exit_bar': exit_bar,
-            'bars_held': exit_bar - i,
+            'bars_held': exit_bar - entry_bar,
             'direction': 'LONG' if d == 1 else 'SHORT',
             'entry_price': entry,
             'tp_price': tp,
@@ -184,7 +230,7 @@ def simulate(
             'signal_quality': int(sig_q[i]),
             'regime': str(regime[i]),
         })
-        in_position_until = exit_bar + 1  # 1-bar cooldown
+        in_position_until = exit_bar + cooldown_bars
 
     trades_df = pd.DataFrame(trades)
     if len(trades_df) == 0:
@@ -296,10 +342,35 @@ def main():
     p.add_argument('--commission-per-side', type=float, default=0.50)
     p.add_argument('--min-signal-quality', type=int, default=0,
                    help='Only trade events with signal_quality >= this')
+    # ── strict-mode flags (anti-leakage) ──
+    p.add_argument('--strict', action='store_true',
+                   help='Enable strict anti-leakage mode: '
+                        'next-bar entry + stop slippage + holdout-only')
+    p.add_argument('--entry-at-next-open', action='store_true',
+                   help='Enter at open[i+1+latency_bars] instead of close[i]')
+    p.add_argument('--latency-bars', type=int, default=0,
+                   help='Bars between signal detection and entry (default 0)')
+    p.add_argument('--stop-slippage-pips', type=float, default=0.0,
+                   help='Penalty pips when SL is hit (real stops fill worse)')
+    p.add_argument('--cooldown-bars', type=int, default=1,
+                   help='Bars to wait after exit before allowing new trade')
+    p.add_argument('--holdout-only', action='store_true',
+                   help='Run backtest ONLY on dataset_slice==holdout rows')
     args = p.parse_args()
 
+    # Strict mode = sane anti-leakage defaults (can be overridden individually)
+    if args.strict:
+        if not args.entry_at_next_open:
+            args.entry_at_next_open = True
+        if args.latency_bars == 0:
+            args.latency_bars = 1
+        if args.stop_slippage_pips == 0.0:
+            args.stop_slippage_pips = 0.5
+        if not args.holdout_only:
+            args.holdout_only = True
+
     print("═" * 72)
-    print("              DAY-TRADE BACKTEST")
+    print("              DAY-TRADE BACKTEST" + (' (STRICT)' if args.strict else ''))
     print("═" * 72)
     print(f"Features:        {args.features}")
     print(f"Output:          {args.output}")
@@ -309,6 +380,11 @@ def main():
     print(f"Costs:           {args.spread_pips} spread + {args.slippage_pips_per_side}×2 slip + "
           f"${args.commission_per_side}×2 comm")
     print(f"Min signal_q:    {args.min_signal_quality}")
+    if args.entry_at_next_open or args.strict:
+        print(f"STRICT entry:    open[i+1+{args.latency_bars}]")
+        print(f"STRICT stop slip: {args.stop_slippage_pips} pips")
+        print(f"STRICT cooldown: {args.cooldown_bars} bars")
+        print(f"STRICT holdout:  {args.holdout_only}")
     print()
 
     df = pd.read_parquet(args.features)
@@ -320,6 +396,15 @@ def main():
     if args.end_ts:
         df = df[df['ts_event'] <= pd.Timestamp(args.end_ts)]
     print(f"Loaded: {len(df):,} bars  ({df['ts_event'].iloc[0]} → {df['ts_event'].iloc[-1]})")
+
+    # ── Holdout-only filter ──
+    if args.holdout_only:
+        if 'dataset_slice' not in df.columns:
+            raise SystemExit("--holdout-only requires 'dataset_slice' column in features")
+        before_h = len(df)
+        df = df[df['dataset_slice'] == 'holdout'].copy()
+        print(f"  holdout-only: {before_h:,} → {len(df):,} bars "
+              f"({df['ts_event'].iloc[0]} → {df['ts_event'].iloc[-1]})")
 
     # Filter by signal quality
     if args.min_signal_quality > 0:
@@ -336,54 +421,47 @@ def main():
 
     horizon = args.horizon_bars if args.horizon_bars > 0 else None
 
-    # ── Full backtest ──
-    out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print("═══ FULL DATA ═══")
-    trades_all, equity_all, sum_all = simulate(
-        df, tp_mult=args.tp_mult, sl_mult=args.sl_mult, horizon_bars=horizon,
+    # Shared simulate kwargs
+    sim_kwargs = dict(
+        tp_mult=args.tp_mult, sl_mult=args.sl_mult, horizon_bars=horizon,
         spread_pips=args.spread_pips,
         slippage_pips_per_side=args.slippage_pips_per_side,
         commission_per_side=args.commission_per_side,
         contracts=args.contracts_per_trade,
         starting_equity=args.starting_equity,
+        entry_at_next_open=args.entry_at_next_open,
+        stop_slippage_pips=args.stop_slippage_pips,
+        latency_bars=args.latency_bars,
+        cooldown_bars=args.cooldown_bars,
     )
+
+    # ── Full backtest ──
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("═══ FULL DATA ═══")
+    trades_all, equity_all, sum_all = simulate(df, **sim_kwargs)
     print_report(trades_all, sum_all, label='ALL EVENTS')
 
-    # ── Train/holdout split if available ──
+    # ── Train/holdout split if available AND we did NOT already filter to holdout ──
     splits = {}
-    if 'dataset_slice' in df.columns:
+    if 'dataset_slice' in df.columns and not args.holdout_only:
         for slice_name in ('train', 'holdout'):
             sub = df[df['dataset_slice'] == slice_name].copy()
             if len(sub) == 0:
                 continue
             print(f"═══ {slice_name.upper()} SLICE ═══")
-            t, e, s = simulate(
-                sub, tp_mult=args.tp_mult, sl_mult=args.sl_mult, horizon_bars=horizon,
-                spread_pips=args.spread_pips,
-                slippage_pips_per_side=args.slippage_pips_per_side,
-                commission_per_side=args.commission_per_side,
-                contracts=args.contracts_per_trade,
-                starting_equity=args.starting_equity,
-            )
+            t, e, s = simulate(sub, **sim_kwargs)
             print_report(t, s, label=slice_name.upper())
             splits[slice_name] = {'trades': t, 'equity': e, 'summary': s}
 
     # ── By signal_quality tier on full data ──
     if 'signal_quality' in df.columns:
-        print("═══ BY signal_quality TIER (full data) ═══")
+        print("═══ BY signal_quality TIER ═══")
         for tier in sorted(df.loc[df['event_flag'] == 1, 'signal_quality'].dropna().unique()):
             sub = df.copy()
             sub.loc[(sub['event_flag'] == 1) & (sub['signal_quality'] != tier), 'event_flag'] = 0
-            t, e, s = simulate(
-                sub, tp_mult=args.tp_mult, sl_mult=args.sl_mult, horizon_bars=horizon,
-                spread_pips=args.spread_pips,
-                slippage_pips_per_side=args.slippage_pips_per_side,
-                commission_per_side=args.commission_per_side,
-                contracts=args.contracts_per_trade,
-                starting_equity=args.starting_equity,
-            )
+            t, e, s = simulate(sub, **sim_kwargs)
             print_report(t, s, label=f'signal_quality={int(tier)}')
 
     # ── Save outputs ──
