@@ -452,10 +452,11 @@ def generate_markdown_report(
                 conf = stats.get('confidence')
                 long_pct = stats.get('long_pct')
                 short_pct = stats.get('short_pct')
+                acc_s = f"{acc:.3f}" if acc is not None else 'N/A'
+                conf_s = f"{conf:.3f}" if conf is not None else 'N/A'
                 out.append(
                     f"| `{name}` | {stats['n_samples']} | "
-                    f"{acc:.3f if acc is not None else 'N/A'} | "
-                    f"{conf:.3f if conf is not None else 'N/A'} | "
+                    f"{acc_s} | {conf_s} | "
                     f"{(long_pct or 0)*100:.1f}% | {(short_pct or 0)*100:.1f}% |"
                 )
             out.append('')
