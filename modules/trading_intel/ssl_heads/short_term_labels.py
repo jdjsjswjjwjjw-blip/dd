@@ -292,9 +292,9 @@ def build_next_gap_fill_targets(
     nearest-to-best liquidity gap on either side; 0 otherwise.
 
     A "gap" = empty level surrounded by non-empty levels on the same side
-    (matches `_liquidity_gaps` in `lob_features_v2.py`).
+    (matches `_liquidity_gaps` in `..lob.features`).
     """
-    from modules.lob_features_v2 import _liquidity_gaps
+    from modules.trading_intel.lob.features import _liquidity_gaps
 
     N = raw_depth_seq.shape[0]
     P = raw_depth_seq.shape[2]

@@ -4,7 +4,7 @@ from __future__ import annotations
 import torch
 import pytest
 
-from modules.hybrid_model import (
+from modules.trading_intel.hybrid.model import (
     HybridConfig,
     HybridModel,
     HybridOutput,

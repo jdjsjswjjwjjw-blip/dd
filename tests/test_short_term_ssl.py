@@ -5,14 +5,14 @@ import numpy as np
 import pytest
 import torch
 
-from modules.deep_lob.short_term_heads import (
+from modules.trading_intel.ssl_heads.short_term import (
     ShortTermHeads,
     ShortTermHeadsConfig,
     ShortTermOutput,
     ShortTermTargets,
     compute_short_term_loss,
 )
-from modules.deep_lob.short_term_targets import (
+from modules.trading_intel.ssl_heads.short_term_labels import (
     build_all_short_term_targets,
     build_next_gap_fill_targets,
     build_next_imbalance_shift_targets,

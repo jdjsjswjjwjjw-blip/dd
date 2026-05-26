@@ -31,7 +31,8 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# From modules/trading_intel/training/ go up 3 levels to repo root
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
 
 import numpy as np
 import pandas as pd
@@ -39,7 +40,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from modules.hybrid_model import (
+from modules.trading_intel.hybrid.model import (
     HybridConfig,
     HybridModel,
     HybridOutput,

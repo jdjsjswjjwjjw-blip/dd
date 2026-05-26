@@ -1,16 +1,16 @@
-"""Tests for modules.lob_features_v2 and modules.human_lob_cnn."""
+"""Tests for modules.trading_intel.lob (features + cnn)."""
 from __future__ import annotations
 
 import numpy as np
 import pytest
 import torch
 
-from modules.human_lob_cnn import (
+from modules.trading_intel.lob.cnn import (
     HumanLOBCNN,
     HumanLOBCNNConfig,
     make_human_lob_cnn,
 )
-from modules.lob_features_v2 import (
+from modules.trading_intel.lob.features import (
     CH,
     N_LOB_CHANNELS_V2,
     _depth_gradient,

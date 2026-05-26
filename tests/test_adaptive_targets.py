@@ -5,20 +5,20 @@ import numpy as np
 import pytest
 import torch
 
-from modules.deep_lob.adaptive_target_heads import (
+from modules.trading_intel.ssl_heads.adaptive import (
     AdaptiveTargetConfig,
     AdaptiveTargetHeads,
     AdaptiveTargetOutput,
     AdaptiveTargetTargets,
     compute_adaptive_target_loss,
 )
-from modules.deep_lob.adaptive_target_labels import (
+from modules.trading_intel.ssl_heads.adaptive_labels import (
     build_all_adaptive_targets,
     build_max_R_reached_targets,
     build_regime_risk_targets,
     build_target_bucket_targets,
 )
-from modules.trade_decision_policy import (
+from modules.trading_intel.hybrid.policy import (
     TradeDecision,
     TradeDecisionPolicy,
     decide,
@@ -302,7 +302,7 @@ class TestDecisionPolicy:
 class TestNumericalStabilityFixes:
     def test_trade_imbalance_no_blowup_tiny_volume(self):
         """1 share traded must not blow up the imbalance ratio (MEDIUM-4)."""
-        from modules.lob_features_v2 import build_lob_tensor_v2_for_bar
+        from modules.trading_intel.lob.features import build_lob_tensor_v2_for_bar
         T, P = 5, 20
         half = P // 2
         raw_depth = np.ones((T, P)) * 10
