@@ -9,7 +9,7 @@ aware sizing.
 > **Branch:** `claude/task-d-RcDhu`
 > **Baseline tag:** `v1-baseline-pre-cleanup` (commit `c7b88dd`)
 > **Architecture authority:** [`SUBSYSTEMS.md`](SUBSYSTEMS.md)
-> **Tests:** 88 passing (84 trading_intel + 4 boundary lint)
+> **Tests:** 320 passing + 2 skipped, 0 failures (88 trading_intel + 4 boundary + 230 legacy day_trade/SSL backbone)
 
 ---
 
@@ -157,19 +157,29 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 │   ├── test_subsystem_boundaries.py ← Boundary lint (4 tests)
 │   └── ... (other existing tests)
 │
-└── _archive/                        ← 87 archived files (legacy V19, diagnostics)
-                                       Nothing deleted — restore with `git mv`
+└── _archive/                        ← 126 archived files (legacy V19,
+                                       diagnostics, dead quantum_* modules,
+                                       broken feature_enrichment, broken
+                                       tests). Nothing deleted — restore
+                                       with `git mv`. See PROJECT_TREE.md.
 ```
 
 ---
 
 ## 🧪 Tests
 
-### Run the new subsystem tests
+### Run the full active test suite
+```bash
+python -m pytest tests/ -q
+# Expect: 320 passed, 2 skipped, 0 failed
+```
+
+### Run just the new subsystem tests
 ```bash
 python -m pytest tests/test_lob_features_v2.py tests/test_short_term_ssl.py \
                  tests/test_hybrid_model.py tests/test_adaptive_targets.py \
                  tests/test_subsystem_boundaries.py -v
+# Expect: 88 passed
 ```
 
 | Suite | Tests | Covers |
