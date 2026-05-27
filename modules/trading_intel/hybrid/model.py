@@ -204,8 +204,13 @@ def compute_hybrid_loss(
         weighted["event"] = config.w_event * l
 
     if outputs.direction_logits is not None and targets.direction is not None:
+        # ignore_index=-1 lets callers use -1 as a "this row's direction is
+        # invalid, skip it" sentinel (see train_hybrid._build_direction_label
+        # and tools/run_walk_forward_fold). Avoids torch's IndexError when
+        # a batch contains a mix of valid and invalid rows.
         l = F.cross_entropy(
-            outputs.direction_logits, targets.direction.long(), reduction=reduction,
+            outputs.direction_logits, targets.direction.long(),
+            reduction=reduction, ignore_index=-1,
         )
         losses["direction"] = l
         weighted["direction"] = config.w_direction * l
