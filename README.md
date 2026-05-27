@@ -146,7 +146,11 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 │
 ├── tools/
 │   ├── check_subsystem_boundaries.py  ← Boundary lint
-│   ├── paper_dry_run.py
+│   ├── extract_continuous_contract.py ← Smart contract rollover
+│   ├── build_walk_forward_folds.py    ← Fold definition generator
+│   ├── run_walk_forward_fold.py       ← Baseline fold runner
+│   ├── run_walk_forward_fold_enhanced.py  ← Anti-collapse fold runner
+│   ├── aggregate_walk_forward.py      ← Per-fold metrics aggregator
 │   └── backtest_smoke.py
 │
 ├── tests/                           ← 88+ tests
