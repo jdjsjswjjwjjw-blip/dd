@@ -122,20 +122,23 @@ echo ""
 # ──────────────────────────────────────────────────────────────────────────
 # Optional anti-collapse environment variables — picked up by ENHANCED runner.
 # Defaults match the baseline behavior (all disabled).
-#   WF_USE_SIMPLEX_ETF=1      → replace direction head with Simplex ETF
-#   WF_ORTHO_WEIGHT=0.5       → orthogonality penalty against rule features
-#   WF_USE_DBMTL=1            → DB-MTL gradient balancer
-#   WF_SHARPE_WEIGHT=0.3      → differentiable Sharpe regularizer
+#   WF_USE_SIMPLEX_ETF=1               → replace direction head with Simplex ETF
+#   WF_ORTHO_WEIGHT=0.5                → orthogonality penalty against rule features
+#   WF_USE_DBMTL=1                     → DB-MTL gradient balancer
+#   WF_SHARPE_WEIGHT=0.3               → differentiable Sharpe regularizer
+#   WF_DROP_FROM_AUDIT=path/to/audit.json → apply feature-redundancy drop list
 # Set any to enable the corresponding research-driven counter-measure.
 RUNNER="tools/run_walk_forward_fold.py"
 EXTRA_FLAGS=()
 if [ -n "${WF_USE_SIMPLEX_ETF:-}" ] || [ -n "${WF_ORTHO_WEIGHT:-}" ] \
-   || [ -n "${WF_USE_DBMTL:-}" ] || [ -n "${WF_SHARPE_WEIGHT:-}" ]; then
+   || [ -n "${WF_USE_DBMTL:-}" ] || [ -n "${WF_SHARPE_WEIGHT:-}" ] \
+   || [ -n "${WF_DROP_FROM_AUDIT:-}" ]; then
     RUNNER="tools/run_walk_forward_fold_enhanced.py"
     [ "${WF_USE_SIMPLEX_ETF:-0}" = "1" ] && EXTRA_FLAGS+=("--use-simplex-etf")
     [ -n "${WF_ORTHO_WEIGHT:-}" ] && EXTRA_FLAGS+=("--ortho-weight" "$WF_ORTHO_WEIGHT")
     [ "${WF_USE_DBMTL:-0}" = "1" ] && EXTRA_FLAGS+=("--use-dbmtl")
     [ -n "${WF_SHARPE_WEIGHT:-}" ] && EXTRA_FLAGS+=("--sharpe-weight" "$WF_SHARPE_WEIGHT")
+    [ -n "${WF_DROP_FROM_AUDIT:-}" ] && EXTRA_FLAGS+=("--drop-features-from-audit" "$WF_DROP_FROM_AUDIT")
     echo "═══ Anti-collapse flags ON: ${EXTRA_FLAGS[*]}"
 fi
 

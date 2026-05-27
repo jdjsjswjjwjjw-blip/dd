@@ -136,6 +136,32 @@ def train(args):
 
     feature_cols = _select_features(df)
     print(f"Selected {len(feature_cols)} non-leakage numeric columns")
+
+    # Optional: apply a drop list from a redundancy audit
+    drop_diagnostics: dict | None = None
+    if args.drop_features_from_audit:
+        from modules.trading_intel.training.feature_selection import (
+            apply_drop_list, load_drop_list_from_audit,
+            validate_audit_against_features,
+        )
+        drop_diagnostics = validate_audit_against_features(
+            args.drop_features_from_audit, feature_cols,
+        )
+        print(f"  Audit drop file: {args.drop_features_from_audit}")
+        print(f"  Audit drop_list size: {drop_diagnostics['n_drop_in_audit']}")
+        print(f"  Will actually drop:   {drop_diagnostics['n_drop_actually_in_features']}")
+        if drop_diagnostics["stale_audit"]:
+            raise RuntimeError(
+                f"Audit appears stale — more than half of its drop list "
+                f"is missing from the current features. "
+                f"Re-run tools/audit_feature_redundancy.py on the current "
+                f"parquet before training."
+            )
+        drop_set = load_drop_list_from_audit(args.drop_features_from_audit)
+        feature_cols, dropped = apply_drop_list(feature_cols, drop_set)
+        print(f"  Features after dedup: {len(feature_cols)}  "
+              f"(dropped {len(dropped)})")
+
     # Materialize feature matrix, replace NaN with 0 after z-score
     X_daytrade = df[feature_cols].fillna(0).to_numpy(dtype=np.float32)
 
@@ -334,6 +360,8 @@ def train(args):
             }
             if cnn_emb_norm is not None:
                 ckpt['norm_cnn'] = {'mu': mu_c.tolist(), 'sigma': sig_c.tolist()}
+            if drop_diagnostics is not None:
+                ckpt['feature_audit'] = drop_diagnostics
             torch.save(ckpt, out_dir / 'best_hybrid.pt')
             patience_left = args.patience
         else:
@@ -400,6 +428,11 @@ def main():
     p.add_argument('--embargo-bars', type=int, default=24)
     p.add_argument('--use-dataset-slice', action='store_true',
                    help='Use dataset_slice column if present (else use --train-split)')
+    p.add_argument('--drop-features-from-audit', default='',
+                   help='Path to redundancy_summary.json from '
+                        'tools/audit_feature_redundancy.py. If given, the '
+                        '`drop_list` columns are removed from the feature '
+                        'matrix before training (Issue #5 / #5b remedy).')
     p.add_argument('--hidden-dim', type=int, default=256)
     p.add_argument('--n-layers', type=int, default=3)
     p.add_argument('--dropout', type=float, default=0.3)

@@ -142,6 +142,24 @@ def run_fold(args) -> dict:
             train_mask[train_idxs[-args.embargo_bars:]] = False
 
     feat_cols = _select_features(df)
+    drop_diagnostics: dict | None = None
+    if getattr(args, "drop_features_from_audit", "") :
+        from modules.trading_intel.training.feature_selection import (
+            apply_drop_list, load_drop_list_from_audit,
+            validate_audit_against_features,
+        )
+        drop_diagnostics = validate_audit_against_features(
+            args.drop_features_from_audit, feat_cols,
+        )
+        if drop_diagnostics["stale_audit"]:
+            raise RuntimeError(
+                f"Audit appears stale — more than half of its drop list "
+                f"is missing from the current features. Re-run the audit."
+            )
+        drop_set = load_drop_list_from_audit(args.drop_features_from_audit)
+        feat_cols, dropped = apply_drop_list(feat_cols, drop_set)
+        print(f"   feature_audit: dropped {len(dropped)}/"
+              f"{len(feat_cols) + len(dropped)} features")
     X = df[feat_cols].fillna(0).to_numpy(dtype=np.float32)
     sample_valid = emb_valid & np.isfinite(X).all(axis=1)
     train_mask &= sample_valid
@@ -321,13 +339,17 @@ def run_fold(args) -> dict:
         "n_train": n_train,
         "n_test": n_test,
         "best_val_loss": best_val_loss,
+        "n_features_after_dedup": int(X.shape[1]),
         "config": {
             "use_simplex_etf": args.use_simplex_etf,
             "ortho_weight": args.ortho_weight,
             "use_dbmtl": args.use_dbmtl,
             "sharpe_weight": args.sharpe_weight,
+            "drop_features_from_audit": getattr(args, "drop_features_from_audit", ""),
         },
     }
+    if drop_diagnostics is not None:
+        metrics["feature_audit"] = drop_diagnostics
 
     rule_events = test_df[test_df["event_flag"] == 1]
     if len(rule_events) > 0:
@@ -413,6 +435,11 @@ def main():
                    help="Weight for differentiable Sharpe loss (0 = disabled)")
     p.add_argument("--tx-cost", type=float, default=1e-4,
                    help="Per-unit-position transaction cost for Sharpe loss")
+    p.add_argument("--drop-features-from-audit", default="",
+                   help="Path to redundancy_summary.json from "
+                        "tools/audit_feature_redundancy.py. If given, the "
+                        "`drop_list` columns are removed from the feature "
+                        "matrix before training.")
     args = p.parse_args()
     run_fold(args)
 
