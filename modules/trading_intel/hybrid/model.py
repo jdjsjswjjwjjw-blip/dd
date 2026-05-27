@@ -71,6 +71,12 @@ class HybridOutput:
     event_logit: Optional[torch.Tensor] = None     # (B,)
     direction_logits: Optional[torch.Tensor] = None  # (B, 3)
     confidence_logit: Optional[torch.Tensor] = None  # (B,)
+    # Backbone embedding — exposed so anti-collapse modules can use it:
+    #   • OrthogonalRepresentationModule wants this to penalize correlation
+    #     with day_trade rule features.
+    #   • dot_regression_loss operates on this directly when the
+    #     direction_head is a SimplexETFClassifier.
+    backbone_embedding: Optional[torch.Tensor] = None  # (B, hidden_dim)
 
     def event_prob(self) -> Optional[torch.Tensor]:
         return torch.sigmoid(self.event_logit) if self.event_logit is not None else None
@@ -112,7 +118,18 @@ class HybridModel(nn.Module):
     """Fuse day_trade features + SSL embeddings + (optional) CNN embedding
     into event / direction / confidence predictions."""
 
-    def __init__(self, config: HybridConfig | None = None):
+    def __init__(
+        self,
+        config: HybridConfig | None = None,
+        direction_head: nn.Module | None = None,
+    ):
+        """
+        Args:
+          config: HybridConfig
+          direction_head: optional override for the direction head. Use a
+            SimplexETFClassifier to get the anti-collapse guarantee. If
+            None, a standard nn.Linear is used.
+        """
         super().__init__()
         self.config = config or HybridConfig()
         cfg = self.config
@@ -126,7 +143,11 @@ class HybridModel(nn.Module):
 
         h = cfg.hidden_dim
         self.event_head = nn.Linear(h, 1) if cfg.use_event_head else None
-        self.direction_head = nn.Linear(h, 3) if cfg.use_direction_head else None
+        if cfg.use_direction_head:
+            self.direction_head = direction_head if direction_head is not None \
+                else nn.Linear(h, 3)
+        else:
+            self.direction_head = None
         self.confidence_head = nn.Linear(h, 1) if cfg.use_confidence_head else None
 
         if all(x is None for x in (self.event_head, self.direction_head, self.confidence_head)):
@@ -182,6 +203,7 @@ class HybridModel(nn.Module):
             event_logit=self.event_head(h).squeeze(-1) if self.event_head is not None else None,
             direction_logits=self.direction_head(h) if self.direction_head is not None else None,
             confidence_logit=self.confidence_head(h).squeeze(-1) if self.confidence_head is not None else None,
+            backbone_embedding=h,
         )
 
     def num_parameters(self) -> int:

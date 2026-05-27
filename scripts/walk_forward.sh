@@ -120,7 +120,26 @@ echo ""
 # ──────────────────────────────────────────────────────────────────────────
 # STEP 3: Walk-forward — N folds
 # ──────────────────────────────────────────────────────────────────────────
-echo "═══ STEP 3: run $n_folds folds (hybrid training + backtest) ═══"
+# Optional anti-collapse environment variables — picked up by ENHANCED runner.
+# Defaults match the baseline behavior (all disabled).
+#   WF_USE_SIMPLEX_ETF=1      → replace direction head with Simplex ETF
+#   WF_ORTHO_WEIGHT=0.5       → orthogonality penalty against rule features
+#   WF_USE_DBMTL=1            → DB-MTL gradient balancer
+#   WF_SHARPE_WEIGHT=0.3      → differentiable Sharpe regularizer
+# Set any to enable the corresponding research-driven counter-measure.
+RUNNER="tools/run_walk_forward_fold.py"
+EXTRA_FLAGS=()
+if [ -n "${WF_USE_SIMPLEX_ETF:-}" ] || [ -n "${WF_ORTHO_WEIGHT:-}" ] \
+   || [ -n "${WF_USE_DBMTL:-}" ] || [ -n "${WF_SHARPE_WEIGHT:-}" ]; then
+    RUNNER="tools/run_walk_forward_fold_enhanced.py"
+    [ "${WF_USE_SIMPLEX_ETF:-0}" = "1" ] && EXTRA_FLAGS+=("--use-simplex-etf")
+    [ -n "${WF_ORTHO_WEIGHT:-}" ] && EXTRA_FLAGS+=("--ortho-weight" "$WF_ORTHO_WEIGHT")
+    [ "${WF_USE_DBMTL:-0}" = "1" ] && EXTRA_FLAGS+=("--use-dbmtl")
+    [ -n "${WF_SHARPE_WEIGHT:-}" ] && EXTRA_FLAGS+=("--sharpe-weight" "$WF_SHARPE_WEIGHT")
+    echo "═══ Anti-collapse flags ON: ${EXTRA_FLAGS[*]}"
+fi
+
+echo "═══ STEP 3: run $n_folds folds (runner=$(basename $RUNNER)) ═══"
 for fold_spec in "${FOLDS[@]}"; do
     read -r fold_id tr_s tr_e te_s te_e <<< "$fold_spec"
     fold_dir="$OUT_ROOT/fold_${fold_id}"
@@ -128,7 +147,7 @@ for fold_spec in "${FOLDS[@]}"; do
 
     echo "  ─── Fold $fold_id ─── train ${tr_s}..${tr_e} | test ${te_s}..${te_e} ───"
 
-    python tools/run_walk_forward_fold.py \
+    python "$RUNNER" \
         --fold-id "$fold_id" \
         --combined-features "$DT_OUT/combined/day_trading_features.parquet" \
         --ssl-embeddings "$SSL_OUT/embeddings/embeddings.npy" \
@@ -136,6 +155,7 @@ for fold_spec in "${FOLDS[@]}"; do
         --train-start "$tr_s" --train-end "$tr_e" \
         --test-start "$te_s" --test-end "$te_e" \
         --output-dir "$fold_dir" \
+        "${EXTRA_FLAGS[@]}" \
         2>&1 | tail -10
 done
 echo ""
