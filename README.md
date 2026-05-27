@@ -41,6 +41,162 @@ run as a test in `tests/test_subsystem_boundaries.py`).
 
 ---
 
+## 🧠 SSL Subsystem — Architecture & Anti-Collapse
+
+SSL (Subsystem B) is the experimental representation-learning layer that
+sits between day_trade's rule labels and trading_intel's hybrid decisions.
+This section documents what's inside it and the four research-driven
+counter-measures we've added to address the failures observed in our
+6-month run.
+
+### Encoder backbones (~743k params total)
+
+```
+                  bars + LOB + order tensors          context features
+                              │                                │
+                              ▼                                ▼
+    ┌──────────────────────────────────┐    ┌──────────────────────────────┐
+    │ HierarchicalLOBTransformer       │    │ PriceCycleModel              │
+    │ (modules/deep_lob/)              │    │ (modules/price_cycle/)       │
+    │                                   │    │                              │
+    │  • OrderEmbedder    (per-order)  │    │  • CycleEncoder              │
+    │  • OrderTransformer (per-bar)    │    │  • FractalFeatures           │
+    │  • EventAggregator               │    │  • SwingAnalysis             │
+    │  • BarLSTM          (temporal)   │    │  • PhaseClassifier           │
+    │  • LOBImageEncoder  (optional)   │    │  • MultiScaleFusion          │
+    │  • ContextEncoder                │    │                              │
+    │  • Fusion + MultiTaskHeads       │    │  ~450k parameters            │
+    │                                   │    │                              │
+    │  ~293k parameters                 │    │                              │
+    └──────────────────────────────────┘    └──────────────────────────────┘
+                              │                                │
+                              ▼                                ▼
+                        shared_emb (64-dim)             cycle_emb (64-dim)
+                              │                                │
+                              └────────────┬───────────────────┘
+                                           ▼
+                            embeddings.npy  (N, 161)
+                            = LOB(64) + Cycle(64) + seasonal/cycle (33)
+```
+
+### SSL heads (training-time only)
+
+| Family | Module | Heads | What they predict |
+|---|---|---|---|
+| **Macro** (existing) | `deep_lob.multi_task_heads` | 6 (direction, next_price, next_imbalance, next_volatility, next_regime, wall_persist, time_to_event) | Long-horizon dynamics |
+| **Short-term** (new) | `trading_intel.ssl_heads.short_term` | 5 (wall_break, imbalance_shift, micro_target, liquidity_sweep, gap_fill) | 1-4 bar trading events |
+| **Adaptive** (new) | `trading_intel.ssl_heads.adaptive` | 3 (max_R_reached, target_bucket, regime_risk) | Trade sizing + TP scaling |
+
+All heads attach to the shared backbone embedding and produce causal
+labels (no lookahead). See `modules/trading_intel/ssl_heads/__init__.py`
+for the public API.
+
+### Anti-collapse modules (`modules/trading_intel/anti_collapse/`)
+
+Each addresses a specific failure mechanism observed in the 6-month run.
+All four are opt-in via CLI flags or environment variables — default
+training behavior is unchanged.
+
+| Module | Mechanism solved | Theory source | Wired via |
+|---|---|---|---|
+| `SimplexETFClassifier` + `dot_regression_loss` | #2 Class collapse (direction head → 100% UP) | Papyan-Han-Donoho 2020 "Neural Collapse"; Yang et al. 2022 "AllNC" | `--use-simplex-etf` |
+| `OrthogonalRepresentationModule` | #5 Rule overlap (SSL on non-event bars = 52.4%, riding day_trade events) | Chinese OMoE; Stiefel-manifold projection | `--ortho-weight W` |
+| `DBMTLBalancer` (LSB + GNB) | #7 Multi-task tradeoff (v1: magnitude wins; v2: direction wins; never both) | Lin et al. 2023 "DB-MTL"; Chen et al. 2018 "GradNorm" | `--use-dbmtl` |
+| `SharpeRegularizer` + `differentiable_sharpe_loss` | #1 Loss-landscape mismatch (surrogate ≠ trading goal) | Moody-Saffell 2001; Donti et al. 2017 "Decision-Focused Learning" | `--sharpe-weight W` |
+
+### Coverage of the seven failure mechanisms
+
+| # | Mechanism | Direct evidence (6-mo run) | Code-level solution | Status |
+|---|---|---|---|---|
+| 1 | Loss-landscape mismatch | — (structural) | `SharpeRegularizer` | ✅ wired |
+| 2 | Class collapse | direction head: 100% UP | `SimplexETFClassifier` + `dot_regression_loss` | ✅ wired |
+| 3 | Horizon mismatch | — (structural) | `ShortTermHeads` (5 micro-horizon heads) | ✅ wired |
+| 4 | Direction vs magnitude | v1 rank-IC=0.25 mag, dir collapsed | `AdaptiveTargetHeads` + Sharpe | ✅ wired |
+| 5 | Rule overlap | SSL on non-event: 52.4% (random) | `OrthogonalRepresentationModule` | ✅ wired |
+| 6 | Sample bottleneck | 5,478 train samples, 290k params | 5-year data scale (2021-2025) | ⏳ structural |
+| 7 | MTL tradeoff | β=5 magnitude wins; α=5 direction wins | `DBMTLBalancer` (LSB + GNB) | ✅ wired |
+
+**6 of 7 mechanisms have operational code-level solutions.** Mechanism #6
+resolves at data scale, not in code.
+
+### Running SSL with the anti-collapse modules
+
+#### Default (no anti-collapse — baseline behavior):
+```bash
+./scripts/walk_forward.sh /raw/data /out 2021-01 2025-12 6B
+```
+
+#### With all four counter-measures enabled:
+```bash
+WF_USE_SIMPLEX_ETF=1 \
+WF_ORTHO_WEIGHT=0.5 \
+WF_USE_DBMTL=1 \
+WF_SHARPE_WEIGHT=0.3 \
+  ./scripts/walk_forward.sh /raw/data /out 2021-01 2025-12 6B
+```
+
+The script auto-detects these env vars and switches to the enhanced fold
+runner (`tools/run_walk_forward_fold_enhanced.py`). Any subset works:
+e.g., `WF_USE_SIMPLEX_ETF=1 WF_SHARPE_WEIGHT=0.3 ...` enables just ETF + Sharpe.
+
+#### As a library (in your own training script):
+```python
+from modules.trading_intel.anti_collapse import (
+    SimplexETFClassifier, dot_regression_loss,
+    OrthogonalRepresentationModule,
+    DBMTLBalancer, DBMTLConfig,
+    SharpeRegularizer, SharpeLossConfig,
+)
+from modules.trading_intel.hybrid.model import HybridModel, HybridConfig
+
+# Replace the direction head with a Simplex ETF (0 trainable params)
+etf_head = SimplexETFClassifier(SimplexETFConfig(
+    feature_dim=128, num_classes=3,
+))
+model = HybridModel(HybridConfig(hidden_dim=128), direction_head=etf_head)
+
+# Anti-overlap penalty against rule features
+ortho = OrthogonalRepresentationModule(weight=0.5)
+
+# DB-MTL gradient balancer across event/direction/confidence/sharpe
+balancer = DBMTLBalancer(["event", "direction", "confidence", "sharpe"])
+
+# Sharpe regularizer (Western Decision-Focused Learning)
+sharpe = SharpeRegularizer(weight=0.3)
+```
+
+### Empirical guarantees (from the test suite)
+
+Each anti-collapse module ships with empirical proofs in
+`tests/test_anti_collapse.py`, `tests/test_dbmtl_and_sharpe.py`, and
+`tests/test_enhanced_fold_integration.py` (39 tests total):
+
+- **Simplex ETF** — `test_resists_majority_collapse`: 200 gradient steps
+  on 180/15/5 imbalanced 3-class data, **minority-class accuracy > 50%**
+  (would be 0 under standard CE).
+- **Orthogonal Rep** — `test_perfectly_correlated_high_penalty`: penalty
+  on duplicated-feature embedding is **>5× higher** than on truly
+  uncorrelated; `test_gradient_flows_into_embedding_only`: rule features
+  receive zero gradient (detached).
+- **DB-MTL** — `test_gradient_norm_balancing_lifts_quiet_tasks`: a head
+  initialized with 0.001× weights gets a **larger task weight** than the
+  loud head (the quiet task is "lifted", not muted).
+- **Sharpe** — `test_optimization_improves_sharpe`: 300 gradient steps
+  on a synthetic problem **improves empirical Sharpe by > 0.3** vs the
+  random initialization.
+
+### See also
+
+- [`SUBSYSTEMS.md`](SUBSYSTEMS.md) — full architectural contract between
+  day_trade, SSL, and trading_intel
+- [`docs/RESEARCH_SYNTHESIS.md`](docs/RESEARCH_SYNTHESIS.md) — mapping of
+  the seven failure mechanisms to fourteen proposed solutions across the
+  Western / Chinese / Russian schools
+- [`docs/PIPELINE_GUIDE.pdf`](docs/PIPELINE_GUIDE.pdf) — bilingual step-by-step
+  operational guide (17 pages, EN + AR)
+
+---
+
 ## 🚀 Quick start
 
 ### Scenario 1 — Run the proven baseline (no ML)
