@@ -197,6 +197,7 @@ reality (live execution, noisy feature inputs, market regime shifts):
 | **Input redundancy** | `tools/audit_feature_redundancy.py` + `modules/trading_intel/training/feature_selection.py` | Empirical correlation-cluster connected-components auditor; in our codebase it found 14 CVD / 12 ATR / 7 imbalance variants. Output `drop_list` is consumed by both fold runners via `--drop-features-from-audit`. | `test_feature_redundancy_audit.py` (14) + `test_feature_selection.py` (14) |
 | **Execution stress** | `tools/diagnostics/stress_test_backtest.py` | Re-runs the strict backtest under 5 progressively worse latency + slippage scenarios (baseline → mild → moderate → severe → extreme). Classifies the strategy as ROBUST / ACCEPTABLE / FRAGILE / BROKEN. | `test_stress_test.py` (13) |
 | **Regime sensitivity** | `tools/diagnostics/regime_parity_test.py` | Splits `trades.csv` by categorical regime AND volatility quartile, computes per-subset Sharpe/PF/DD, verdicts ROBUST / ACCEPTABLE / UNSTABLE / REGIME_BIAS / INSUFFICIENT_DATA. Catches "one-regime trick" strategies that look profitable in aggregate. | `test_regime_parity.py` (19) |
+| **Label-gate health** | `tools/diagnostics/audit_event_gate.py` | Audits the upstream event gate that decides which bars get labeled (everything else is silently stamped NEUTRAL). Reports overall rate vs the 20–30 % design target, per-regime + per-session rates, component failure breakdown, `cvd_direction_pct` `fillna(0.5)` contamination, and warm-up zero-bias from `_zscore` min_periods. Verdicts HEALTHY / LOW_RATE / STARVED / WARMUP_HEAVY / COMPONENT_DOMINATED / REGIME_STARVED. | `test_event_gate_audit.py` (23) |
 
 Quick usage:
 
@@ -219,6 +220,11 @@ python tools/diagnostics/stress_test_backtest.py \
 python tools/diagnostics/regime_parity_test.py \
     --trades-csv backtests/baseline_strict/trades.csv \
     --output     diagnostics/regime
+
+# 5. Audit the upstream event gate (catches "80 % NEUTRAL" pathologies)
+python tools/diagnostics/audit_event_gate.py \
+    --features combined/day_trading_features.parquet \
+    --output   diagnostics/event_gate
 ```
 
 Pipeline-issues coverage status (from `docs/PIPELINE_ISSUES_AUDIT.md`):
@@ -366,9 +372,10 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 │   ├── backtest_smoke.py
 │   └── diagnostics/
 │       ├── stress_test_backtest.py    ← Latency + slippage stress test
-│       └── regime_parity_test.py      ← Per-regime / per-vol-quartile parity
+│       ├── regime_parity_test.py      ← Per-regime / per-vol-quartile parity
+│       └── audit_event_gate.py        ← Upstream event-gate health audit
 │
-├── tests/                           ← 457 tests (2 skipped)
+├── tests/                           ← 480 tests (2 skipped)
 │   ├── test_lob_features_v2.py     ← LOB layer (23 tests)
 │   ├── test_short_term_ssl.py      ← Short-term heads (19 tests)
 │   ├── test_hybrid_model.py        ← Hybrid fusion (16 tests)
@@ -403,7 +410,8 @@ python -m pytest tests/test_lob_features_v2.py tests/test_short_term_ssl.py \
                  tests/test_inference_helpers.py \
                  tests/test_feature_redundancy_audit.py \
                  tests/test_feature_selection.py \
-                 tests/test_stress_test.py tests/test_regime_parity.py -v
+                 tests/test_stress_test.py tests/test_regime_parity.py \
+                 tests/test_event_gate_audit.py -v
 ```
 
 | Suite | Tests | Covers |
@@ -421,6 +429,7 @@ python -m pytest tests/test_lob_features_v2.py tests/test_short_term_ssl.py \
 | `test_feature_selection.py` | 14 | `--drop-features-from-audit` integration |
 | `test_stress_test.py` | 13 | Latency + slippage degradation scenarios |
 | `test_regime_parity.py` | 19 | Per-regime / per-vol-quartile parity diagnostic |
+| `test_event_gate_audit.py` | 23 | Upstream event-gate health + ghost-hunt diagnostics |
 | `test_walk_forward.py` | 11 | Fold generation + aggregator + end-to-end smoke |
 
 ### Boundary check
