@@ -185,6 +185,53 @@ Each anti-collapse module ships with empirical proofs in
   on a synthetic problem **improves empirical Sharpe by > 0.3** vs the
   random initialization.
 
+### Operational hardening for SSL
+
+The anti-collapse modules above are necessary but not sufficient. Four
+additional layers were added so the SSL pipeline survives contact with
+reality (live execution, noisy feature inputs, market regime shifts):
+
+| Layer | Module / tool | What it solves | Tests |
+|---|---|---|---|
+| **Normalization drift** | `trading_intel/hybrid/inference.py` — `FrozenScaler`, `load_hybrid_for_inference`, `predict_one` | The "transform with train stats — never `fit_transform`" rule, enforced in code. Loading a trained hybrid for live inference cannot accidentally re-fit scalers. | `test_inference_helpers.py` (10) |
+| **Input redundancy** | `tools/audit_feature_redundancy.py` + `modules/trading_intel/training/feature_selection.py` | Empirical correlation-cluster connected-components auditor; in our codebase it found 14 CVD / 12 ATR / 7 imbalance variants. Output `drop_list` is consumed by both fold runners via `--drop-features-from-audit`. | `test_feature_redundancy_audit.py` (14) + `test_feature_selection.py` (14) |
+| **Execution stress** | `tools/diagnostics/stress_test_backtest.py` | Re-runs the strict backtest under 5 progressively worse latency + slippage scenarios (baseline → mild → moderate → severe → extreme). Classifies the strategy as ROBUST / ACCEPTABLE / FRAGILE / BROKEN. | `test_stress_test.py` (13) |
+| **Regime sensitivity** | `tools/diagnostics/regime_parity_test.py` | Splits `trades.csv` by categorical regime AND volatility quartile, computes per-subset Sharpe/PF/DD, verdicts ROBUST / ACCEPTABLE / UNSTABLE / REGIME_BIAS / INSUFFICIENT_DATA. Catches "one-regime trick" strategies that look profitable in aggregate. | `test_regime_parity.py` (19) |
+
+Quick usage:
+
+```bash
+# 1. Audit feature redundancy (writes drop_list to summary.json)
+python tools/audit_feature_redundancy.py \
+    --features combined/day_trading_features.parquet \
+    --output   audits/redundancy --threshold 0.9
+
+# 2. Walk-forward fold with the auditor's drop list applied
+python tools/run_walk_forward_fold_enhanced.py ... \
+    --drop-features-from-audit audits/redundancy/redundancy_summary.json
+
+# 3. Stress-test the trained strategy under degrading execution
+python tools/diagnostics/stress_test_backtest.py \
+    --features combined/day_trading_features.parquet \
+    --output   diagnostics/stress
+
+# 4. Verify the edge is not regime-conditional
+python tools/diagnostics/regime_parity_test.py \
+    --trades-csv backtests/baseline_strict/trades.csv \
+    --output     diagnostics/regime
+```
+
+Pipeline-issues coverage status (from `docs/PIPELINE_ISSUES_AUDIT.md`):
+
+| Pipeline risk | Status | Addressed by |
+|---|---|---|
+| Normalization drift (live ↔ train) | ✅ Mitigated | `FrozenScaler` + `load_hybrid_for_inference` |
+| Feature bloat / redundancy | ✅ Mitigated | `audit_feature_redundancy` + `--drop-features-from-audit` |
+| Slippage realism | ✅ Diagnosed | Stress test (severe / extreme scenarios) |
+| Latency degradation | ✅ Diagnosed | Stress test (`extra_latency_bars`) |
+| Regime drift | ✅ Diagnosed | Regime parity test |
+| Live state management / event buffer | ⏳ Deferred | No live layer exists yet — documented as the first thing to build |
+
 ### See also
 
 - [`SUBSYSTEMS.md`](SUBSYSTEMS.md) — full architectural contract between
@@ -192,6 +239,9 @@ Each anti-collapse module ships with empirical proofs in
 - [`docs/RESEARCH_SYNTHESIS.md`](docs/RESEARCH_SYNTHESIS.md) — mapping of
   the seven failure mechanisms to fourteen proposed solutions across the
   Western / Chinese / Russian schools
+- [`docs/PIPELINE_ISSUES_AUDIT.md`](docs/PIPELINE_ISSUES_AUDIT.md) — six
+  pipeline failure modes (state, normalization, pandas-in-loop, lookahead,
+  feature bloat, parity) and the code-level mitigation for each
 - [`docs/PIPELINE_GUIDE.pdf`](docs/PIPELINE_GUIDE.pdf) — bilingual step-by-step
   operational guide (17 pages, EN + AR)
 
@@ -279,8 +329,11 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 │   │   ├── README.md               ← Detailed architecture + data flow
 │   │   ├── lob/                    ← 13-channel LOB features + CNN
 │   │   ├── ssl_heads/              ← Short-term + adaptive trading heads
-│   │   ├── hybrid/                 ← Fusion model + decision policy
-│   │   └── training/               ← train_hybrid.py
+│   │   ├── anti_collapse/          ← Simplex ETF, Orthogonal Rep,
+│   │   │                              DB-MTL balancer, Sharpe loss
+│   │   ├── hybrid/                 ← Fusion model + policy + inference.py
+│   │   │                              (FrozenScaler, load_hybrid_for_inference)
+│   │   └── training/               ← train_hybrid.py + feature_selection.py
 │   │
 │   ├── deep_lob/                   ← Subsystem B: LOB transformer backbone
 │   ├── price_cycle/                ← Subsystem B: price cycle model
@@ -306,10 +359,16 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 │   ├── build_walk_forward_folds.py    ← Fold definition generator
 │   ├── run_walk_forward_fold.py       ← Baseline fold runner
 │   ├── run_walk_forward_fold_enhanced.py  ← Anti-collapse fold runner
+│   │                                    (+--drop-features-from-audit)
 │   ├── aggregate_walk_forward.py      ← Per-fold metrics aggregator
-│   └── backtest_smoke.py
+│   ├── audit_feature_redundancy.py    ← Correlation-cluster auditor
+│   ├── dead_features_audit.py         ← Zero-variance / mostly-NaN cols
+│   ├── backtest_smoke.py
+│   └── diagnostics/
+│       ├── stress_test_backtest.py    ← Latency + slippage stress test
+│       └── regime_parity_test.py      ← Per-regime / per-vol-quartile parity
 │
-├── tests/                           ← 88+ tests
+├── tests/                           ← 457 tests (2 skipped)
 │   ├── test_lob_features_v2.py     ← LOB layer (23 tests)
 │   ├── test_short_term_ssl.py      ← Short-term heads (19 tests)
 │   ├── test_hybrid_model.py        ← Hybrid fusion (16 tests)
@@ -331,15 +390,20 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 ### Run the full active test suite
 ```bash
 python -m pytest tests/ -q
-# Expect: 320 passed, 2 skipped, 0 failed
+# Expect: 457 passed, 2 skipped, 0 failed
 ```
 
-### Run just the new subsystem tests
+### Run just the SSL + hybrid + diagnostics sweep
 ```bash
 python -m pytest tests/test_lob_features_v2.py tests/test_short_term_ssl.py \
                  tests/test_hybrid_model.py tests/test_adaptive_targets.py \
-                 tests/test_subsystem_boundaries.py -v
-# Expect: 88 passed
+                 tests/test_subsystem_boundaries.py \
+                 tests/test_anti_collapse.py tests/test_dbmtl_and_sharpe.py \
+                 tests/test_enhanced_fold_integration.py \
+                 tests/test_inference_helpers.py \
+                 tests/test_feature_redundancy_audit.py \
+                 tests/test_feature_selection.py \
+                 tests/test_stress_test.py tests/test_regime_parity.py -v
 ```
 
 | Suite | Tests | Covers |
@@ -349,6 +413,15 @@ python -m pytest tests/test_lob_features_v2.py tests/test_short_term_ssl.py \
 | `test_hybrid_model.py` | 16 | HybridModel fusion + per-head losses |
 | `test_adaptive_targets.py` | 26 | Adaptive heads + decision policy + regression fixes |
 | `test_subsystem_boundaries.py` | 4 | Architecture lint (positive + negative tests) |
+| `test_anti_collapse.py` | * | Simplex ETF + Orthogonal Representation guarantees |
+| `test_dbmtl_and_sharpe.py` | * | DB-MTL balancer + differentiable Sharpe loss |
+| `test_enhanced_fold_integration.py` | 8 | Walk-forward fold runner with all anti-collapse flags |
+| `test_inference_helpers.py` | 10 | `FrozenScaler` + live-safe hybrid loader |
+| `test_feature_redundancy_audit.py` | 14 | Correlation-cluster auditor |
+| `test_feature_selection.py` | 14 | `--drop-features-from-audit` integration |
+| `test_stress_test.py` | 13 | Latency + slippage degradation scenarios |
+| `test_regime_parity.py` | 19 | Per-regime / per-vol-quartile parity diagnostic |
+| `test_walk_forward.py` | 11 | Fold generation + aggregator + end-to-end smoke |
 
 ### Boundary check
 ```bash
@@ -450,6 +523,9 @@ tag points to the exact state before any cleanup.
 | [`SUBSYSTEMS.md`](SUBSYSTEMS.md) | **Authoritative** subsystem architecture, data contracts, boundaries |
 | [`PROJECT_TREE.md`](PROJECT_TREE.md) | Repository layout + archive restore instructions |
 | [`modules/trading_intel/README.md`](modules/trading_intel/README.md) | trading_intel package detail + data-flow diagram |
+| [`docs/RESEARCH_SYNTHESIS.md`](docs/RESEARCH_SYNTHESIS.md) | Seven SSL failure mechanisms → fourteen proposed solutions (Western / Chinese / Russian schools) |
+| [`docs/PIPELINE_ISSUES_AUDIT.md`](docs/PIPELINE_ISSUES_AUDIT.md) | Six pipeline failure modes + the code-level mitigation for each |
+| [`docs/PIPELINE_GUIDE.pdf`](docs/PIPELINE_GUIDE.pdf) | Bilingual operational guide (17 pages, EN + AR) |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release notes |
 | [`AGENTS.md`](AGENTS.md) | Agent runbook (for automation users) |
 
