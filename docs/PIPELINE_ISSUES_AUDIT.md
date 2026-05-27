@@ -193,6 +193,71 @@ gate between `_archive/legacy_v19/integration_bridge.py` becoming
 
 ---
 
+## Issue 5b — Feature redundancy (further investigation)
+
+After the user pointed at this specifically, a deeper grep of
+`prepare_day_trading.py` confirms the redundancy concern is empirically
+real, not theoretical:
+
+  • **14 CVD variants** (cvd, cvd_momentum, cvd_price_divergence,
+    cvd_slope_1h, cvd_slope_4h, cvd_slope_6b, session_cvd, …)
+  • **12 ATR variants** (atr_14, micro_atr, dist_to_london_high_atr,
+    dist_to_london_low_atr, …)
+  • **7 imbalance variants** (obi, obi_direction, lob_imbalance,
+    trade_imbalance, imbalance_*)
+  • **5 VWAP variants** (current_vwap, vwap_dist, vwap_dist_1h_roll,
+    vwap_z_score, rolling_vwap_*)
+
+This is exactly the pattern the source document warns about:
+"`Imbalance_L1`, `Imbalance_L2`, `Book_Pressure` simultaneously — the
+model is forced to disentangle the same information three times."
+
+**Quantifying it on real data:** the `OrthogonalRepresentationModule`
+(shipped in the research-synthesis work) handles the SSL-vs-rules
+overlap, but it doesn't help with rule-internal redundancy because the
+features are already in the same matrix by the time training starts.
+
+**Action taken (this commit):** added
+`tools/audit_feature_redundancy.py` — an empirical auditor that:
+
+  1. Computes the full absolute-Pearson correlation matrix on all
+     numeric non-leakage columns
+  2. Identifies high-correlation pairs (default threshold |r| ≥ 0.95)
+  3. Clusters features via connected-components of the correlation
+     graph (transitive correlation)
+  4. Picks one representative per cluster — the one with the highest
+     correlation to a target column (if given), else the first
+     member alphabetically
+  5. Emits a CSV correlation matrix, a JSON summary with cluster
+     details + drop list, and a human-readable text report
+
+Tests (`tests/test_feature_redundancy_audit.py`, 14 tests):
+  • Leakage detection mirrors `train_hybrid.LEAKAGE_PATTERNS`
+  • Correlation matrix: identity on diagonal, perfect-correlation
+    detected, constant column dropped
+  • Cluster detection: 2 independent clusters of 3 each detected at
+    threshold 0.95; threshold-sensitivity verified at 0.99 vs 0.85
+  • Representative picking: picks most-correlated-with-target
+  • End-to-end synthetic case: 5 CVD variants + 4 ATR variants →
+    2 clusters detected, 7 features in the drop list, leakage cols
+    correctly ignored
+  • CLI subprocess smoke
+
+**Usage:**
+```bash
+python tools/audit_feature_redundancy.py \
+    --features combined_6y/day_trading_features.parquet \
+    --output audit_results/redundancy \
+    --threshold 0.95 \
+    --target-col target_ret_24
+```
+
+The output `redundancy_summary.json` includes a `drop_list` that can be
+fed directly to a feature-selection step in train_hybrid.py to reduce
+the 135-feature input to ~70-90 features by dropping the highly-
+correlated members of each cluster. This is the practical remedy for
+the user's "feature bloat" concern.
+
 ## What this audit changes in the codebase
 
   • `modules/trading_intel/hybrid/inference.py` — new file (240 LOC)
