@@ -1,4 +1,4 @@
-"""Tests for walk-forward fold runner + aggregator."""
+"""Tests for walk-forward fold runner + aggregator + fold generator."""
 from __future__ import annotations
 
 import json
@@ -12,6 +12,89 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+
+
+# ════════════════════════════════════════════════════════════════════
+# Fold generator
+# ════════════════════════════════════════════════════════════════════
+class TestFoldGenerator:
+    def test_2021_to_2025_produces_8_folds(self):
+        from tools.build_walk_forward_folds import build_folds
+        folds = build_folds("2021-01", "2025-12",
+                            initial_train_months=12, step_months=6,
+                            test_window_months=6)
+        assert len(folds) == 8
+        # First fold
+        assert folds[0].train_start == "2021-01"
+        assert folds[0].train_end == "2021-12"
+        assert folds[0].test_start == "2022-01"
+        assert folds[0].test_end == "2022-06"
+        # Last fold
+        assert folds[-1].train_end == "2025-06"
+        assert folds[-1].test_start == "2025-07"
+        assert folds[-1].test_end == "2025-12"
+
+    def test_train_window_always_starts_at_range_start(self):
+        from tools.build_walk_forward_folds import build_folds
+        folds = build_folds("2022-01", "2024-12")
+        for f in folds:
+            assert f.train_start == "2022-01", \
+                "expanding-window walk-forward must keep train_start fixed"
+
+    def test_no_overlap_train_test(self):
+        from tools.build_walk_forward_folds import build_folds
+        folds = build_folds("2021-01", "2025-12")
+        for f in folds:
+            # test_start must be after train_end
+            assert f.test_start > f.train_end, \
+                f"fold {f.fold_id}: test_start {f.test_start} <= train_end {f.train_end}"
+
+    def test_test_windows_are_consecutive(self):
+        from tools.build_walk_forward_folds import build_folds
+        folds = build_folds("2021-01", "2025-12")
+        # Each subsequent fold's test_start should be 6 months after the
+        # previous fold's test_start
+        for i in range(1, len(folds)):
+            prev_start = folds[i - 1].test_start
+            curr_start = folds[i].test_start
+            # crude diff check: split YYYY-MM
+            py, pm = map(int, prev_start.split("-"))
+            cy, cm = map(int, curr_start.split("-"))
+            months_diff = (cy - py) * 12 + (cm - pm)
+            assert months_diff == 6, \
+                f"fold {i}: {prev_start} → {curr_start} not 6 months apart"
+
+    def test_empty_range_returns_no_folds(self):
+        from tools.build_walk_forward_folds import build_folds
+        # Range too short for even one fold
+        folds = build_folds("2021-01", "2021-06",
+                            initial_train_months=12, test_window_months=6)
+        assert folds == []
+
+    def test_cli_bash_format(self):
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tools" / "build_walk_forward_folds.py"),
+             "--start", "2021-01", "--end", "2025-12", "--format", "bash"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        lines = result.stdout.strip().split("\n")
+        assert len(lines) == 8
+        # Format: <id> <tr_s> <tr_e> <te_s> <te_e>
+        first = lines[0].split()
+        assert first[0] == "1"
+        assert first[1] == "2021-01"
+
+    def test_cli_json_format(self):
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tools" / "build_walk_forward_folds.py"),
+             "--start", "2022-01", "--end", "2024-12", "--format", "json"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        folds = json.loads(result.stdout)
+        assert isinstance(folds, list)
+        assert all("fold_id" in f for f in folds)
 
 
 # ════════════════════════════════════════════════════════════════════

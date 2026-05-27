@@ -1,42 +1,40 @@
 #!/usr/bin/env bash
 # ════════════════════════════════════════════════════════════════════════════
-# scripts/walk_forward_2022_2024.sh
+# scripts/walk_forward.sh
 # ────────────────────────────────────────────────────────────────────────────
-# Walk-forward validation for the SSL + hybrid pipeline on 2022-2024 data.
+# Walk-forward validation for the SSL + hybrid pipeline.
 #
 # Design:
-#   • Pretrain SSL ONCE on full 2022-2024 (expensive, ~4-7h on GPU)
+#   • Pretrain SSL ONCE on the full date range (expensive)
 #   • Extract embeddings ONCE for the full period
-#   • 5 walk-forward folds with expanding train window + 6-month test:
-#       Fold 1: train H1 2022      → test H2 2022
-#       Fold 2: train 2022 full    → test H1 2023
-#       Fold 3: train 2022+H1 2023 → test H2 2023
-#       Fold 4: train 2022-2023    → test H1 2024
-#       Fold 5: train ...H1 2024   → test H2 2024
+#   • N walk-forward folds with expanding train window + 6-month test windows
+#     (folds generated automatically by tools/build_walk_forward_folds.py)
 #   • For each fold: train hybrid on train slice, backtest on test slice
 #
-# Why frozen SSL: pretraining sees all 3 years (one-time, no fold-specific
+# Why frozen SSL: pretraining sees the full range (one-time, no fold-specific
 # leakage because SSL has no labels). Walk-forward measures HYBRID
-# generalization, which is where the labels live. This matches industry
-# practice (large pretrain, walk-forward fine-tune).
+# generalization. Matches industry practice.
 #
-# Strict variant: pass --strict-ssl to retrain SSL inside each fold (5x more
-# compute, ~20-30 hours total). Use only if you suspect SSL is overfitting
-# the union of all years.
+# Strict variant: --strict-ssl retrains SSL inside each fold (~5x compute).
 #
 # Usage:
-#   ./scripts/walk_forward_2022_2024.sh <raw_data_root> <output_root> [--strict-ssl]
+#   ./scripts/walk_forward.sh <raw_data_root> <output_root> \
+#       [start=2021-01] [end=2025-12] [root_symbol=6B] [--strict-ssl]
 #
-# Pre-requirement: scripts/run_day_trade_only.sh must have already produced
-# <day_trade_out>/combined/ for the full 2022-2024 period.
+# Pre-requirement: scripts/run_day_trade_only.sh must have produced the
+# day_trade features for the full date range. This script will invoke it
+# automatically if missing.
 # ════════════════════════════════════════════════════════════════════════════
 
 set -eo pipefail
 
-RAW_ROOT="${1:?Usage: $0 <raw_data_root> <output_root> [--strict-ssl]}"
-OUT_ROOT="${2:?Usage: $0 <raw_data_root> <output_root> [--strict-ssl]}"
+RAW_ROOT="${1:?Usage: $0 <raw_data_root> <output_root> [start=2021-01] [end=2025-12] [root=6B] [--strict-ssl]}"
+OUT_ROOT="${2:?Usage: $0 <raw_data_root> <output_root> [start=2021-01] [end=2025-12] [root=6B] [--strict-ssl]}"
+START_YM="${3:-2021-01}"
+END_YM="${4:-2025-12}"
+ROOT_SYMBOL="${5:-6B}"
 STRICT_SSL=0
-[ "${3:-}" = "--strict-ssl" ] && STRICT_SSL=1
+[ "${6:-}" = "--strict-ssl" ] && STRICT_SSL=1
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="$OUT_ROOT/walk_forward.log"
@@ -45,45 +43,45 @@ exec > >(tee -a "$LOG") 2>&1
 cd "$REPO_ROOT"
 
 echo "════════════════════════════════════════════════════════════════"
-echo "  WALK-FORWARD VALIDATION  2022 → 2024  (5 folds)"
+echo "  WALK-FORWARD VALIDATION  ${START_YM} → ${END_YM}"
 echo "════════════════════════════════════════════════════════════════"
-echo "  raw:       $RAW_ROOT"
-echo "  output:    $OUT_ROOT"
+echo "  raw:        $RAW_ROOT"
+echo "  output:     $OUT_ROOT"
+echo "  range:      $START_YM .. $END_YM"
+echo "  root:       $ROOT_SYMBOL"
 echo "  strict_ssl: $STRICT_SSL"
-echo "  start:     $(date)"
+echo "  start:      $(date)"
 echo ""
 
 # ──────────────────────────────────────────────────────────────────────────
-# STEP 0: ensure day_trade pipeline has produced features for all months
+# STEP 0: ensure day_trade pipeline has produced features for the range
 # ──────────────────────────────────────────────────────────────────────────
-echo "═══ STEP 0: verify day_trade features exist ═══"
+START_YEAR="${START_YM%-*}"
+END_YEAR="${END_YM%-*}"
 DT_OUT="$OUT_ROOT/day_trade"
+echo "═══ STEP 0: verify day_trade features ($START_YEAR..$END_YEAR) ═══"
 if [ ! -d "$DT_OUT/combined" ]; then
     echo "  Running day_trade pipeline first..."
-    ./scripts/run_day_trade_only.sh "$RAW_ROOT" "$DT_OUT" 6B 2022 2024
+    ./scripts/run_day_trade_only.sh \
+        "$RAW_ROOT" "$DT_OUT" "$ROOT_SYMBOL" "$START_YEAR" "$END_YEAR"
 fi
 echo "  ✓ day_trade features at $DT_OUT/combined/"
 echo ""
 
 # ──────────────────────────────────────────────────────────────────────────
-# STEP 1: Pretrain SSL ONCE on full 2022-2024 (frozen-SSL design)
+# STEP 1: Pretrain SSL ONCE on full range (frozen-SSL design)
 # ──────────────────────────────────────────────────────────────────────────
 SSL_OUT="$OUT_ROOT/ssl_full"
+SSL_COMBINED="$OUT_ROOT/ssl_combined"
 if [ "$STRICT_SSL" = "0" ]; then
-    echo "═══ STEP 1: pretrain SSL once on full 2022-2024 ═══"
+    echo "═══ STEP 1: pretrain SSL once on $START_YM..$END_YM ═══"
     if [ ! -f "$SSL_OUT/embeddings/embeddings.npy" ]; then
-        # Need order tensors too — build per month + combine
         echo "  Building per-month order tensors..."
         for m_dir in "$DT_OUT"/features/*/; do
             ym=$(basename "$m_dir")
             mbo_file="$DT_OUT/continuous/${ym}.mbo.parquet"
-            if [ ! -f "$mbo_file" ]; then
-                echo "    ⏭️  ${ym}: no mbo file"
-                continue
-            fi
-            if [ -f "$m_dir/order_features.npy" ]; then
-                continue   # already done
-            fi
+            [ ! -f "$mbo_file" ] && { echo "    ⏭️  ${ym}: no mbo"; continue; }
+            [ -f "$m_dir/order_features.npy" ] && continue   # idempotent
             python self_supervised/build_order_batches.py \
                 --mbo "$mbo_file" \
                 --features "$m_dir/day_trading_features.parquet" \
@@ -92,15 +90,14 @@ if [ "$STRICT_SSL" = "0" ]; then
                 >/dev/null 2>&1 || echo "    ❌ ${ym} order build failed"
         done
 
-        # Combine all months with order tensors
+        # Combine all monthly artifacts into one SSL dataset
         quarter_dirs=("$DT_OUT"/features/*/)
-        SSL_COMBINED="$OUT_ROOT/ssl_combined"
         python self_supervised/combine_quarter_artifacts.py \
             --quarter-dirs "${quarter_dirs[@]}" \
             --output-dir "$SSL_COMBINED" \
             --overlap-mode auto
 
-        # Pretrain SSL
+        # Pretrain SSL (LOB + cycle) end-to-end
         ./self_supervised/run_ssl_only.sh "$SSL_COMBINED" "$SSL_OUT" 0.85
     else
         echo "  ✓ existing checkpoint $SSL_OUT/embeddings/embeddings.npy"
@@ -109,19 +106,21 @@ fi
 echo ""
 
 # ──────────────────────────────────────────────────────────────────────────
-# STEP 2: Walk-forward — 5 folds
+# STEP 2: Generate fold definitions
 # ──────────────────────────────────────────────────────────────────────────
-echo "═══ STEP 2: 5-fold walk-forward (hybrid training + backtest) ═══"
+echo "═══ STEP 2: generate walk-forward folds ═══"
+mapfile -t FOLDS < <(python tools/build_walk_forward_folds.py \
+    --start "$START_YM" --end "$END_YM" --format bash)
+n_folds="${#FOLDS[@]}"
+echo "  → $n_folds folds"
+python tools/build_walk_forward_folds.py --start "$START_YM" --end "$END_YM" \
+    --format table
+echo ""
 
-# Fold definitions:  fold_id, train_start_ym, train_end_ym, test_start_ym, test_end_ym
-declare -a FOLDS=(
-    "1 2022-01 2022-06 2022-07 2022-12"
-    "2 2022-01 2022-12 2023-01 2023-06"
-    "3 2022-01 2023-06 2023-07 2023-12"
-    "4 2022-01 2023-12 2024-01 2024-06"
-    "5 2022-01 2024-06 2024-07 2024-12"
-)
-
+# ──────────────────────────────────────────────────────────────────────────
+# STEP 3: Walk-forward — N folds
+# ──────────────────────────────────────────────────────────────────────────
+echo "═══ STEP 3: run $n_folds folds (hybrid training + backtest) ═══"
 for fold_spec in "${FOLDS[@]}"; do
     read -r fold_id tr_s tr_e te_s te_e <<< "$fold_spec"
     fold_dir="$OUT_ROOT/fold_${fold_id}"
@@ -142,9 +141,9 @@ done
 echo ""
 
 # ──────────────────────────────────────────────────────────────────────────
-# STEP 3: Aggregate per-fold metrics
+# STEP 4: Aggregate per-fold metrics
 # ──────────────────────────────────────────────────────────────────────────
-echo "═══ STEP 3: aggregate walk-forward results ═══"
+echo "═══ STEP 4: aggregate walk-forward results ═══"
 python tools/aggregate_walk_forward.py \
     --folds-dir "$OUT_ROOT" \
     --output "$OUT_ROOT/walk_forward_summary.json"
@@ -153,6 +152,6 @@ echo ""
 echo "════════════════════════════════════════════════════════════════"
 echo "  WALK-FORWARD COMPLETE"
 echo "════════════════════════════════════════════════════════════════"
-echo "  end:    $(date)"
-echo "  log:    $LOG"
+echo "  end:     $(date)"
+echo "  log:     $LOG"
 echo "  summary: $OUT_ROOT/walk_forward_summary.json"
