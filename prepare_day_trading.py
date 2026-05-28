@@ -1784,6 +1784,59 @@ def _coverage_stats(series: pd.Series | np.ndarray, *, low_threshold: float) -> 
     }
 
 
+def _run_event_gate_audit_safe(out_path: str, output_dir: str) -> dict | None:
+    """
+    Post-write auto-diagnostic. Runs the event-gate audit on the parquet we
+    just wrote and prints a single-line verdict. Wrapped in try/except so a
+    missing diagnostic module or audit failure never breaks the pipeline.
+
+    Returns the audit summary dict on success, None on any failure.
+    """
+    try:
+        from pathlib import Path as _Path
+        from tools.diagnostics.audit_event_gate import run_audit
+    except Exception as exc:
+        print(f"   ⚠️  event-gate audit unavailable: {type(exc).__name__}: {exc}")
+        return None
+
+    try:
+        audit_dir = os.path.join(output_dir, '_audit_event_gate')
+        summary = run_audit(_Path(out_path), _Path(audit_dir))
+    except Exception as exc:
+        print(f"   ⚠️  event-gate audit failed: {type(exc).__name__}: {exc}")
+        return None
+
+    verdict = str(summary.get('verdict', 'INCOMPLETE'))
+    rate = summary.get('overall_event_rate')
+    icon = {
+        'HEALTHY':             '✅',
+        'LOW_RATE':            '⚠️ ',
+        'STARVED':             '🚨',
+        'WARMUP_HEAVY':        '⚠️ ',
+        'COMPONENT_DOMINATED': '🚨',
+        'REGIME_STARVED':      '⚠️ ',
+        'INSUFFICIENT_DATA':   '❔',
+        'INCOMPLETE':          '❔',
+    }.get(verdict, '❔')
+    rate_str = f"{rate:.1%}" if isinstance(rate, (int, float)) else "n/a"
+    print(f"\n   {icon} Event gate: {verdict} (rate={rate_str}) → {audit_dir}/")
+
+    # Loud diagnostic when the gate is the root cause of high NEUTRAL
+    if verdict in ('STARVED', 'COMPONENT_DOMINATED'):
+        print("      ← الـ NEUTRAL العالي مرجعه gate وليس market behavior")
+        diag = summary.get('diag', {})
+        for k, v in diag.items():
+            if k != 'n_rows':
+                print(f"      ← {k}: {v}")
+    elif verdict in ('LOW_RATE', 'WARMUP_HEAVY', 'REGIME_STARVED'):
+        diag = summary.get('diag', {})
+        flagged = {k: v for k, v in diag.items() if k not in ('n_rows', 'overall_rate')}
+        if flagged:
+            print(f"      ← diag: {flagged}")
+
+    return summary
+
+
 def _mbo_bar_coverage_from_tick_series(tc: pd.Series) -> np.ndarray:
     """كثافة شريط MBO (tick_count) مقابل وسط محلي ∈ [0,1] — موازٍ لفكرة تغطية MBP."""
     t = pd.to_numeric(tc, errors='coerce').fillna(0.0).astype(np.float64)
@@ -4221,6 +4274,12 @@ def run_day_trading_refinery(
         for reg in ['trending', 'ranging', 'volatile']:
             m = (df_out['regime_label'] == reg) & (df_out['train_event_flag'] == 1)
             print(f"      {reg:8s} events: {int(m.sum()):,}")
+
+    # ── 7.5 Event-gate auto-diagnostic ─────────────────────────────
+    # Surfaces gate starvation / component domination / warm-up bias
+    # so high-NEUTRAL pipelines tell us WHY before we ask. Safe wrapper:
+    # any failure prints a warning and continues — never breaks the run.
+    _run_event_gate_audit_safe(out_path, output_dir)
 
     # ── 8. Manifest ────────────────────────────────────────────────
     regime_ev_counts: dict = {}
