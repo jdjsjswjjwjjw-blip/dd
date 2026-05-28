@@ -274,6 +274,24 @@ Outputs `execution_log.jsonl` (one fill per line, snapshot included) and
 The log is what you diff against the model's *assumed* slippage to
 quantify backtest overfitting.
 
+**Slippage calibration** — `tools/calibrate_slippage.py` closes the
+model-vs-realised loop. It reads `execution_log.jsonl`, splits events
+by region (sub-L1 / linear ramp / walking), refits each
+`AdaptiveSlippage` constant via region-specific OLS-through-origin, and
+applies safety clamps (non-negativity + base ≤ mid). On our mock data
+it correctly refused to suggest a negative `mid_ticks` value when
+region B was dominated by L0-fits, and surfaced a meaningful
+`extra_per_level` drop (1.0 → 0.144) that closes the 3.23× over-shoot.
+Verdicts: `WELL_CALIBRATED / OVER_CALIBRATED / UNDER_CALIBRATED / INSUFFICIENT_DATA`.
+
+```bash
+python tools/calibrate_slippage.py \
+    --log    replay_results/baseline/execution_log.jsonl \
+    --output replay_results/baseline/calibration \
+    --tick-size 0.0001 \
+    --current-base 0.5 --current-mid 1.5 --current-extra 1.0
+```
+
 ### See also
 
 - [`SUBSYSTEMS.md`](SUBSYSTEMS.md) — full architectural contract between
@@ -407,6 +425,8 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 │   ├── dead_features_audit.py         ← Zero-variance / mostly-NaN cols
 │   ├── backtest_smoke.py
 │   ├── run_replay_backtest.py        ← Event-by-event LOB replay CLI
+│   ├── calibrate_slippage.py         ← Refits AdaptiveSlippage from replay log
+│   ├── generate_mock_data.py         ← Synthetic MBP-10 + signals fixtures
 │   └── diagnostics/
 │       ├── stress_test_backtest.py    ← Latency + slippage stress test
 │       ├── regime_parity_test.py      ← Per-regime / per-vol-quartile parity
@@ -416,7 +436,7 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 │   ├── book.py                       ← LOBSnapshot + fill_market_order + AdaptiveSlippage
 │   └── engine.py                     ← LatencyModel + ExecutionEvent + ReplayBacktest
 │
-├── tests/                           ← 511 tests (2 skipped)
+├── tests/                           ← 549 tests (2 skipped)
 │   ├── test_lob_features_v2.py     ← LOB layer (23 tests)
 │   ├── test_short_term_ssl.py      ← Short-term heads (19 tests)
 │   ├── test_hybrid_model.py        ← Hybrid fusion (16 tests)
@@ -473,6 +493,7 @@ python -m pytest tests/test_lob_features_v2.py tests/test_short_term_ssl.py \
 | `test_event_gate_audit.py` | 23 | Upstream event-gate health + ghost-hunt diagnostics |
 | `test_event_gate_auto_hook.py` | 6 | Pipeline-integrated post-write audit hook |
 | `test_replay_engine.py` | 25 | LOB snapshot + market-order fill + adaptive slippage + latency + replay backtest |
+| `test_calibrate_slippage.py` | 38 | Region-by-region OLS refit + safety clamps + verdict cascade |
 | `test_walk_forward.py` | 11 | Fold generation + aggregator + end-to-end smoke |
 
 ### Boundary check
