@@ -241,6 +241,39 @@ Pipeline-issues coverage status (from `docs/PIPELINE_ISSUES_AUDIT.md`):
 | Regime drift | ✅ Diagnosed | Regime parity test |
 | Live state management / event buffer | ⏳ Deferred | No live layer exists yet — documented as the first thing to build |
 
+### Execution realism — Replay Engine (separate stack)
+
+The four-layer hardening above protects the *training* and *bar-level
+backtest* paths. Bar-level backtest still assumes constant slippage
+(`0.5 pip/side` in `self_supervised/backtest_day_trade.py`) and integer
+"latency bars". For execution realism we ship a **stand-alone**
+event-by-event simulator in `modules/replay_engine/`:
+
+| Piece | What it models |
+|---|---|
+| `LOBSnapshot` + `LOBState` | Immutable 10-level book view + sequential MBP-10 ingestion |
+| `fill_market_order` | Walks the book level-by-level — returns VWAP fill, residual, levels consumed |
+| `AdaptiveSlippage` | Slippage = f(level-1 depth ratio); blows up when L1 is thin |
+| `LatencyModel` | Lognormal-ish per-order latency with seedable RNG |
+| `ReplayBacktest` | Orchestrator: signal → snapshot @ decision → +latency → snapshot @ arrival → fill → log |
+
+Run it as a separate CLI — independent of the bar-level backtest:
+
+```bash
+python tools/run_replay_backtest.py \
+    --signals  backtests/baseline/signals.csv \
+    --mbp      raw/mbp_10.parquet \
+    --output   replay_results/baseline \
+    --tick-size 0.0001 \
+    --latency-mean-us 5000 --latency-jitter-us 2000 \
+    --slip-base-ticks 0.5 --slip-mid-ticks 1.5
+```
+
+Outputs `execution_log.jsonl` (one fill per line, snapshot included) and
+`replay_summary.json` (aggregate slippage / latency / fill-quality stats).
+The log is what you diff against the model's *assumed* slippage to
+quantify backtest overfitting.
+
 ### See also
 
 - [`SUBSYSTEMS.md`](SUBSYSTEMS.md) — full architectural contract between
@@ -373,12 +406,17 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 │   ├── audit_feature_redundancy.py    ← Correlation-cluster auditor
 │   ├── dead_features_audit.py         ← Zero-variance / mostly-NaN cols
 │   ├── backtest_smoke.py
+│   ├── run_replay_backtest.py        ← Event-by-event LOB replay CLI
 │   └── diagnostics/
 │       ├── stress_test_backtest.py    ← Latency + slippage stress test
 │       ├── regime_parity_test.py      ← Per-regime / per-vol-quartile parity
 │       └── audit_event_gate.py        ← Upstream event-gate health audit
 │
-├── tests/                           ← 486 tests (2 skipped)
+├── modules/replay_engine/             ← Event-by-event LOB simulator (separate stack)
+│   ├── book.py                       ← LOBSnapshot + fill_market_order + AdaptiveSlippage
+│   └── engine.py                     ← LatencyModel + ExecutionEvent + ReplayBacktest
+│
+├── tests/                           ← 511 tests (2 skipped)
 │   ├── test_lob_features_v2.py     ← LOB layer (23 tests)
 │   ├── test_short_term_ssl.py      ← Short-term heads (19 tests)
 │   ├── test_hybrid_model.py        ← Hybrid fusion (16 tests)
@@ -434,6 +472,7 @@ python -m pytest tests/test_lob_features_v2.py tests/test_short_term_ssl.py \
 | `test_regime_parity.py` | 19 | Per-regime / per-vol-quartile parity diagnostic |
 | `test_event_gate_audit.py` | 23 | Upstream event-gate health + ghost-hunt diagnostics |
 | `test_event_gate_auto_hook.py` | 6 | Pipeline-integrated post-write audit hook |
+| `test_replay_engine.py` | 25 | LOB snapshot + market-order fill + adaptive slippage + latency + replay backtest |
 | `test_walk_forward.py` | 11 | Fold generation + aggregator + end-to-end smoke |
 
 ### Boundary check
