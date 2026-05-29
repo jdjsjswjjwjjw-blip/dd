@@ -490,7 +490,13 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 │   ├── masking.py                    ← generate_mask + apply_mask (3 strategies)
 │   └── reconstruction.py             ← ReconstructionHead + compute_recon_loss
 │
-├── tests/                           ← 581 tests (2 skipped)
+├── modules/production/                ← Production runtime layer (Path X)
+│   ├── config.py                     ← ProductionConfig + sub-configs (validated)
+│   ├── guards.py                     ← ConfidenceGate + DriftGuard + StartupGuard
+│   ├── response.py                   ← PredictionResponse dataclass
+│   └── runner.py                     ← ProductionRunner orchestrator
+│
+├── tests/                           ← 666 tests (2 skipped)
 │   ├── test_lob_features_v2.py     ← LOB layer (23 tests)
 │   ├── test_short_term_ssl.py      ← Short-term heads (19 tests)
 │   ├── test_hybrid_model.py        ← Hybrid fusion (16 tests)
@@ -549,6 +555,9 @@ python -m pytest tests/test_lob_features_v2.py tests/test_short_term_ssl.py \
 | `test_replay_engine.py` | 25 | LOB snapshot + market-order fill + adaptive slippage + latency + replay backtest |
 | `test_calibrate_slippage.py` | 38 | Region-by-region OLS refit + safety clamps + verdict cascade |
 | `test_masked_modeling.py` | 32 | Masked-reconstruction config + 3 mask strategies + recon head + loss |
+| `test_ssl_ablation.py` | 26 | SSL ablation harness (Path Z) — paired t-stat verdict cascade |
+| `test_sharpe_auxiliary.py` | 23 | Sharpe-aware auxiliary loss wiring (Path Y) |
+| `test_production.py` | 36 | Production runtime (Path X) — response + config + guards + runner |
 | `test_walk_forward.py` | 11 | Fold generation + aggregator + end-to-end smoke |
 
 ### Boundary check
