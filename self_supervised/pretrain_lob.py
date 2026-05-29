@@ -90,10 +90,17 @@ def _masked_loss(loss_per_sample: torch.Tensor, valid_mask: torch.Tensor) -> tor
 
 def compute_ssl_loss(
     outputs, batch: dict, device: torch.device, config_weights,
+    sharpe_aux_config=None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Per-task SSL loss with per-sample validity masking.
 
     Returns (total_loss, per_task_loss_floats).
+
+    When `sharpe_aux_config` is supplied AND has `enabled=True`, a
+    differentiable Sharpe-aware loss is added on top of the existing
+    six tasks (rewards predictions that are profitable to trade, not
+    just MSE-accurate). Default is None → behaviour matches the
+    six-task setup exactly.
     """
     # Per-task validity masks (from batch dict)
     v_price  = batch['next_price_valid'].to(device)
@@ -143,10 +150,36 @@ def compute_ssl_loss(
         + w.time_to_event_weight   * losses['time_to_event']
     )
 
-    return weighted_sum, {
+    per_task_log = {
         'total': float(weighted_sum.item()),
         **{k: float(v.item()) for k, v in losses.items()},
     }
+
+    # ── Sharpe-aware auxiliary loss (Path Y) ─────────────────────────
+    # When enabled, adds a differentiable Sharpe term computed on
+    # outputs.next_price against the realised next return. Encoder
+    # learns representations that translate into profitable positions
+    # rather than just low-MSE forecasts.
+    if sharpe_aux_config is not None and getattr(
+        sharpe_aux_config, "enabled", False
+    ):
+        from self_supervised.sharpe_auxiliary import compute_sharpe_aux_loss
+        sharpe_loss, sharpe_diag = compute_sharpe_aux_loss(
+            pred_return=outputs.next_price,
+            target_return=t_price,
+            config=sharpe_aux_config,
+            valid_mask=(v_price > 0.5) if v_price.dtype == torch.float else v_price,
+        )
+        total = weighted_sum + sharpe_aux_config.weight * sharpe_loss
+        per_task_log['sharpe_aux'] = float(sharpe_loss.item())
+        per_task_log['total'] = float(total.item())
+        # Surface a couple of diagnostics so the operator can see the
+        # auxiliary task converging without parsing nested dicts.
+        if 'emp_sharpe' in sharpe_diag:
+            per_task_log['sharpe_aux_emp'] = float(sharpe_diag['emp_sharpe'])
+        return total, per_task_log
+
+    return weighted_sum, per_task_log
 
 
 # ════════════════════════════════════════════════════════════════════════════
