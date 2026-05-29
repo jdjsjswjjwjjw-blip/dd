@@ -185,6 +185,55 @@ Each anti-collapse module ships with empirical proofs in
   on a synthetic problem **improves empirical Sharpe by > 0.3** vs the
   random initialization.
 
+### Masked-reconstruction auxiliary task (Path B)
+
+The existing six forecasting heads (next_price, next_imbalance,
+next_volatility, next_regime, wall_persist, time_to_event) give the
+model a forward-looking signal but never force it to learn what's
+*consistent with the surrounding context*. `modules/deep_lob/masked_modeling/`
+adds that signal: random positions in the order-features tensor are
+zeroed and a small head reconstructs them from the encoder output. The
+two paradigms are complementary, not exclusive — masked reconstruction
+is an *additional* auxiliary task, not a replacement.
+
+| Piece | What it does |
+|---|---|
+| `MaskedModelingConfig` | All knobs in one frozen dataclass; off by default |
+| `generate_mask(order_masks, cfg)` | Seedable, padding-aware, per-sample mask floor |
+| `apply_mask(features, mask)` | Zero-out + optional mask-indicator channel |
+| `ReconstructionHead` | Two-layer MLP (encoder_dim → hidden → feature_dim) |
+| `compute_recon_loss` | Padding-aware MSE on masked-AND-valid positions |
+
+Three masking strategies cover the documented failure modes:
+
+```
+random  Bernoulli(mask_ratio) per order — BERT-style baseline
+patch   Contiguous patches of `patch_size` orders — mirrors tape outages
+bar     Whole bars masked — strongest bar-level context test
+```
+
+Integration recipe for `pretrain_lob.py`:
+
+```python
+from modules.deep_lob.masked_modeling import (
+    MaskedModelingConfig, generate_mask, apply_mask,
+    ReconstructionHead, compute_recon_loss,
+)
+
+cfg = MaskedModelingConfig(enabled=True, mask_ratio=0.15)
+head = ReconstructionHead(
+    encoder_dim=hidden_dim, feature_dim=ORDER_FEATURE_DIM,
+    hidden_dim=cfg.reconstruction_hidden_dim,
+)
+# In the training step:
+mask = generate_mask(order_masks, cfg)
+masked = apply_mask(order_features, mask, cfg.provide_mask_indicator)
+encoded = backbone.encode(masked, order_masks, ...)
+recon = head(encoded)
+l_recon = compute_recon_loss(recon, order_features, mask, order_masks)
+total_loss = existing_total + cfg.reconstruction_weight * l_recon
+```
+
 ### Operational hardening for SSL
 
 The anti-collapse modules above are necessary but not sufficient. Four
@@ -436,7 +485,12 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 │   ├── book.py                       ← LOBSnapshot + fill_market_order + AdaptiveSlippage
 │   └── engine.py                     ← LatencyModel + ExecutionEvent + ReplayBacktest
 │
-├── tests/                           ← 549 tests (2 skipped)
+├── modules/deep_lob/masked_modeling/  ← Masked-reconstruction auxiliary task (Path B)
+│   ├── config.py                     ← MaskedModelingConfig dataclass
+│   ├── masking.py                    ← generate_mask + apply_mask (3 strategies)
+│   └── reconstruction.py             ← ReconstructionHead + compute_recon_loss
+│
+├── tests/                           ← 581 tests (2 skipped)
 │   ├── test_lob_features_v2.py     ← LOB layer (23 tests)
 │   ├── test_short_term_ssl.py      ← Short-term heads (19 tests)
 │   ├── test_hybrid_model.py        ← Hybrid fusion (16 tests)
@@ -494,6 +548,7 @@ python -m pytest tests/test_lob_features_v2.py tests/test_short_term_ssl.py \
 | `test_event_gate_auto_hook.py` | 6 | Pipeline-integrated post-write audit hook |
 | `test_replay_engine.py` | 25 | LOB snapshot + market-order fill + adaptive slippage + latency + replay backtest |
 | `test_calibrate_slippage.py` | 38 | Region-by-region OLS refit + safety clamps + verdict cascade |
+| `test_masked_modeling.py` | 32 | Masked-reconstruction config + 3 mask strategies + recon head + loss |
 | `test_walk_forward.py` | 11 | Fold generation + aggregator + end-to-end smoke |
 
 ### Boundary check
