@@ -496,7 +496,7 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 │   ├── response.py                   ← PredictionResponse dataclass
 │   └── runner.py                     ← ProductionRunner orchestrator
 │
-├── tests/                           ← 666 tests (2 skipped)
+├── tests/                           ← 732 tests (2 skipped)
 │   ├── test_lob_features_v2.py     ← LOB layer (23 tests)
 │   ├── test_short_term_ssl.py      ← Short-term heads (19 tests)
 │   ├── test_hybrid_model.py        ← Hybrid fusion (16 tests)
@@ -558,6 +558,10 @@ python -m pytest tests/test_lob_features_v2.py tests/test_short_term_ssl.py \
 | `test_ssl_ablation.py` | 26 | SSL ablation harness (Path Z) — paired t-stat verdict cascade |
 | `test_sharpe_auxiliary.py` | 23 | Sharpe-aware auxiliary loss wiring (Path Y) |
 | `test_production.py` | 36 | Production runtime (Path X) — response + config + guards + runner |
+| `test_pipeline_hardening.py` | 8 | Column pinning + effective-sample size guard |
+| `test_verify_data_health.py` | 21 | Pre-flight SSL data verifier — causality / required / NaN / samples |
+| `test_regularization_audit.py` | 17 | SSL dropout floor audit (8 knobs) + context-encoder recommendation |
+| `test_loss_watchdog.py` | 20 | Early-loss watchdog — saturation / divergence / healthy detection |
 | `test_walk_forward.py` | 11 | Fold generation + aggregator + end-to-end smoke |
 
 ### Boundary check

@@ -191,12 +191,18 @@ def _params_are_finite(model) -> bool:
 
 
 def train_epoch(model, loader, optimizer, device, scaler, scheduler,
-                config_weights, use_amp: bool) -> dict:
+                config_weights, use_amp: bool, watchdog=None) -> dict:
+    """Train one epoch. If `watchdog` (a LossWatchdog) is supplied, each
+    step's total loss is fed to it; on DIVERGING the epoch aborts with a
+    RuntimeError, on SATURATED at the warmup boundary it prints a loud
+    warning (but does not abort — the operator decides). Pass watchdog
+    only for the FIRST epoch — that's where saturation shows."""
     model.train()
     losses_sum: dict[str, float] = {}
     n_batches = 0
     n_skipped = 0
     n_total = 0
+    _watchdog_warned = False
     for batch in loader:
         n_total += 1
         inputs = {
@@ -256,6 +262,23 @@ def train_epoch(model, loader, optimizer, device, scaler, scheduler,
         for k, v in per_task.items():
             losses_sum[k] = losses_sum.get(k, 0.0) + v
         n_batches += 1
+
+        # ── Early-loss watchdog ──────────────────────────────────────
+        # Feeds the per-step total loss to the watchdog. Aborts the run
+        # on DIVERGING; warns once on SATURATED at the warmup boundary.
+        if watchdog is not None:
+            verdict = watchdog.observe(per_task.get('total', float('nan')))
+            if verdict == "DIVERGING":
+                raise RuntimeError(
+                    f"Loss watchdog: {watchdog.diagnosis()}"
+                )
+            if (
+                verdict == "SATURATED"
+                and not _watchdog_warned
+                and watchdog.n_observed >= watchdog.warmup_steps
+            ):
+                print(f"           ⚠️  {watchdog.diagnosis()}")
+                _watchdog_warned = True
 
     # Fail-fast: too many skipped batches = silent corruption somewhere
     if n_total > 0 and n_skipped / n_total > MAX_SKIP_RATIO:
@@ -404,12 +427,23 @@ def main():
     history = []
     cfg_weights = config.multi_task_heads
 
+    # Early-loss watchdog: attached to the FIRST epoch only — saturation
+    # / divergence shows in the opening steps, not deep into training.
+    from self_supervised.loss_watchdog import LossWatchdog
+    watchdog_warmup = min(100, max(40, getattr(args, "watchdog_warmup", 100)))
+
     for epoch in range(args.epochs):
         t0 = time.time()
+        epoch_watchdog = (
+            LossWatchdog(warmup_steps=watchdog_warmup, window=20)
+            if epoch == 0 else None
+        )
         train_metrics = train_epoch(
             model, train_loader, optimizer, device, scaler, scheduler,
-            cfg_weights, use_amp,
+            cfg_weights, use_amp, watchdog=epoch_watchdog,
         )
+        if epoch_watchdog is not None:
+            print(f"           🔍 watchdog: {epoch_watchdog.diagnosis()}")
         val_metrics = eval_epoch(model, holdout_loader, device, cfg_weights, use_amp)
         elapsed = time.time() - t0
 
