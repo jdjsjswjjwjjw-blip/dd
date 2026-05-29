@@ -238,6 +238,52 @@ def _compute_time_to_event_array(
     return tte, valid
 
 
+# ── Sample-size thresholds ──────────────────────────────────────────
+# Below these counts the SSL training will overfit / fail to converge.
+# Numbers chosen so the warning fires at "I would not trust this", and
+# the error fires at "this run is guaranteed garbage".
+SSL_MIN_SAMPLES_WARN: int = 30_000     # ~6 months at 5-min bars after embargo
+SSL_MIN_SAMPLES_ERROR: int = 5_000     # below this, refuse to instantiate
+
+# Allow operators to override via env var for tiny smoke / synthetic runs:
+#   SSL_BYPASS_MIN_SAMPLES=1  → skip the hard error (warn-only)
+# This is intentionally an opt-in escape hatch, not a config flag.
+import os as _os
+_BYPASS_MIN_SAMPLES_ENV = "SSL_BYPASS_MIN_SAMPLES"
+
+
+def _check_sample_size(n_samples: int) -> None:
+    """Loud-fail on degenerate sample counts; warn on suspicious ones.
+
+    Pulled out as a free function so the smoke verifier
+    (`verify_data_health.py`) can call the same logic.
+    """
+    if n_samples < SSL_MIN_SAMPLES_ERROR:
+        if _os.environ.get(_BYPASS_MIN_SAMPLES_ENV, "") == "1":
+            print(
+                f"  ⚠️  Total Effective Samples: {n_samples:,} — "
+                f"below ERROR floor ({SSL_MIN_SAMPLES_ERROR:,}). "
+                f"Bypassed via {_BYPASS_MIN_SAMPLES_ENV}=1."
+            )
+            return
+        raise RuntimeError(
+            f"SSLDataset has only {n_samples:,} effective samples — "
+            f"below the hard floor of {SSL_MIN_SAMPLES_ERROR:,}. "
+            f"Check embargo_bars / session_breaks / min_idx in "
+            f"the calling script. Set {_BYPASS_MIN_SAMPLES_ENV}=1 to "
+            f"bypass for smoke tests with synthetic data."
+        )
+    if n_samples < SSL_MIN_SAMPLES_WARN:
+        print(
+            f"  ⚠️  Total Effective Samples: {n_samples:,} — "
+            f"BELOW recommended {SSL_MIN_SAMPLES_WARN:,}. SSL likely to "
+            f"overfit. Inspect embargo / session breaks / leakage filter "
+            f"before launching a full training run."
+        )
+    else:
+        print(f"  ✅ Total Effective Samples: {n_samples:,}")
+
+
 class SSLDataset(Dataset):
     """Dataset for SSL pretraining من output prepare_day_trading.py.
 
@@ -353,6 +399,9 @@ class SSLDataset(Dataset):
             print(f"     segment filter: dropped {dropped:,} samples whose "
                   f"lookback/forward window crosses a session break")
             print(f"     final valid samples: {self.n_samples:,}")
+        # Hard-fail / warn on degenerate sample counts before the operator
+        # commits a GPU to a guaranteed-overfit run.
+        _check_sample_size(self.n_samples)
 
         # Stats fit window: defaults to this Dataset's own range
         self.stats_min_idx = stats_min_idx if stats_min_idx is not None else self.min_idx
@@ -495,7 +544,22 @@ class SSLDataset(Dataset):
         self.next_price_valid = valid_mask
 
         # next_imbalance — uses obi[i+1]
-        obi_col = 'obi_net' if 'obi_net' in self.df.columns else 'order_flow_imbalance'
+        # PIN: require the column under one of its exact known names. The
+        # previous fallback to 0.0 produced a silently-zero target that
+        # quietly killed the next_imbalance task's gradient — we'd rather
+        # fail loudly here than train a head on noise.
+        if 'obi_net' in self.df.columns:
+            obi_col = 'obi_net'
+        elif 'order_flow_imbalance' in self.df.columns:
+            obi_col = 'order_flow_imbalance'
+        else:
+            raise RuntimeError(
+                "Pipeline misconfigured: the features parquet has neither "
+                "`obi_net` nor `order_flow_imbalance`. The SSL "
+                "next_imbalance task requires one of them. "
+                "Re-run prepare_day_trading.py and verify the OBI "
+                "computation is on (see prepare_day_trading.py:1038)."
+            )
         obi = _safe_col(obi_col, fallback=0.0)
         obi = np.clip(obi, -1.0, 1.0)
         next_obi = np.zeros(n, dtype=np.float32)
@@ -505,11 +569,23 @@ class SSLDataset(Dataset):
         self.next_imbalance_valid[:-1] = True
 
         # next_volatility — uses atr[i+1]
-        atr_col = 'atr_14' if 'atr_14' in self.df.columns else 'atr'
+        # PIN: same loud-failure rule as obi above. An all-zero ATR target
+        # would degrade next_volatility training to noise.
+        if 'atr_14' in self.df.columns:
+            atr_col = 'atr_14'
+        elif 'atr' in self.df.columns:
+            atr_col = 'atr'
+        else:
+            raise RuntimeError(
+                "Pipeline misconfigured: the features parquet has neither "
+                "`atr_14` nor `atr`. The SSL next_volatility task requires "
+                "one. Re-run prepare_day_trading.py with ATR enabled."
+            )
         atr = _safe_col(atr_col, fallback=0.001)
         atr = np.clip(atr, 1e-5, 0.05).astype(np.float32)
         next_atr = np.zeros(n, dtype=np.float32)
         next_atr[:-1] = atr[1:]
+
         self.next_volatility = np.maximum(next_atr, 1e-6)
         self.next_volatility_valid = np.zeros(n, dtype=bool)
         self.next_volatility_valid[:-1] = True
