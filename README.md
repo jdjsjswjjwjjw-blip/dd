@@ -9,7 +9,7 @@ aware sizing.
 > **Branch:** `claude/task-d-RcDhu`
 > **Baseline tag:** `v1-baseline-pre-cleanup` (commit `c7b88dd`)
 > **Architecture authority:** [`SUBSYSTEMS.md`](SUBSYSTEMS.md)
-> **Tests:** 320 passing + 2 skipped, 0 failures (88 trading_intel + 4 boundary + 230 legacy day_trade/SSL backbone)
+> **Tests:** 732 passing + 2 skipped, 0 failures
 
 ---
 
@@ -518,7 +518,7 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 ### Run the full active test suite
 ```bash
 python -m pytest tests/ -q
-# Expect: 457 passed, 2 skipped, 0 failed
+# Expect: 732 passed, 2 skipped, 0 failed
 ```
 
 ### Run just the SSL + hybrid + diagnostics sweep
@@ -621,6 +621,27 @@ SSL bottleneck propagates and the hybrid offers marginal lift. The proposal's
 Stage 1 (6-year baseline) is the path to validate whether the hybrid actually
 adds value at scale.
 
+### Verification + production layers (built this cycle, untrained)
+Everything below is **measurement and safety apparatus** — built and unit-
+tested, but it has never run against a trained checkpoint or real Databento
+data because **none exists in the repo yet** (zero `.pt`/`.ckpt`/`metrics.json`).
+These are the instruments; the experiment has not been run.
+
+| Layer | Status | Gap to "live" |
+|---|---|---|
+| Event-gate audit (auto-hook) | ✅ wired into `prepare_day_trading.py` | needs a real feature build to emit a verdict |
+| 4 hardening layers (scaler/redundancy/stress/regime) | ✅ built + tested | stress/regime need a real `trades.csv` |
+| Replay engine + slippage calibration | ✅ skeleton + closed loop on mock data | never run on real MBP-10 |
+| SSL masked-reconstruction (Path B) | ✅ skeleton, off by default | not yet wired into a training run |
+| SSL ablation harness (Path Z) | ✅ `--ablate-ssl` + paired t-test | needs paired fold runs on real data |
+| Sharpe-aware aux loss (Path Y) | ✅ wired into `pretrain_lob`, off by default | needs a pretrain run to confirm convergence |
+| Production runner (Path X) | ✅ skeleton + guards | refuses all actions until a calibrated checkpoint exists |
+| Pipeline hardening (4 fail-fast gates) | ✅ pinning / verifier / dropout / watchdog | active the moment training starts |
+
+**The single remaining blocker is a training run on real data** — that one
+step produces the checkpoint, the ablation deltas, and the loss curves that
+turn every 🟡 above into a 🟢.
+
 ---
 
 ## ⚠️ Known limitations
@@ -667,6 +688,7 @@ tag points to the exact state before any cleanup.
 | [`docs/RESEARCH_SYNTHESIS.md`](docs/RESEARCH_SYNTHESIS.md) | Seven SSL failure mechanisms → fourteen proposed solutions (Western / Chinese / Russian schools) |
 | [`docs/PIPELINE_ISSUES_AUDIT.md`](docs/PIPELINE_ISSUES_AUDIT.md) | Six pipeline failure modes + the code-level mitigation for each |
 | [`docs/PIPELINE_GUIDE.pdf`](docs/PIPELINE_GUIDE.pdf) | Bilingual operational guide (17 pages, EN + AR) |
+| [`docs/VERIFICATION_PIPELINE.pdf`](docs/VERIFICATION_PIPELINE.pdf) | Bilingual walkthrough of every audit + verdict + feedback loop (11 pages, EN + AR) |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release notes |
 | [`AGENTS.md`](AGENTS.md) | Agent runbook (for automation users) |
 
@@ -707,3 +729,22 @@ move forward:
 Each stage is independent — partial completion still produces useful
 artifacts (Stage 1 alone re-validates the 78.3 % baseline; Stage 3 gives
 better embeddings even without the hybrid).
+
+Every stage is now wrapped by fail-fast verification gates so a bad data
+build can't silently consume a GPU:
+
+```bash
+# Stage 1 — build features (auto event-gate audit)
+python prepare_day_trading.py --raw-mbo-dir raw/mbo --output-dir combined/
+
+# Pre-flight — refuse to proceed on FAIL (causality / required / NaN / samples)
+python self_supervised/verify_data_health.py \
+    --features combined/day_trading_features.parquet --output audits/health || exit 1
+
+# Stage 3 — pretrain (auto column-pinning + dropout floor + loss watchdog)
+python self_supervised/pretrain_lob.py --batches combined/ssl/ --output-dir runs/ssl_v1/
+
+# After training — quantify SSL contribution (paired ablation)
+python tools/ssl_ablation_comparison.py \
+    --with-ssl-dir runs/with_ssl --no-ssl-dir runs/no_ssl --output runs/ablation
+```
