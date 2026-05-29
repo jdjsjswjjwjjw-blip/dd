@@ -180,6 +180,17 @@ def run_fold(args) -> dict:
     X_norm = _zscore_fit_apply(X, train_mask)
     emb_norm = _zscore_fit_apply(emb, train_mask)
 
+    # ── SSL Ablation (Path Z) ─────────────────────────────────────────
+    # When --ablate-ssl is set, replace the SSL embeddings with zeros
+    # BEFORE training. The model architecture stays identical (same
+    # ssl_embed_dim) so the only difference is the absence of SSL
+    # information. The delta between paired runs (one ablated, one not)
+    # quantifies the actual contribution of the SSL backbone.
+    ssl_ablated = bool(getattr(args, "ablate_ssl", False))
+    if ssl_ablated:
+        print("   🚨 SSL ABLATED — embeddings zeroed for this fold")
+        emb_norm = np.zeros_like(emb_norm)
+
     # ── Build model ───────────────────────────────────────────────────
     cfg = HybridConfig(
         daytrade_feature_dim=X_norm.shape[1],
@@ -346,6 +357,7 @@ def run_fold(args) -> dict:
             "use_dbmtl": args.use_dbmtl,
             "sharpe_weight": args.sharpe_weight,
             "drop_features_from_audit": getattr(args, "drop_features_from_audit", ""),
+            "ablate_ssl": bool(ssl_ablated),
         },
     }
     if drop_diagnostics is not None:
@@ -440,6 +452,12 @@ def main():
                         "tools/audit_feature_redundancy.py. If given, the "
                         "`drop_list` columns are removed from the feature "
                         "matrix before training.")
+    # ── SSL ablation flag (Path Z — empirical SSL value check) ──────
+    p.add_argument("--ablate-ssl", action="store_true",
+                   help="Zero out the SSL embeddings before training "
+                        "(model architecture unchanged). Pair with a "
+                        "non-ablated run to quantify SSL contribution "
+                        "via tools/ssl_ablation_comparison.py.")
     args = p.parse_args()
     run_fold(args)
 
