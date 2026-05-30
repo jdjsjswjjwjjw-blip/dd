@@ -9,7 +9,7 @@ aware sizing.
 > **Branch:** `claude/task-d-RcDhu`
 > **Baseline tag:** `v1-baseline-pre-cleanup` (commit `c7b88dd`)
 > **Architecture authority:** [`SUBSYSTEMS.md`](SUBSYSTEMS.md)
-> **Tests:** 732 passing + 2 skipped, 0 failures
+> **Tests:** 763 passing + 2 skipped, 0 failures
 
 ---
 
