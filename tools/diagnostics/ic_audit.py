@@ -96,8 +96,17 @@ MIN_IR_MODERATE = 0.30
 MIN_IR_STRONG = 0.50
 FDR_ALPHA = 0.05
 
+# Production-grade hardening thresholds (Option 2)
+LOOKAHEAD_DROP_THRESHOLD = 0.75    # drop > 75% from h=1 to longest horizon
+WALK_FORWARD_MIN_CONSISTENCY = 0.625  # ≥ 5 of 8 windows same-sign
+WARMUP_IC_DROP_THRESHOLD = 0.50    # > 50% drop when warmup excluded
+COST_ADJUSTED_NOISE_THRESHOLD = 0.02
+
 DEFAULT_HORIZONS = (3, 6, 12, 24)        # in bars (15min, 30min, 1h, 2h @ 5min)
 DEFAULT_N_ROLLING_WINDOWS = 8
+DEFAULT_N_WALK_FORWARD = 8
+DEFAULT_WARMUP_BARS = 20
+DEFAULT_COST_PER_SIDE = 0.0          # in same units as returns (e.g., 5e-5 = 0.5 pip)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -105,7 +114,28 @@ DEFAULT_N_ROLLING_WINDOWS = 8
 # ══════════════════════════════════════════════════════════════════════════════
 @dataclass
 class ICResult:
-    """Per (feature × horizon) IC measurement."""
+    """Per (feature × horizon) IC measurement.
+
+    Production-grade fields (Option 2 hardening)
+    ─────────────────────────────────────────────
+    walk_forward_mean/std/consistency: replaces single train/test split
+        with N expanding windows. consistency = fraction of windows
+        whose IC has the same sign as the mean.
+
+    lookahead_score: 0 = clean signal decay across horizons,
+                     > 0 = IC drops suspiciously fast (possible leakage).
+                     Computed at the feature level (not per-horizon).
+                     The same score is broadcast to every horizon row
+                     for the same feature.
+
+    cost_adjusted_spearman: IC where small forward returns
+        (|r| < 2 × cost) have been collapsed to zero — captures only
+        the portion of the signal that survives transaction costs.
+
+    warmup_ic_drop: fractional drop in |IC| when warm-up bars (first N
+        bars after each session break) are excluded. > 0 means the
+        feature was riding warm-up bias.
+    """
     feature: str
     horizon: int
     n_samples: int
@@ -113,12 +143,19 @@ class ICResult:
     spearman_ic: float
     spearman_p: float
     mi_score: float
-    rolling_ir: float          # mean(rolling_ic) / std(rolling_ic)
+    rolling_ir: float
     rolling_mean: float
     rolling_std: float
-    test_spearman: float       # holdout consistency check
-    p_fdr: float               # FDR-adjusted p-value
+    test_spearman: float
+    p_fdr: float
     verdict: str
+    # Option 2: production-grade fields
+    walk_forward_mean: float = 0.0
+    walk_forward_std: float = 0.0
+    walk_forward_consistency: float = 0.0
+    lookahead_score: float = 0.0
+    cost_adjusted_spearman: float = 0.0
+    warmup_ic_drop: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -204,6 +241,158 @@ def _rolling_ic(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Option 2 — Production-grade IC primitives
+# ══════════════════════════════════════════════════════════════════════════════
+def walk_forward_ic(
+    feature: np.ndarray, forward_returns: np.ndarray, n_windows: int = 8,
+) -> tuple[float, float, float, list[float]]:
+    """Expanding-window walk-forward IC.
+
+    For N windows, build N (train_end, test_start, test_end) splits.
+    For each split, compute Spearman IC on the test slice. The test
+    sets are disjoint and forward-only — no test set ever sees data
+    from any later window.
+
+    Returns (wf_mean, wf_std, wf_consistency, individual_ics).
+    wf_consistency = fraction of windows whose IC has the same sign
+                     as the mean. 1.0 = unanimous, 0.5 = random.
+
+    The first 1/N of the data is reserved for the initial training
+    window and is never tested — that's by construction (we need a
+    training history before we can have a test set).
+    """
+    mask = np.isfinite(feature) & np.isfinite(forward_returns)
+    if mask.sum() < n_windows * 200:
+        return float("nan"), float("nan"), float("nan"), []
+    n = len(feature)
+    step = n // n_windows
+    test_ics: list[float] = []
+    for i in range(1, n_windows):
+        test_start = i * step
+        test_end = min(test_start + step, n)
+        if test_end - test_start < 100:
+            continue
+        test_feat = feature[test_start:test_end]
+        test_ret = forward_returns[test_start:test_end]
+        ic, _ = _safe_spearman(test_feat, test_ret)
+        if np.isfinite(ic):
+            test_ics.append(ic)
+    if len(test_ics) < 3:
+        return float("nan"), float("nan"), float("nan"), test_ics
+    arr = np.asarray(test_ics)
+    mean = float(arr.mean())
+    std = float(arr.std(ddof=1))
+    # Consistency: how many windows have the same sign as the mean
+    if abs(mean) <= 1e-9:
+        consistency = 0.5
+    else:
+        same_sign = int((np.sign(arr) == np.sign(mean)).sum())
+        consistency = float(same_sign) / float(len(arr))
+    return mean, std, consistency, test_ics
+
+
+def cost_adjusted_returns(
+    forward_returns: np.ndarray, cost_per_side: float,
+) -> np.ndarray:
+    """Collapse forward returns to zero where |return| ≤ 2 × cost.
+
+    Captures only the portion of the signal that would survive the
+    round-trip transaction cost. A return of 0.0001 with cost 0.00005
+    becomes zero — the trade would have been a wash.
+
+    Pure: returns a NEW array, doesn't mutate input.
+    """
+    if cost_per_side <= 0.0:
+        return forward_returns.copy()
+    threshold = 2.0 * float(cost_per_side)
+    out = forward_returns.copy()
+    small_mask = np.abs(out) <= threshold
+    out[small_mask] = 0.0
+    return out
+
+
+def detect_lookahead(
+    spearman_ics_by_horizon: dict[int, float],
+) -> float:
+    """Return a lookahead score in [0, 1].
+
+    Logic: a clean feature shows smooth IC decay (or rise) across
+    horizons. Leakage typically shows |IC| at the shortest horizon
+    that is much larger than at longer horizons.
+
+    Score formula:
+        ic_short = |IC(h_min)|
+        ic_long  = |IC(h_max)|
+        drop_ratio = (ic_short - ic_long) / max(ic_short, 1e-9)
+        score = max(0, drop_ratio - 0.5)   # 0 unless drop > 50 %
+
+    A score above 0.25 (= drop > 75 %) triggers SUSPICIOUS_LEAKAGE.
+    """
+    if len(spearman_ics_by_horizon) < 2:
+        return 0.0
+    horizons = sorted(spearman_ics_by_horizon.keys())
+    h_min, h_max = horizons[0], horizons[-1]
+    ic_short = abs(spearman_ics_by_horizon[h_min])
+    ic_long = abs(spearman_ics_by_horizon[h_max])
+    # A noise feature has all horizons near 0 — don't flag
+    if ic_short < 0.03:
+        return 0.0
+    drop_ratio = (ic_short - ic_long) / max(ic_short, 1e-9)
+    return float(max(0.0, drop_ratio - 0.5))
+
+
+def compute_warmup_mask(
+    df: pd.DataFrame, n_warmup_bars: int = DEFAULT_WARMUP_BARS,
+    session_break_col: str = "is_session_break",
+) -> np.ndarray:
+    """Return boolean mask True for warm-up bars.
+
+    A bar is warm-up if it is among the first `n_warmup_bars` rows
+    after a session break (or after the start of the dataset).
+    """
+    n = len(df)
+    if n_warmup_bars <= 0:
+        return np.zeros(n, dtype=bool)
+    if session_break_col in df.columns:
+        breaks = df[session_break_col].astype(bool).to_numpy()
+    else:
+        breaks = np.zeros(n, dtype=bool)
+        breaks[0] = True   # treat start of dataset as a break
+
+    warmup = np.zeros(n, dtype=bool)
+    counter = n_warmup_bars   # also warm up the very first bar
+    for i in range(n):
+        if breaks[i]:
+            counter = n_warmup_bars
+        if counter > 0:
+            warmup[i] = True
+            counter -= 1
+    return warmup
+
+
+def warmup_drop_ratio(
+    feature: np.ndarray, forward_returns: np.ndarray,
+    warmup_mask: np.ndarray,
+) -> float:
+    """Fractional drop in |IC| when warm-up bars are excluded.
+
+    Positive value = IC depended on warm-up bars.
+    Returns 0.0 when neither subset has enough samples to compare.
+    """
+    full_ic, _ = _safe_spearman(feature, forward_returns)
+    if not np.isfinite(full_ic) or abs(full_ic) < 1e-9:
+        return 0.0
+    keep = ~warmup_mask
+    if keep.sum() < 1000:
+        return 0.0
+    no_warmup_ic, _ = _safe_spearman(feature[keep], forward_returns[keep])
+    if not np.isfinite(no_warmup_ic):
+        return 0.0
+    drop = (abs(full_ic) - abs(no_warmup_ic)) / max(abs(full_ic), 1e-9)
+    return float(max(0.0, drop))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Forward returns (session-break aware)
 # ══════════════════════════════════════════════════════════════════════════════
 def compute_forward_returns(
@@ -260,7 +449,23 @@ def fdr_correct(pvals: np.ndarray, alpha: float = FDR_ALPHA) -> np.ndarray:
 # ══════════════════════════════════════════════════════════════════════════════
 def classify_verdict(
     spearman_ic: float, mi: float, ir: float, p_fdr: float, n_samples: int,
+    # Option 2 — production-grade fields (all optional, default 0.0 = "not measured")
+    walk_forward_consistency: float = 1.0,
+    lookahead_score: float = 0.0,
+    cost_adjusted_ic: float | None = None,
+    warmup_drop: float = 0.0,
 ) -> str:
+    """Verdict cascade — extended with production-grade checks.
+
+    Order of checks (early returns dominate):
+      NONFINITE             (degenerate input / too few samples)
+      SUSPICIOUS_LEAKAGE    (lookahead_score > threshold — possible cheating)
+      WARMUP_RIDER          (>50% IC drop when warm-up bars excluded)
+      COST_NEGATIVE         (linear signal disappears after costs)
+      UNSTABLE_WALKFORWARD  (signal flips sign across walk-forward windows)
+      NOISE / NONLINEAR_EDGE / WEAK / MODERATE / STRONG / UNSTABLE_STRONG
+                            (original cascade — applies when no red flag fires)
+    """
     if n_samples < MIN_SAMPLES:
         return "NONFINITE"
     if not np.isfinite(spearman_ic):
@@ -268,15 +473,39 @@ def classify_verdict(
 
     abs_ic = abs(spearman_ic)
 
-    # Non-significance → NOISE regardless of magnitude
+    # ── Production-grade red flags (in priority order) ─────────────
+    # Leakage takes precedence — feature MUST be excluded from training
+    if lookahead_score > 0.25:
+        return "SUSPICIOUS_LEAKAGE"
+
+    # Warm-up dependency: the apparent IC came from a degenerate
+    # rolling-window state. Real-world signal vanishes.
+    if warmup_drop > WARMUP_IC_DROP_THRESHOLD and abs_ic > NOISE_THRESHOLD:
+        return "WARMUP_RIDER"
+
+    # Cost-adjusted check — only when the user supplied a non-zero
+    # cost. Otherwise this branch is skipped (cost_adjusted_ic=None).
+    if (
+        cost_adjusted_ic is not None
+        and abs_ic > WEAK_THRESHOLD
+        and abs(cost_adjusted_ic) < COST_ADJUSTED_NOISE_THRESHOLD
+    ):
+        return "COST_NEGATIVE"
+
+    # Walk-forward consistency — only enforced when measurement available
+    if (
+        walk_forward_consistency < WALK_FORWARD_MIN_CONSISTENCY
+        and abs_ic > WEAK_THRESHOLD
+    ):
+        return "UNSTABLE_WALKFORWARD"
+
+    # ── Original cascade ───────────────────────────────────────────
     if np.isfinite(p_fdr) and p_fdr > FDR_ALPHA:
-        # But check if MI catches what Spearman missed (non-linear)
         if np.isfinite(mi) and mi > MI_NONLINEAR_THRESHOLD:
             return "NONLINEAR_EDGE"
         return "NOISE"
 
     if abs_ic < NOISE_THRESHOLD:
-        # Low linear correlation — check non-linear
         if np.isfinite(mi) and mi > MI_NONLINEAR_THRESHOLD:
             return "NONLINEAR_EDGE"
         return "NOISE"
@@ -284,13 +513,11 @@ def classify_verdict(
     if abs_ic < WEAK_THRESHOLD:
         return "WEAK"
 
-    # Stronger signals require IR check
     if abs_ic >= STRONG_THRESHOLD:
         if np.isfinite(ir) and abs(ir) >= MIN_IR_STRONG:
             return "STRONG"
         return "UNSTABLE_STRONG"
 
-    # 0.05 ≤ |ic| < 0.10
     if np.isfinite(ir) and abs(ir) >= MIN_IR_MODERATE:
         return "MODERATE"
     return "UNSTABLE_STRONG"
@@ -307,8 +534,17 @@ def compute_ic_one_feature(
     name: str,
     horizon: int,
     n_rolling: int = DEFAULT_N_ROLLING_WINDOWS,
+    # Option 2 production-grade additions (all optional)
+    warmup_mask: np.ndarray | None = None,
+    cost_per_side: float = 0.0,
+    n_walk_forward: int = 0,        # 0 = disabled
 ) -> ICResult:
-    """Computes the full ICResult for one feature × horizon pair."""
+    """Computes the full ICResult for one feature × horizon pair.
+
+    With Option 2 enabled (warmup_mask / cost_per_side / n_walk_forward),
+    populates walk_forward_*, cost_adjusted_spearman, and warmup_ic_drop.
+    The lookahead_score is filled in later at the feature level (after
+    all horizons for the same feature have been computed)."""
     # Train slice — primary measurement
     x_tr = feature[train_mask]
     y_tr = forward_returns[train_mask]
@@ -325,6 +561,29 @@ def compute_ic_one_feature(
     y_te = forward_returns[test_mask]
     test_sp, _ = _safe_spearman(x_te, y_te)
 
+    # ── Walk-forward IC (full series, not train-only) ────────────
+    if n_walk_forward > 0:
+        wf_mean, wf_std, wf_cons, _ = walk_forward_ic(
+            feature, forward_returns, n_windows=n_walk_forward,
+        )
+    else:
+        wf_mean = wf_std = wf_cons = 0.0
+
+    # ── Cost-adjusted IC (on train slice) ────────────────────────
+    if cost_per_side > 0.0:
+        cost_returns = cost_adjusted_returns(y_tr, cost_per_side)
+        cost_ic, _ = _safe_spearman(x_tr, cost_returns)
+        cost_adj = float(cost_ic) if np.isfinite(cost_ic) else 0.0
+    else:
+        cost_adj = 0.0
+
+    # ── Warm-up dependency check ─────────────────────────────────
+    if warmup_mask is not None:
+        wm_tr = warmup_mask[train_mask]
+        wu_drop = warmup_drop_ratio(x_tr, y_tr, wm_tr)
+    else:
+        wu_drop = 0.0
+
     return ICResult(
         feature=name, horizon=int(horizon),
         n_samples=n_tr,
@@ -336,8 +595,16 @@ def compute_ic_one_feature(
         rolling_mean=mean_ic if np.isfinite(mean_ic) else 0.0,
         rolling_std=std_ic if np.isfinite(std_ic) else 0.0,
         test_spearman=test_sp if np.isfinite(test_sp) else 0.0,
-        p_fdr=float("nan"),       # filled in after FDR correction
-        verdict="NONFINITE",      # filled in after FDR correction
+        p_fdr=float("nan"),
+        verdict="NONFINITE",
+        walk_forward_mean=wf_mean if np.isfinite(wf_mean) else 0.0,
+        walk_forward_std=wf_std if np.isfinite(wf_std) else 0.0,
+        walk_forward_consistency=(
+            wf_cons if np.isfinite(wf_cons) else 0.0
+        ),
+        lookahead_score=0.0,    # filled in at the feature level
+        cost_adjusted_spearman=cost_adj,
+        warmup_ic_drop=wu_drop,
     )
 
 
@@ -389,8 +656,29 @@ def run_ic_audit(
     feature_cols: Optional[list[str]] = None,
     close_col: str = "close",
     session_break_col: str = "is_session_break",
+    # Option 2 — production-grade hardening
+    n_walk_forward: int = 0,           # 0 = disabled (Option 1 behaviour)
+    cost_per_side: float = 0.0,
+    exclude_warmup: bool = False,
+    warmup_bars: int = DEFAULT_WARMUP_BARS,
 ) -> tuple[pd.DataFrame, dict]:
-    """Run the full IC audit. Returns (results_df, summary_dict)."""
+    """Run the full IC audit. Returns (results_df, summary_dict).
+
+    Production hardening (Option 2)
+    ──────────────────────────────
+    n_walk_forward    > 0 enables expanding-window IC across N test
+                      windows. Adds walk_forward_* fields + can trigger
+                      UNSTABLE_WALKFORWARD verdict.
+    cost_per_side     > 0 enables cost-adjusted IC. Adds
+                      cost_adjusted_spearman field + can trigger
+                      COST_NEGATIVE verdict (large naive IC, cost-
+                      adjusted IC near zero).
+    exclude_warmup    True enables warm-up dependency check. Adds
+                      warmup_ic_drop field + can trigger WARMUP_RIDER
+                      verdict. The warm-up bars are NOT removed from
+                      the training data — only the dependency is
+                      measured.
+    """
     if close_col not in df.columns:
         raise ValueError(f"close column {close_col!r} missing from features parquet")
 
@@ -417,6 +705,13 @@ def run_ic_audit(
         df[close_col], horizons, session_breaks=session_breaks,
     )
 
+    # Warm-up mask (Option 2) — computed once, reused across horizons
+    warmup_mask_arr = (
+        compute_warmup_mask(df, n_warmup_bars=warmup_bars,
+                            session_break_col=session_break_col)
+        if exclude_warmup else None
+    )
+
     # Compute IC for every (feature, horizon)
     results: list[ICResult] = []
     for h in horizons:
@@ -427,8 +722,21 @@ def run_ic_audit(
                 feature=x, forward_returns=ret,
                 train_mask=train_mask, test_mask=test_mask,
                 name=col, horizon=h, n_rolling=n_rolling,
+                warmup_mask=warmup_mask_arr,
+                cost_per_side=cost_per_side,
+                n_walk_forward=n_walk_forward,
             )
             results.append(r)
+
+    # Option 2: compute lookahead_score per feature (uses ICs across horizons)
+    by_feature: dict[str, list[ICResult]] = {}
+    for r in results:
+        by_feature.setdefault(r.feature, []).append(r)
+    for feat, items in by_feature.items():
+        ic_by_h = {it.horizon: it.spearman_ic for it in items}
+        score = detect_lookahead(ic_by_h)
+        for it in items:
+            it.lookahead_score = score
 
     # FDR correction per horizon (multiple-testing burden is per horizon)
     by_horizon: dict[int, list[ICResult]] = {}
@@ -443,6 +751,15 @@ def run_ic_audit(
                 spearman_ic=it.spearman_ic, mi=it.mi_score,
                 ir=it.rolling_ir, p_fdr=it.p_fdr,
                 n_samples=it.n_samples,
+                # Option 2 fields — None/0.0 = "not measured" → branches skipped
+                walk_forward_consistency=(
+                    it.walk_forward_consistency if n_walk_forward > 0 else 1.0
+                ),
+                lookahead_score=it.lookahead_score,
+                cost_adjusted_ic=(
+                    it.cost_adjusted_spearman if cost_per_side > 0 else None
+                ),
+                warmup_drop=it.warmup_ic_drop if exclude_warmup else 0.0,
             )
 
     # Build DataFrame
@@ -464,6 +781,13 @@ def run_ic_audit(
         "n_test": int(test_mask.sum()),
         "verdict_counts": {str(k): int(v) for k, v in verdict_counts.items()},
         "n_sklearn_ok": int(_SKLEARN_OK),
+        # Option 2 production-grade params actually used
+        "option2": {
+            "n_walk_forward": int(n_walk_forward),
+            "cost_per_side": float(cost_per_side),
+            "exclude_warmup": bool(exclude_warmup),
+            "warmup_bars": int(warmup_bars),
+        },
     }
     return results_df, summary
 
@@ -571,6 +895,23 @@ def main() -> int:
                    help="Also compute IC × regime breakdown")
     p.add_argument("--per-session", action="store_true",
                    help="Also compute IC × session breakdown (london/ny/overlap)")
+    # Option 2 — production-grade flags
+    p.add_argument("--walk-forward", type=int, default=0,
+                   help="Number of expanding walk-forward windows. "
+                        "0 = disabled (Option 1 behaviour). "
+                        "Typical production value: 8.")
+    p.add_argument("--cost-per-side", type=float, default=0.0,
+                   help="Transaction cost per side in return units "
+                        "(e.g., 5e-5 for 0.5 pip on a $1.30 instrument). "
+                        "0 = no cost adjustment.")
+    p.add_argument("--exclude-warmup", action="store_true",
+                   help="Measure IC dependency on warm-up bars (first "
+                        "N bars after each session break). Adds a "
+                        "warmup_ic_drop column + can trigger "
+                        "WARMUP_RIDER verdict.")
+    p.add_argument("--warmup-bars", type=int, default=DEFAULT_WARMUP_BARS,
+                   help=f"Warm-up window size in bars "
+                        f"(default {DEFAULT_WARMUP_BARS}).")
     args = p.parse_args()
 
     print(f"loading {args.features}")
@@ -581,6 +922,10 @@ def main() -> int:
     results_df, summary = run_ic_audit(
         df, horizons=tuple(args.horizons),
         train_end=train_end, n_rolling=args.n_rolling_windows,
+        n_walk_forward=args.walk_forward,
+        cost_per_side=args.cost_per_side,
+        exclude_warmup=args.exclude_warmup,
+        warmup_bars=args.warmup_bars,
     )
 
     args.output.mkdir(parents=True, exist_ok=True)

@@ -23,17 +23,26 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from tools.diagnostics.ic_audit import (
+    DEFAULT_WARMUP_BARS,
     FDR_ALPHA,
+    LOOKAHEAD_DROP_THRESHOLD,
     MI_NONLINEAR_THRESHOLD,
     MIN_IR_STRONG,
     NOISE_THRESHOLD,
     STRONG_THRESHOLD,
+    WALK_FORWARD_MIN_CONSISTENCY,
+    WARMUP_IC_DROP_THRESHOLD,
     WEAK_THRESHOLD,
     classify_verdict,
     compute_forward_returns,
+    compute_warmup_mask,
+    cost_adjusted_returns,
+    detect_lookahead,
     fdr_correct,
     run_ic_audit,
     top_features,
+    walk_forward_ic,
+    warmup_drop_ratio,
     _rolling_ic,
     _safe_mi,
     _safe_pearson,
@@ -245,6 +254,209 @@ class TestVerdict:
             spearman_ic=-0.15, mi=0.01, ir=-0.8, p_fdr=0.001, n_samples=5000,
         )
         assert v == "STRONG"
+
+
+# ════════════════════════════════════════════════════════════════════
+# Option 2 — Production-grade primitives
+# ════════════════════════════════════════════════════════════════════
+class TestWalkForwardIC:
+    def test_stable_signal_high_consistency(self):
+        rng = np.random.RandomState(0)
+        n = 10_000
+        x = rng.randn(n)
+        # Persistent positive correlation across the whole series
+        y = 0.5 * x + 0.5 * rng.randn(n)
+        mean, std, consistency, ics = walk_forward_ic(x, y, n_windows=8)
+        assert mean > 0.3
+        assert consistency >= 0.85  # nearly all windows positive
+
+    def test_flipping_signal_low_consistency(self):
+        rng = np.random.RandomState(0)
+        n = 8_000
+        x = rng.randn(n)
+        # First half positive correlation, second half negative
+        y = np.concatenate([0.5 * x[:n//2] + 0.5 * rng.randn(n//2),
+                            -0.5 * x[n//2:] + 0.5 * rng.randn(n//2)])
+        mean, std, consistency, ics = walk_forward_ic(x, y, n_windows=8)
+        # Some windows positive, some negative → consistency low
+        assert consistency < 0.85
+
+    def test_too_few_samples_returns_nan(self):
+        x = np.random.randn(100)
+        y = np.random.randn(100)
+        mean, std, _, ics = walk_forward_ic(x, y, n_windows=8)
+        assert np.isnan(mean)
+        assert ics == []
+
+
+class TestCostAdjustedReturns:
+    def test_zero_cost_passes_through(self):
+        r = np.array([0.001, -0.002, 0.0005, -0.0001])
+        adj = cost_adjusted_returns(r, cost_per_side=0.0)
+        assert np.allclose(adj, r)
+
+    def test_small_returns_collapsed(self):
+        # cost = 0.0005 → threshold = 0.001
+        r = np.array([0.0005, -0.0005, 0.002, -0.002])
+        adj = cost_adjusted_returns(r, cost_per_side=0.0005)
+        # |0.0005| ≤ 0.001 → 0
+        # |0.002|  > 0.001 → preserved
+        assert adj[0] == 0.0
+        assert adj[1] == 0.0
+        assert adj[2] == 0.002
+        assert adj[3] == -0.002
+
+    def test_input_not_mutated(self):
+        r = np.array([0.001, -0.002])
+        r_ref = r.copy()
+        _ = cost_adjusted_returns(r, cost_per_side=0.0005)
+        assert np.array_equal(r, r_ref)
+
+
+class TestDetectLookahead:
+    def test_clean_smooth_decay_no_flag(self):
+        # IC decays gently: 0.06 → 0.05 → 0.04 → 0.03
+        ics = {1: 0.06, 6: 0.05, 12: 0.04, 24: 0.03}
+        score = detect_lookahead(ics)
+        assert score == 0.0   # drop ratio = (0.06-0.03)/0.06 = 0.5 → not > 0.5
+
+    def test_suspicious_collapse_flagged(self):
+        # IC at h=1 is 0.15, drops to 0.005 at h=24 → 96.7% drop
+        ics = {1: 0.15, 6: 0.08, 12: 0.03, 24: 0.005}
+        score = detect_lookahead(ics)
+        assert score > 0.4   # 0.967 - 0.5 = 0.467
+
+    def test_noise_feature_not_flagged(self):
+        # All IC values are small — drop is large in % but not flagged
+        # because ic_short < 0.03 (the noise floor)
+        ics = {1: 0.020, 24: 0.001}
+        score = detect_lookahead(ics)
+        assert score == 0.0
+
+    def test_single_horizon_returns_zero(self):
+        assert detect_lookahead({1: 0.10}) == 0.0
+
+
+class TestWarmupMask:
+    def test_no_breaks_marks_only_dataset_start(self):
+        df = pd.DataFrame({"close": np.arange(100, dtype=float)})
+        mask = compute_warmup_mask(df, n_warmup_bars=10)
+        # First 10 bars warm-up, rest are post-warmup
+        assert mask[:10].all()
+        assert not mask[10:].any()
+
+    def test_session_break_resets_warmup(self):
+        n = 100
+        breaks = np.zeros(n, dtype=int)
+        breaks[50] = 1   # break at index 50
+        df = pd.DataFrame({
+            "close": np.arange(n, dtype=float),
+            "is_session_break": breaks,
+        })
+        mask = compute_warmup_mask(df, n_warmup_bars=10)
+        # First 10 + 10 after break (50..59) = warm-up
+        assert mask[0:10].all()
+        assert not mask[10:50].any()
+        assert mask[50:60].all()
+        assert not mask[60:].any()
+
+    def test_zero_warmup_returns_all_false(self):
+        df = pd.DataFrame({"close": np.arange(50, dtype=float)})
+        mask = compute_warmup_mask(df, n_warmup_bars=0)
+        assert not mask.any()
+
+
+class TestWarmupDropRatio:
+    def test_feature_independent_of_warmup_no_drop(self):
+        rng = np.random.RandomState(0)
+        n = 3_000
+        x = rng.randn(n)
+        y = 0.5 * x + 0.5 * rng.randn(n)
+        warmup = np.zeros(n, dtype=bool)
+        warmup[:100] = True   # 100 warm-up bars
+        drop = warmup_drop_ratio(x, y, warmup)
+        # IC barely changes when 100 of 3000 bars removed
+        assert drop < 0.20
+
+    def test_warmup_driven_ic_high_drop(self):
+        rng = np.random.RandomState(0)
+        n = 3_000
+        # x = noise everywhere
+        x = rng.randn(n)
+        # y = correlated with x ONLY in warm-up region; pure noise elsewhere
+        y = rng.randn(n) * 0.3
+        y[:300] = x[:300]  # strong signal in first 300
+        warmup = np.zeros(n, dtype=bool)
+        warmup[:300] = True
+        drop = warmup_drop_ratio(x, y, warmup)
+        # Full IC has signal from warm-up; non-warmup IC has none → big drop
+        assert drop > 0.50
+
+
+# ════════════════════════════════════════════════════════════════════
+# Option 2 — Extended verdict cascade
+# ════════════════════════════════════════════════════════════════════
+class TestExtendedVerdict:
+    def test_lookahead_dominates(self):
+        # Strong-looking IC, but lookahead_score above threshold
+        v = classify_verdict(
+            spearman_ic=0.20, mi=0.01, ir=2.0, p_fdr=0.001,
+            n_samples=5000,
+            lookahead_score=0.40,  # > 0.25 threshold
+        )
+        assert v == "SUSPICIOUS_LEAKAGE"
+
+    def test_warmup_rider_above_noise(self):
+        v = classify_verdict(
+            spearman_ic=0.08, mi=0.01, ir=0.5, p_fdr=0.001,
+            n_samples=5000,
+            warmup_drop=0.60,   # > 0.50 threshold
+        )
+        assert v == "WARMUP_RIDER"
+
+    def test_warmup_drop_below_threshold_passes(self):
+        v = classify_verdict(
+            spearman_ic=0.08, mi=0.01, ir=0.5, p_fdr=0.001,
+            n_samples=5000,
+            warmup_drop=0.30,
+        )
+        assert v in {"MODERATE", "UNSTABLE_STRONG"}
+
+    def test_cost_negative_when_naive_ic_disappears(self):
+        v = classify_verdict(
+            spearman_ic=0.08, mi=0.01, ir=0.5, p_fdr=0.001,
+            n_samples=5000,
+            cost_adjusted_ic=0.005,   # below COST threshold (0.02)
+        )
+        assert v == "COST_NEGATIVE"
+
+    def test_cost_not_supplied_skips_check(self):
+        # cost_adjusted_ic=None → branch skipped
+        v = classify_verdict(
+            spearman_ic=0.08, mi=0.01, ir=0.5, p_fdr=0.001,
+            n_samples=5000,
+            cost_adjusted_ic=None,
+        )
+        assert v != "COST_NEGATIVE"
+
+    def test_unstable_walkforward_triggers(self):
+        v = classify_verdict(
+            spearman_ic=0.08, mi=0.01, ir=0.5, p_fdr=0.001,
+            n_samples=5000,
+            walk_forward_consistency=0.50,   # < 0.625 threshold
+        )
+        assert v == "UNSTABLE_WALKFORWARD"
+
+    def test_leakage_check_before_others(self):
+        # Both lookahead AND warmup AND cost flagged → leakage wins
+        v = classify_verdict(
+            spearman_ic=0.15, mi=0.01, ir=1.0, p_fdr=0.001,
+            n_samples=5000,
+            lookahead_score=0.50,
+            warmup_drop=0.80,
+            cost_adjusted_ic=0.001,
+        )
+        assert v == "SUSPICIOUS_LEAKAGE"
 
 
 # ════════════════════════════════════════════════════════════════════
