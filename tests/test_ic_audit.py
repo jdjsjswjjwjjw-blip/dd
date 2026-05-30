@@ -25,6 +25,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from tools.diagnostics.ic_audit import (
     DEFAULT_WARMUP_BARS,
     FDR_ALPHA,
+    GATE_KILLS_SIGNAL_THRESHOLD,
     LOOKAHEAD_DROP_THRESHOLD,
     MI_NONLINEAR_THRESHOLD,
     MIN_IR_STRONG,
@@ -39,6 +40,7 @@ from tools.diagnostics.ic_audit import (
     cost_adjusted_returns,
     detect_lookahead,
     fdr_correct,
+    per_event_status_ic,
     run_ic_audit,
     top_features,
     walk_forward_ic,
@@ -457,6 +459,136 @@ class TestExtendedVerdict:
             cost_adjusted_ic=0.001,
         )
         assert v == "SUSPICIOUS_LEAKAGE"
+
+
+# ════════════════════════════════════════════════════════════════════
+# Per-event-status IC (NEUTRAL diagnostic)
+# ════════════════════════════════════════════════════════════════════
+class TestPerEventStatusIC:
+    def test_signal_only_on_event_bars(self):
+        """When signal exists ONLY on event bars, gate_kill_ratio ≈ 0
+        (gate is properly filtering)."""
+        rng = np.random.RandomState(0)
+        n = 4_000
+        x = rng.randn(n)
+        # event mask: 30% of bars are events
+        event_mask = (rng.rand(n) < 0.30).astype(bool)
+        y = np.where(
+            event_mask, 0.7 * x + 0.3 * rng.randn(n),
+            rng.randn(n) * 0.5,
+        )
+        ic_ev, ic_nonev, ratio = per_event_status_ic(x, y, event_mask)
+        assert abs(ic_ev) > 0.30
+        assert abs(ic_nonev) < 0.10
+        assert ratio < 0.5   # gate is justified
+
+    def test_signal_on_both_event_and_non_event(self):
+        """When non-event bars carry comparable signal, gate is wrong."""
+        rng = np.random.RandomState(0)
+        n = 4_000
+        x = rng.randn(n)
+        # signal everywhere
+        y = 0.5 * x + 0.3 * rng.randn(n)
+        event_mask = (rng.rand(n) < 0.30).astype(bool)
+        ic_ev, ic_nonev, ratio = per_event_status_ic(x, y, event_mask)
+        assert abs(ic_ev) > 0.20
+        assert abs(ic_nonev) > 0.20
+        # Ratio close to 1 → gate is killing signal
+        assert ratio > 0.7
+
+    def test_too_few_event_bars_returns_nan(self):
+        rng = np.random.RandomState(0)
+        n = 1_000
+        x = rng.randn(n)
+        y = rng.randn(n)
+        event_mask = np.zeros(n, dtype=bool)
+        event_mask[:10] = True   # only 10 event bars
+        ic_ev, ic_nonev, ratio = per_event_status_ic(x, y, event_mask)
+        assert np.isnan(ic_ev) or np.isnan(ratio)
+
+    def test_noise_event_ic_returns_zero_ratio(self):
+        """When event-bar IC is itself noise, ratio is uninformative
+        (returns 0 to indicate 'gate-kill question doesn't apply')."""
+        rng = np.random.RandomState(0)
+        n = 4_000
+        x = rng.randn(n)
+        y = rng.randn(n)  # pure noise
+        event_mask = (rng.rand(n) < 0.30).astype(bool)
+        ic_ev, ic_nonev, ratio = per_event_status_ic(x, y, event_mask)
+        # event IC will be < 0.03 → ratio collapses to 0
+        if abs(ic_ev) < 0.03:
+            assert ratio == 0.0
+
+
+class TestPerEventStatusIntegration:
+    def _synthetic_with_event_col(self, gate_kills_signal: bool) -> pd.DataFrame:
+        rng = np.random.RandomState(0)
+        n = 5_000
+        # Simulate a feature with signal
+        raw_ret = rng.randn(n) * 0.001
+        close = 100 * np.exp(np.cumsum(raw_ret))
+        future_ret = np.zeros(n)
+        future_ret[:-1] = (close[1:] - close[:-1]) / close[:-1]
+
+        # 30% bars are events
+        event_mask = (rng.rand(n) < 0.30).astype(np.int8)
+
+        if gate_kills_signal:
+            # Signal everywhere → gate kills good non-event bars
+            signal = future_ret + 0.5 * rng.randn(n) * 0.001
+        else:
+            # Signal only on event bars
+            signal = np.where(
+                event_mask.astype(bool),
+                future_ret + 0.3 * rng.randn(n) * 0.001,
+                rng.randn(n) * 0.001,
+            )
+
+        return pd.DataFrame({
+            "ts_event": pd.date_range("2024-01-01", periods=n, freq="5min"),
+            "close": close,
+            "signal_feat": signal,
+            "regime_label": "trending",
+            "is_event": event_mask,
+            "is_session_break": np.zeros(n, dtype=int),
+        })
+
+    def test_gate_kills_signal_verdict(self):
+        df = self._synthetic_with_event_col(gate_kills_signal=True)
+        results, summary = run_ic_audit(
+            df, horizons=(1, 3),
+            per_event_status=True,
+        )
+        # The signal_feat should have comparable IC on both subsets
+        signal_rows = results[results["feature"] == "signal_feat"]
+        assert (signal_rows["gate_kill_ratio"] > 0.5).any()
+
+    def test_gate_properly_filtering_verdict(self):
+        df = self._synthetic_with_event_col(gate_kills_signal=False)
+        results, summary = run_ic_audit(
+            df, horizons=(1, 3),
+            per_event_status=True,
+        )
+        # signal_feat has signal only on event bars → ratio low
+        signal_rows = results[results["feature"] == "signal_feat"]
+        assert (signal_rows["gate_kill_ratio"] < 0.7).all()
+
+    def test_missing_event_column_raises(self):
+        df = pd.DataFrame({
+            "ts_event": pd.date_range("2024-01-01", periods=2000, freq="5min"),
+            "close": np.arange(2000.0),
+            "feat_a": np.random.randn(2000),
+        })
+        with pytest.raises(ValueError, match="is_event"):
+            run_ic_audit(df, horizons=(1,), per_event_status=True)
+
+    def test_disabled_per_event_skips_computation(self):
+        df = self._synthetic_with_event_col(gate_kills_signal=True)
+        results, summary = run_ic_audit(df, horizons=(1,))
+        # No per-event fields populated (defaults to 0)
+        assert (results["ic_event_bars"] == 0.0).all()
+        assert (results["gate_kill_ratio"] == 0.0).all()
+        assert "gate_diagnostic" not in summary
 
 
 # ════════════════════════════════════════════════════════════════════

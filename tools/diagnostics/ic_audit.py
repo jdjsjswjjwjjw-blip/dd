@@ -102,6 +102,11 @@ WALK_FORWARD_MIN_CONSISTENCY = 0.625  # ≥ 5 of 8 windows same-sign
 WARMUP_IC_DROP_THRESHOLD = 0.50    # > 50% drop when warmup excluded
 COST_ADJUSTED_NOISE_THRESHOLD = 0.02
 
+# Per-event-status thresholds (NEUTRAL diagnostic)
+# gate_kill_ratio = |IC on non-event bars| / |IC on event bars|
+GATE_KILLS_SIGNAL_THRESHOLD = 0.50   # ratio ≥ 0.5 → gate kills real signal
+GATE_KILLS_SIGNAL_MIN_IC = 0.03      # only meaningful when event-IC > floor
+
 DEFAULT_HORIZONS = (3, 6, 12, 24)        # in bars (15min, 30min, 1h, 2h @ 5min)
 DEFAULT_N_ROLLING_WINDOWS = 8
 DEFAULT_N_WALK_FORWARD = 8
@@ -135,6 +140,17 @@ class ICResult:
     warmup_ic_drop: fractional drop in |IC| when warm-up bars (first N
         bars after each session break) are excluded. > 0 means the
         feature was riding warm-up bias.
+
+    ic_event_bars / ic_non_event_bars / gate_kill_ratio:
+        Per-event-status IC breakdown. Measures whether the
+        prepare_day_trading event gate is throwing away bars that
+        actually contained signal.
+
+        gate_kill_ratio = |ic_non_event| / |ic_event|
+          ≈ 1.0  → non-event bars carry the same edge → gate is wrong
+          ≈ 0    → non-event bars are signal-free   → gate is justified
+          NaN    → is_event column not in parquet OR one subset too
+                   small to compute
     """
     feature: str
     horizon: int
@@ -156,6 +172,10 @@ class ICResult:
     lookahead_score: float = 0.0
     cost_adjusted_spearman: float = 0.0
     warmup_ic_drop: float = 0.0
+    # Per-event-status breakdown (NEUTRAL diagnostic)
+    ic_event_bars: float = 0.0
+    ic_non_event_bars: float = 0.0
+    gate_kill_ratio: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -370,6 +390,41 @@ def compute_warmup_mask(
     return warmup
 
 
+def per_event_status_ic(
+    feature: np.ndarray, forward_returns: np.ndarray,
+    event_mask: np.ndarray, min_samples: int = 500,
+) -> tuple[float, float, float]:
+    """Spearman IC computed separately on event vs non-event bars.
+
+    Returns (ic_event, ic_non_event, gate_kill_ratio).
+      gate_kill_ratio = |ic_non_event| / |ic_event| when event-IC
+                        clears the noise floor; 0 when event-IC is
+                        itself noise (ratio would be meaningless).
+
+    Pure: no side effects.
+
+    Why this matters for the NEUTRAL problem:
+      If non-event bars carry comparable signal to event bars, the
+      event gate is killing real labeling opportunities — exactly the
+      hypothesis the empirical 80%-vs-40% NEUTRAL gap suggests.
+    """
+    event_mask = event_mask.astype(bool)
+    finite = np.isfinite(feature) & np.isfinite(forward_returns)
+    ev_keep = event_mask & finite
+    nonev_keep = (~event_mask) & finite
+    if ev_keep.sum() < min_samples or nonev_keep.sum() < min_samples:
+        return float("nan"), float("nan"), float("nan")
+    ic_ev, _ = _safe_spearman(feature[ev_keep], forward_returns[ev_keep])
+    ic_nonev, _ = _safe_spearman(feature[nonev_keep], forward_returns[nonev_keep])
+    if not (np.isfinite(ic_ev) and np.isfinite(ic_nonev)):
+        return float(ic_ev), float(ic_nonev), float("nan")
+    if abs(ic_ev) < GATE_KILLS_SIGNAL_MIN_IC:
+        # event-side is itself near-noise → ratio is uninformative
+        return float(ic_ev), float(ic_nonev), 0.0
+    ratio = abs(ic_nonev) / abs(ic_ev)
+    return float(ic_ev), float(ic_nonev), float(ratio)
+
+
 def warmup_drop_ratio(
     feature: np.ndarray, forward_returns: np.ndarray,
     warmup_mask: np.ndarray,
@@ -538,6 +593,7 @@ def compute_ic_one_feature(
     warmup_mask: np.ndarray | None = None,
     cost_per_side: float = 0.0,
     n_walk_forward: int = 0,        # 0 = disabled
+    event_mask: np.ndarray | None = None,
 ) -> ICResult:
     """Computes the full ICResult for one feature × horizon pair.
 
@@ -584,6 +640,16 @@ def compute_ic_one_feature(
     else:
         wu_drop = 0.0
 
+    # ── Per-event-status IC (NEUTRAL diagnostic) ─────────────────
+    if event_mask is not None:
+        em_tr = event_mask[train_mask]
+        ic_ev, ic_nonev, kill_ratio = per_event_status_ic(x_tr, y_tr, em_tr)
+        ic_ev = ic_ev if np.isfinite(ic_ev) else 0.0
+        ic_nonev = ic_nonev if np.isfinite(ic_nonev) else 0.0
+        kill_ratio = kill_ratio if np.isfinite(kill_ratio) else 0.0
+    else:
+        ic_ev = ic_nonev = kill_ratio = 0.0
+
     return ICResult(
         feature=name, horizon=int(horizon),
         n_samples=n_tr,
@@ -605,6 +671,9 @@ def compute_ic_one_feature(
         lookahead_score=0.0,    # filled in at the feature level
         cost_adjusted_spearman=cost_adj,
         warmup_ic_drop=wu_drop,
+        ic_event_bars=float(ic_ev),
+        ic_non_event_bars=float(ic_nonev),
+        gate_kill_ratio=float(kill_ratio),
     )
 
 
@@ -661,6 +730,8 @@ def run_ic_audit(
     cost_per_side: float = 0.0,
     exclude_warmup: bool = False,
     warmup_bars: int = DEFAULT_WARMUP_BARS,
+    per_event_status: bool = False,
+    event_col: str = "is_event",
 ) -> tuple[pd.DataFrame, dict]:
     """Run the full IC audit. Returns (results_df, summary_dict).
 
@@ -712,6 +783,19 @@ def run_ic_audit(
         if exclude_warmup else None
     )
 
+    # Per-event-status mask (NEUTRAL diagnostic)
+    event_mask_arr: np.ndarray | None = None
+    if per_event_status:
+        if event_col not in df.columns:
+            raise ValueError(
+                f"per-event-status requires '{event_col}' column "
+                f"in features parquet"
+            )
+        event_mask_arr = (
+            pd.to_numeric(df[event_col], errors="coerce")
+            .fillna(0).astype(bool).to_numpy()
+        )
+
     # Compute IC for every (feature, horizon)
     results: list[ICResult] = []
     for h in horizons:
@@ -725,6 +809,7 @@ def run_ic_audit(
                 warmup_mask=warmup_mask_arr,
                 cost_per_side=cost_per_side,
                 n_walk_forward=n_walk_forward,
+                event_mask=event_mask_arr,
             )
             results.append(r)
 
@@ -787,8 +872,42 @@ def run_ic_audit(
             "cost_per_side": float(cost_per_side),
             "exclude_warmup": bool(exclude_warmup),
             "warmup_bars": int(warmup_bars),
+            "per_event_status": bool(per_event_status),
         },
     }
+
+    # Per-event-status aggregate diagnostic (NEUTRAL hypothesis test)
+    if per_event_status and not results_df.empty:
+        # Features where event-bar IC clears the noise floor
+        useful = results_df[
+            results_df["ic_event_bars"].abs() >= GATE_KILLS_SIGNAL_MIN_IC
+        ]
+        if len(useful) >= 5:
+            mean_kill_ratio = float(useful["gate_kill_ratio"].mean())
+            n_above_threshold = int(
+                (useful["gate_kill_ratio"] >= GATE_KILLS_SIGNAL_THRESHOLD).sum()
+            )
+            frac_above = n_above_threshold / len(useful)
+            if frac_above >= 0.50:
+                gate_verdict = "GATE_KILLS_SIGNAL"
+            elif frac_above >= 0.25:
+                gate_verdict = "GATE_PARTIALLY_JUSTIFIED"
+            else:
+                gate_verdict = "GATE_PROPERLY_FILTERING"
+            summary["gate_diagnostic"] = {
+                "verdict": gate_verdict,
+                "mean_gate_kill_ratio": mean_kill_ratio,
+                "n_features_kept_signal": n_above_threshold,
+                "n_useful_features": int(len(useful)),
+                "frac_kept_signal": float(frac_above),
+                "threshold": float(GATE_KILLS_SIGNAL_THRESHOLD),
+            }
+        else:
+            summary["gate_diagnostic"] = {
+                "verdict": "INSUFFICIENT_SIGNAL_FEATURES",
+                "n_useful_features": int(len(useful)),
+            }
+
     return results_df, summary
 
 
@@ -872,6 +991,25 @@ def write_report(
                 f"{r['verdict']:<18}"
             )
 
+    # Gate diagnostic (per-event-status verdict)
+    if "gate_diagnostic" in summary:
+        gd = summary["gate_diagnostic"]
+        lines.append("")
+        lines.append("Event-gate diagnostic (NEUTRAL hypothesis test):")
+        lines.append(f"  Verdict        : {gd['verdict']}")
+        if "mean_gate_kill_ratio" in gd:
+            lines.append(
+                f"  Mean kill ratio: {gd['mean_gate_kill_ratio']:.3f}"
+            )
+            lines.append(
+                f"  Features kept signal on non-event bars: "
+                f"{gd['n_features_kept_signal']}/{gd['n_useful_features']} "
+                f"({gd['frac_kept_signal']:.1%})"
+            )
+            lines.append(
+                f"  Threshold      : kill_ratio ≥ {gd['threshold']:.2f}"
+            )
+
     lines.append("")
     lines.append("Threshold reference:")
     lines.append(f"  |spearman| < {NOISE_THRESHOLD}    → NOISE")
@@ -912,6 +1050,16 @@ def main() -> int:
     p.add_argument("--warmup-bars", type=int, default=DEFAULT_WARMUP_BARS,
                    help=f"Warm-up window size in bars "
                         f"(default {DEFAULT_WARMUP_BARS}).")
+    p.add_argument("--per-event-status", action="store_true",
+                   help="Compute IC separately on event vs non-event "
+                        "bars (requires is_event column). Adds "
+                        "ic_event_bars / ic_non_event_bars / "
+                        "gate_kill_ratio columns + a gate_diagnostic "
+                        "verdict in summary.json. Directly answers: "
+                        "is the event gate killing real signal?")
+    p.add_argument("--event-col", default="is_event",
+                   help="Column name for the event indicator "
+                        "(default is_event).")
     args = p.parse_args()
 
     print(f"loading {args.features}")
@@ -926,6 +1074,8 @@ def main() -> int:
         cost_per_side=args.cost_per_side,
         exclude_warmup=args.exclude_warmup,
         warmup_bars=args.warmup_bars,
+        per_event_status=args.per_event_status,
+        event_col=args.event_col,
     )
 
     args.output.mkdir(parents=True, exist_ok=True)
