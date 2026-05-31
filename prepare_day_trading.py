@@ -4246,6 +4246,25 @@ def run_day_trading_refinery(
             print(f"   ⚠️ enrichment تخطّي ({type(exc).__name__}: {exc})")
 
     out_path = os.path.join(output_dir, features_fn)
+
+    # Phase 0 fix: rename columns to match downstream consumer expectations.
+    # The IC audit + event_gate audit + verify_data_health expect specific
+    # canonical names. Without this, downstream tools report "source missing".
+    _phase0_renames = {}
+    if 'obi' in df_out.columns and 'obi_net' not in df_out.columns:
+        _phase0_renames['obi'] = 'obi_net'
+    if 'cvd' in df_out.columns and 'cvd_direction_pct' not in df_out.columns:
+        # The existing `cvd` column is the cumulative line — not the
+        # direction ratio expected by the event gate. We expose BOTH:
+        # keep `cvd` as-is (cumulative), add `cvd_cumulative` as alias
+        # so downstream code can pick the right one. The proper
+        # `cvd_direction_pct` per-bar feature is engineered in Phase 2.
+        df_out['cvd_cumulative'] = df_out['cvd']
+        # Don't drop or rename `cvd` yet — Phase 2 builds proper variants.
+    if _phase0_renames:
+        df_out = df_out.rename(columns=_phase0_renames)
+        print(f"   🔧 Phase 0 renames applied: {_phase0_renames}")
+
     df_out.to_parquet(out_path, index=False)
     print(f"\n💾 Dataset محفوظ: {out_path}")
     print(f"   Rows: {len(df_out):,} | Columns: {len(df_out.columns)}")
