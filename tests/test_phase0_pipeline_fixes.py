@@ -90,3 +90,49 @@ class TestPhase0InSource:
         assert 'Phase 0 fix' in src
         assert 'obi_net' in src
         assert 'cvd_cumulative' in src
+
+
+class TestPhase0GateRemoval:
+    """Source-level guards confirming the event gate has been removed
+    from label_by_outcome. The previous behaviour gated labeling by
+    `if not is_ev_arr[i]: continue` — kill ~80% of bars before the
+    forward TP/SL scan could even run, producing the 80%-NEUTRAL
+    pathology the IC audit confirmed empirically.
+    """
+
+    def test_gate_filter_block_removed(self):
+        src = (REPO_ROOT / 'prepare_day_trading.py').read_text()
+        # The exact filter line should NO LONGER appear in label_by_outcome
+        forbidden_patterns = [
+            "if not is_ev_arr[i]:\n            # ليس حدثاً",
+            "if not is_ev_arr[i]:\n            # ليس حدثاً: افتراضياً NEUTRAL",
+            "neutral_reason[i] = NEUTRAL_REASON_WEAK_EVENT",
+        ]
+        for pattern in forbidden_patterns:
+            assert pattern not in src, (
+                f"Phase 0 root fix regressed: the event gate filter is "
+                f"back in label_by_outcome. Forbidden pattern still in "
+                f"source: {pattern!r}"
+            )
+
+    def test_root_fix_explanation_documented(self):
+        """The replacement explanation must stay so the change is
+        discoverable and the rationale survives later edits."""
+        src = (REPO_ROOT / 'prepare_day_trading.py').read_text()
+        markers = [
+            'Phase 0 root fix',
+            'gate_kill_ratio',
+            'forward TP/SL scan',
+        ]
+        for m in markers:
+            assert m in src, f"Phase 0 root-fix marker missing: {m!r}"
+
+    def test_label_by_outcome_still_callable(self):
+        """Smoke test — function imports and accepts the documented signature.
+        We're not running it here (it's heavy); just verifying it didn't
+        get accidentally broken at parse time."""
+        import importlib
+        import prepare_day_trading as pdt
+        importlib.reload(pdt)
+        assert hasattr(pdt, 'label_by_outcome')
+        assert callable(pdt.label_by_outcome)

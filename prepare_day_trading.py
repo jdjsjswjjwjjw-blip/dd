@@ -2632,27 +2632,17 @@ def label_by_outcome(
         fwd_idx = min(i + max_bars_r, n - 1)
         forward_return[i] = float((close[fwd_idx] - entry) / max(entry, 1e-8))
 
-        if not is_ev_arr[i]:
-            # ليس حدثاً: افتراضياً NEUTRAL، ويمكن (اختياريًا) تحويله لاتجاه ضعيف إذا الحركة واضحة.
-            if weak_event_to_directional:
-                move_px = float(close[sess_end] - entry) if sess_end >= i else 0.0
-                move_thr = float(max(weak_event_min_move_atr, 0.0)) * atr_i
-                trade_duration[i] = max(0, sess_end - i)
-                if move_px >= move_thr:
-                    bias_label[i] = 0
-                    path_outcome[i] = 5  # weak_long
-                    signal_quality[i] = 1 if london_ok[i] else 0
-                    neutral_reason[i] = NEUTRAL_REASON_NONE
-                elif move_px <= -move_thr:
-                    bias_label[i] = 1
-                    path_outcome[i] = 6  # weak_short
-                    signal_quality[i] = 1 if london_ok[i] else 0
-                    neutral_reason[i] = NEUTRAL_REASON_NONE
-                else:
-                    neutral_reason[i] = NEUTRAL_REASON_WEAK_EVENT
-            else:
-                neutral_reason[i] = NEUTRAL_REASON_WEAK_EVENT
-            continue
+        # Phase 0 root fix: removed the `if not is_ev_arr[i]: continue` gate.
+        # Empirical IC evidence (gate_kill_ratio=0.58, with 5/6 STRONG features
+        # showing kill_ratio > 1.0 meaning the gate ANTI-selected) proved the
+        # gate was discarding training data that carried at least as much
+        # forward-return signal as the bars it kept. Every bar now enters the
+        # forward TP/SL scan below; NEUTRAL only arises from genuine path
+        # outcomes (timeout, SL-first, or MFE/MAE rescue failing the
+        # MFE/MAE ratio + min-move check) — never from the gate.
+        # is_event / event_score / event_score_tier columns are still written
+        # so the model can use them as features / confidence weights instead
+        # of having them gate the labeling.
 
         # TP/SL للحدث + مسارات الحدث (بعد شرائح event_score إن فُعّلت)
         event_score_i = float(event_score_arr[i])
