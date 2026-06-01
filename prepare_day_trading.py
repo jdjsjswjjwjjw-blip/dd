@@ -144,8 +144,9 @@ ORIGINAL_FEATURES: tuple[str, ...] = (
     'obi', 'bid_wall_strength', 'ask_wall_strength',
     'distance_to_wall', 'gap_size', 'liquidity_density',
     'micro_price', 'current_vwap', 'vwap_z_score',
-    # Levels
+    # Levels (daily + weekly key levels — structure-aware context)
     'pdh', 'pdl', 'dist_to_pdh', 'price_position',
+    'pwh', 'pwl', 'weekly_price_position',
     'london_sess_high', 'london_sess_low',
     'dist_to_london_high_atr', 'dist_to_london_low_atr',
     # Tick count & coverage
@@ -201,6 +202,8 @@ ORIGINAL_FEATURES: tuple[str, ...] = (
     # being in this list, but listed here for defensive consistency
     # in case the call order is rearranged in the future.
     'dist_to_session_high_atr', 'dist_to_vwap_atr', 'dist_to_pdh_atr',
+    # 1.13 — ATR-normalised distances to prev-day-low + prev-week high/low
+    'dist_to_pdl_atr', 'dist_to_pwh_atr', 'dist_to_pwl_atr',
     # ── Phase 1.4 — II.C/II.D ──
     'regime_label_grouped', 'is_warmup',
     # ── Phase 1.5 — II.A session × feature interactions ──
@@ -935,20 +938,32 @@ def apply_bar_level_catboost_parities(df_bars: pd.DataFrame, freq: str) -> pd.Da
         levels = levels.rename(columns={'close': 'price'})
         try:
             ctx = compute_daily_weekly_levels(levels, price_col='price', ts_col='ts_event')
+            # Harvest ALL causal levels — the helper computes daily AND weekly,
+            # but pre-1.13 only 4 of 9 were taken, silently dropping the weekly
+            # key levels (pwh/pwl) the model never got to see.
             df['pdh'] = ctx['pdh'].to_numpy()
             df['pdl'] = ctx['pdl'].to_numpy()
+            df['pwh'] = ctx['pwh'].to_numpy()
+            df['pwl'] = ctx['pwl'].to_numpy()
             df['dist_to_pdh'] = ctx['dist_to_pdh'].to_numpy()
             df['price_position'] = ctx['price_position'].to_numpy()
+            df['weekly_price_position'] = ctx['weekly_price_position'].to_numpy()
         except Exception:
             df['pdh'] = close.to_numpy()
             df['pdl'] = close.to_numpy()
+            df['pwh'] = close.to_numpy()
+            df['pwl'] = close.to_numpy()
             df['dist_to_pdh'] = np.zeros(len(df), dtype=np.float64)
             df['price_position'] = np.full(len(df), 0.5, dtype=np.float64)
+            df['weekly_price_position'] = np.full(len(df), 0.5, dtype=np.float64)
     else:
         df['pdh'] = close.to_numpy()
         df['pdl'] = close.to_numpy()
+        df['pwh'] = close.to_numpy()
+        df['pwl'] = close.to_numpy()
         df['dist_to_pdh'] = np.zeros(len(df), dtype=np.float64)
         df['price_position'] = np.full(len(df), 0.5, dtype=np.float64)
+        df['weekly_price_position'] = np.full(len(df), 0.5, dtype=np.float64)
 
     obi_proxy = ofi
     if 'order_flow_imbalance' in df.columns:
@@ -3883,6 +3898,19 @@ def _apply_phase1_engineering_fixes(
         if 'pdh' in out.columns:
             pdh = pd.to_numeric(out['pdh'], errors='coerce').astype(np.float64)
             out['dist_to_pdh_atr'] = ((close - pdh) / safe_atr).astype(np.float32)
+        # 1.13: ATR-normalised distances to the prev-day-low + prev-week
+        # high/low key levels. Same scale-robustness rationale as II.B — the
+        # raw price-unit distances collapse (IR≈-4); ATR units are stationary.
+        # All causal: the levels are prev-session (shift(1)) values.
+        if 'pdl' in out.columns:
+            pdl = pd.to_numeric(out['pdl'], errors='coerce').astype(np.float64)
+            out['dist_to_pdl_atr'] = ((close - pdl) / safe_atr).astype(np.float32)
+        if 'pwh' in out.columns:
+            pwh = pd.to_numeric(out['pwh'], errors='coerce').astype(np.float64)
+            out['dist_to_pwh_atr'] = ((close - pwh) / safe_atr).astype(np.float32)
+        if 'pwl' in out.columns:
+            pwl = pd.to_numeric(out['pwl'], errors='coerce').astype(np.float64)
+            out['dist_to_pwl_atr'] = ((close - pwl) / safe_atr).astype(np.float32)
 
     # ── II.A: session × feature interactions ───────────────────────────
     # The audit's per-session split showed `hawkes_intrabar_sum` and

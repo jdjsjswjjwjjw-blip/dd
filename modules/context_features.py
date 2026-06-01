@@ -58,9 +58,16 @@ def compute_daily_weekly_levels(df_all: pd.DataFrame, price_col: str = 'price', 
 
     df['dist_to_pdh'] = (df['pdh'] - px).round(4)
     df['dist_to_pdl'] = (px - df['pdl']).round(4)
+    df['dist_to_pwh'] = (df['pwh'] - px).round(4)
+    df['dist_to_pwl'] = (px - df['pwl']).round(4)
 
     rng = (df['pdh'] - df['pdl']).replace(0, np.nan)
     df['price_position'] = ((px - df['pdl']) / rng).clip(0, 1).fillna(0.5)
+    # Weekly range position ∈ [0,1] — scale-free by construction (where is
+    # price within the *previous* week's range). Same causal guarantee as
+    # price_position: pwh/pwl are prev-week (shift(1)), never the live week.
+    wrng = (df['pwh'] - df['pwl']).replace(0, np.nan)
+    df['weekly_price_position'] = ((px - df['pwl']) / wrng).clip(0, 1).fillna(0.5)
 
     return df
 

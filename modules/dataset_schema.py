@@ -315,6 +315,26 @@ PHASE_1_5_INTERACTION_FEATURES: tuple[FeatureSpec, ...] = (
     FeatureSpec("tick_count_x_session_phase", FAMILY_INTERACTION, IC_VERDICT_NEW,
                 "II.A: tick_count × session_phase code."),
 )
+# Phase 1.13: weekly key levels + their ATR-normalised distances. The helper
+# compute_daily_weekly_levels already produced pwh/pwl causally (prev-week
+# shift(1)) but the refinery harvested only the daily levels — the model
+# never saw a weekly support/resistance. These close that gap. Raw levels are
+# STRUCTURAL; the model-facing distances are ATR-normalised (scale-robust,
+# per the II.B lesson that absolute distances collapse at IR≈-4).
+PHASE_1_6_KEY_LEVEL_FEATURES: tuple[FeatureSpec, ...] = (
+    FeatureSpec("pwh", FAMILY_STRUCTURAL, IC_VERDICT_NEW,
+                "1.13: previous-week high (causal, prev-week shift(1))."),
+    FeatureSpec("pwl", FAMILY_STRUCTURAL, IC_VERDICT_NEW,
+                "1.13: previous-week low (causal, prev-week shift(1))."),
+    FeatureSpec("weekly_price_position", FAMILY_STRUCTURAL, IC_VERDICT_NEW,
+                "1.13: position within prev-week range ∈ [0,1], scale-free."),
+    FeatureSpec("dist_to_pdl_atr", FAMILY_DIST_ATR, IC_VERDICT_NEW,
+                "1.13: (close - pdl) / atr_14 — scale-robust dist to prev-day low."),
+    FeatureSpec("dist_to_pwh_atr", FAMILY_DIST_ATR, IC_VERDICT_NEW,
+                "1.13: (close - pwh) / atr_14 — scale-robust dist to prev-week high."),
+    FeatureSpec("dist_to_pwl_atr", FAMILY_DIST_ATR, IC_VERDICT_NEW,
+                "1.13: (close - pwl) / atr_14 — scale-robust dist to prev-week low."),
+)
 
 
 # Required-by-pipeline columns (not features themselves but must be present)
@@ -334,6 +354,7 @@ ALL_FEATURE_SPECS: tuple[FeatureSpec, ...] = (
     *PHASE_1_4_DIST_ATR_FEATURES,
     *PHASE_1_5_NEW_FEATURES,
     *PHASE_1_5_INTERACTION_FEATURES,
+    *PHASE_1_6_KEY_LEVEL_FEATURES,
 )
 
 
