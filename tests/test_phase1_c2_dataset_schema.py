@@ -145,8 +145,9 @@ class TestDatasetMetaSidecar:
         df = _frame_with_targets()
         meta = build_dataset_meta(df)
         # bias_label is in the frame; mfe is not
-        assert "bias_label" in meta["columns_present"]
-        assert "mfe" in meta["columns_missing"]
+        # Phase 1.1 renamed these to disambiguate label vs feature audits
+        assert "bias_label" in meta["label_columns_present"]
+        assert "mfe" in meta["label_columns_missing"]
 
     def test_build_records_dtype_mismatch(self):
         df = _frame_with_targets()
@@ -166,7 +167,7 @@ class TestDatasetMetaSidecar:
         loaded = load_dataset_meta(parquet_path)
         assert loaded["schema_version"] == SCHEMA_VERSION
         assert loaded["extra"]["horizon_bars"] == 6
-        assert "bias_label" in loaded["columns_present"]
+        assert "bias_label" in loaded["label_columns_present"]
 
     def test_load_missing_sidecar_raises(self, tmp_path):
         parquet_path = tmp_path / "features.parquet"

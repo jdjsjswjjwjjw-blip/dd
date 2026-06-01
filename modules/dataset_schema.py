@@ -157,7 +157,7 @@ ALL_LABEL_SCHEMAS: tuple[LabelSpec, ...] = (
 # Convenience: schema-version tag updated whenever ALL_LABEL_SCHEMAS changes.
 # Bump when adding/removing/renaming entries above so manifests + sidecars
 # can be matched against a known version.
-SCHEMA_VERSION: str = "phase1-c2"
+SCHEMA_VERSION: str = "phase1.1-feature-schema"
 
 # Pipeline-cleanup phase markers — embed in the sidecar so consumers can
 # tell which fixes were live when the parquet was produced.
@@ -170,6 +170,215 @@ PIPELINE_CLEANUP_PHASES: dict[str, str] = {
     "B2": "compute_ssl_directional_target (next_price_delta) wired",
     "C1": "SSL leakage guard extended for new + previously-uncovered cols",
     "C2": "dataset_schema source of truth + dataset_meta.json sidecar",
+    "1.1": "feature-schema added; obi_net/cvd_cumulative canonical at compute-source",
+}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 1.1 — Feature schema. Labels live in ALL_LABEL_SCHEMAS above; this
+# block formalises the FEATURE-side contract so the same source-of-truth
+# pattern that solved label confusion (one place, typed) now covers the
+# input features the model sees. Drives the Phase 1.2 whitelist mode.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Feature-family tags (semantic groupings used by the whitelist + diagnostics)
+FAMILY_OHLCV = "ohlcv"
+FAMILY_REGIME = "regime"
+FAMILY_STRUCTURAL = "structural"      # session highs/lows, vwap, pdh/pdl
+FAMILY_SEASONAL = "seasonal"          # time-of-day, session phase
+FAMILY_VOLUME = "volume"
+FAMILY_MICROSTRUCTURE_AGG = "microstructure_agg"   # hawkes, kyle, lambda
+FAMILY_CONTINUOUS_Z = "continuous_z"   # Phase 1.3
+FAMILY_CVD_MT5 = "cvd_mt5"            # Phase 1.4
+FAMILY_ICEBERG = "iceberg"            # Phase 1.5
+FAMILY_DIST_ATR = "dist_to_x_atr"     # Phase 1.4-aux (II.B fix)
+FAMILY_INTERACTION = "interaction"    # Phase 1.5-aux (II.A fix)
+FAMILY_CONTEXT = "context"            # event metadata kept as features
+
+
+# IC-verdict tags (from the Q2 audit — drives Phase 1.2's blacklist)
+IC_VERDICT_STRONG = "STRONG"
+IC_VERDICT_MODERATE = "MODERATE"
+IC_VERDICT_WEAK = "WEAK"
+IC_VERDICT_NOISE = "NOISE"
+IC_VERDICT_UNSTABLE = "UNSTABLE_WALKFORWARD"
+IC_VERDICT_WARMUP_RIDER = "WARMUP_RIDER"
+IC_VERDICT_NEW = "NEW"                # added by Phase 1.3/1.4/1.5 — not yet audited
+
+
+@dataclass(frozen=True)
+class FeatureSpec:
+    """One row of the feature schema."""
+    name: str
+    family: str                       # FAMILY_* constant
+    ic_verdict: str                   # IC_VERDICT_* constant
+    description: str = ""
+    # Optional: best horizon (in bars) observed for this feature, from
+    # ic_top_features.csv. None for features not yet audited.
+    best_horizon: int | None = None
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+# ── The Q2-audit top features (whitelist seed for Phase 1.2 'keep_top') ────
+TOP_IC_FEATURES: tuple[FeatureSpec, ...] = (
+    # 6 STRONG (full audit verdict)
+    FeatureSpec("london_sess_high", FAMILY_STRUCTURAL, IC_VERDICT_STRONG,
+                "session high — IC -0.110 @ h=24 but scale-dependent (IR=-4.05); pair with dist_to_london_high_atr (II.B fix).",
+                best_horizon=24),
+    FeatureSpec("current_vwap", FAMILY_STRUCTURAL, IC_VERDICT_STRONG,
+                "rolling VWAP — IC -0.102 @ h=24 (IR=-3.62, scale-dependent).",
+                best_horizon=24),
+    FeatureSpec("price", FAMILY_STRUCTURAL, IC_VERDICT_STRONG,
+                "raw close — IC -0.101 @ h=24 (IR=-3.46, scale-dependent).",
+                best_horizon=24),
+    FeatureSpec("hawkes_intrabar_sum", FAMILY_MICROSTRUCTURE_AGG, IC_VERDICT_STRONG,
+                "Hawkes intensity sum — IC -0.106 @ h=24 BUT session sign-flip (Asia +0.06 / NY-close -0.26); II.A interaction needed.",
+                best_horizon=24),
+    FeatureSpec("tick_count", FAMILY_VOLUME, IC_VERDICT_STRONG,
+                "tick count per bar — IC -0.106 @ h=24, same sign-flip story as hawkes_intrabar_sum.",
+                best_horizon=24),
+    FeatureSpec("time_to_ny_close_min", FAMILY_SEASONAL, IC_VERDICT_STRONG,
+                "minutes to NY close — IC -0.106 @ h=24, weak gate-anti-select.",
+                best_horizon=24),
+    # MODERATE additions worth keeping (the top of the moderate list)
+    FeatureSpec("london_sess_low", FAMILY_STRUCTURAL, IC_VERDICT_MODERATE,
+                "session low — IC -0.080 @ h=24."),
+    FeatureSpec("pdh", FAMILY_STRUCTURAL, IC_VERDICT_MODERATE,
+                "previous-day high — IC -0.079 @ h=24."),
+    FeatureSpec("pdl", FAMILY_STRUCTURAL, IC_VERDICT_MODERATE,
+                "previous-day low — IC -0.066 @ h=24."),
+    FeatureSpec("volume", FAMILY_VOLUME, IC_VERDICT_MODERATE,
+                "bar volume — IC -0.098 @ h=24, gate-anti-select 1.51."),
+    FeatureSpec("dist_to_london_low_atr", FAMILY_DIST_ATR, IC_VERDICT_MODERATE,
+                "ATR-normalized distance to session low — IC -0.070 @ h=24 (scale-robust)."),
+    FeatureSpec("inter_event_time", FAMILY_MICROSTRUCTURE_AGG, IC_VERDICT_MODERATE,
+                "bars between micro-structure events — IC +0.093 @ h=24."),
+    FeatureSpec("liquidity_density", FAMILY_MICROSTRUCTURE_AGG, IC_VERDICT_MODERATE,
+                "depth-weighted density — IC -0.094 @ h=24."),
+    FeatureSpec("session_phase", FAMILY_SEASONAL, IC_VERDICT_MODERATE,
+                "session-phase code (Asia/London/overlap/NY/close)."),
+    FeatureSpec("kyle_lambda_intrabar_mean", FAMILY_MICROSTRUCTURE_AGG, IC_VERDICT_MODERATE,
+                "Kyle's lambda mean — IC +0.063 @ h=24."),
+    FeatureSpec("mbo_bar_coverage", FAMILY_CONTEXT, IC_VERDICT_MODERATE,
+                "data-quality metric (not a model feature)."),
+)
+
+
+# ── Brand-new features added by Phase 1.3/1.4/1.5 (no Q2 IC yet) ───────────
+# These are referenced by the whitelist in keep_top mode but tagged NEW so
+# the 1.6 IC re-audit can verify they earn their slot.
+PHASE_1_3_NEW_FEATURES: tuple[FeatureSpec, ...] = (
+    FeatureSpec("event_score_continuous", FAMILY_CONTINUOUS_Z, IC_VERDICT_NEW,
+                "Phase 1.3: continuous event score (replaces binary thresholds)."),
+    FeatureSpec("hawkes_z_raw", FAMILY_CONTINUOUS_Z, IC_VERDICT_NEW,
+                "Phase 1.3: raw z-score of Hawkes intensity (no threshold)."),
+    FeatureSpec("absorb_z_raw", FAMILY_CONTINUOUS_Z, IC_VERDICT_NEW,
+                "Phase 1.3: raw z-score of absorption intensity."),
+    FeatureSpec("kyle_z_raw", FAMILY_CONTINUOUS_Z, IC_VERDICT_NEW,
+                "Phase 1.3: raw z-score of Kyle's lambda."),
+)
+PHASE_1_4_NEW_FEATURES: tuple[FeatureSpec, ...] = (
+    FeatureSpec("cvd_bar_5m", FAMILY_CVD_MT5, IC_VERDICT_NEW,
+                "Phase 1.4: per-bar signed volume (MT5-style delta)."),
+    FeatureSpec("cvd_direction_ratio_5m", FAMILY_CVD_MT5, IC_VERDICT_NEW,
+                "Phase 1.4: |buy-sell|/total per bar ∈ [0,1]."),
+    FeatureSpec("cvd_intensity_vs_atr", FAMILY_CVD_MT5, IC_VERDICT_NEW,
+                "Phase 1.4: |cvd_bar| / ATR — normalised intensity."),
+    FeatureSpec("cvd_divergence_at_level", FAMILY_CVD_MT5, IC_VERDICT_NEW,
+                "Phase 1.4: divergence signal at structural levels (PDH/PDL/VWAP)."),
+    FeatureSpec("cvd_consecutive_imbalance", FAMILY_CVD_MT5, IC_VERDICT_NEW,
+                "Phase 1.4: streak of same-sign CVD bars."),
+)
+PHASE_1_5_NEW_FEATURES: tuple[FeatureSpec, ...] = (
+    FeatureSpec("iceberg_count_5m", FAMILY_ICEBERG, IC_VERDICT_NEW,
+                "Phase 1.5: detected iceberg events per bar."),
+    FeatureSpec("iceberg_total_volume_5m", FAMILY_ICEBERG, IC_VERDICT_NEW,
+                "Phase 1.5: estimated hidden volume per bar."),
+)
+# II.B fix: ATR-normalised distance versions of the scale-dependent STRONG
+# features (london_sess_high, current_vwap, price all hit IR≈-4 because they
+# are absolute-scale).
+PHASE_1_4_DIST_ATR_FEATURES: tuple[FeatureSpec, ...] = (
+    FeatureSpec("dist_to_session_high_atr", FAMILY_DIST_ATR, IC_VERDICT_NEW,
+                "II.B: (close - london_sess_high) / atr_14."),
+    FeatureSpec("dist_to_vwap_atr", FAMILY_DIST_ATR, IC_VERDICT_NEW,
+                "II.B: (close - current_vwap) / atr_14."),
+    FeatureSpec("dist_to_pdh_atr", FAMILY_DIST_ATR, IC_VERDICT_NEW,
+                "II.B: (close - pdh) / atr_14."),
+)
+# II.A fix: session×feature interaction for the sign-flip pair
+PHASE_1_5_INTERACTION_FEATURES: tuple[FeatureSpec, ...] = (
+    FeatureSpec("hawkes_x_session_phase", FAMILY_INTERACTION, IC_VERDICT_NEW,
+                "II.A: hawkes_intrabar_sum × session_phase code."),
+    FeatureSpec("tick_count_x_session_phase", FAMILY_INTERACTION, IC_VERDICT_NEW,
+                "II.A: tick_count × session_phase code."),
+)
+
+
+# Required-by-pipeline columns (not features themselves but must be present)
+REQUIRED_OHLCV: tuple[str, ...] = (
+    'ts_event', 'open', 'high', 'low', 'close', 'volume',
+)
+REQUIRED_REGIME: tuple[str, ...] = (
+    'regime_label', 'atr_14', 'is_session_break',
+)
+
+
+# Aggregate (all feature specs the schema knows about, audited or not)
+ALL_FEATURE_SPECS: tuple[FeatureSpec, ...] = (
+    *TOP_IC_FEATURES,
+    *PHASE_1_3_NEW_FEATURES,
+    *PHASE_1_4_NEW_FEATURES,
+    *PHASE_1_4_DIST_ATR_FEATURES,
+    *PHASE_1_5_NEW_FEATURES,
+    *PHASE_1_5_INTERACTION_FEATURES,
+)
+
+
+# Hard NOISE/UNSTABLE blacklist from the Q2 IC audit (Phase 1.2 'drop_noise')
+# Each entry has a reason so a future reader knows why it was dropped.
+PHASE_1_2_BLACKLIST: dict[str, str] = {
+    # NOISE LOB-snapshot family (Phase 2 will rebuild from MBO)
+    'mbp_roll_lob_coverage': 'NOISE — LOB snapshot, rebuilt in Phase 2',
+    'correction_depth': 'NOISE — LOB snapshot',
+    'distance_to_wall': 'NOISE — LOB snapshot',
+    'ask_wall_strength': 'NOISE — LOB snapshot',
+    'bid_wall_strength': 'NOISE — LOB snapshot',
+    'lob_imbalance': 'NOISE — LOB snapshot',
+    # UNSTABLE_WALKFORWARD (consistency=0.8 — sign flips in 1/5 windows)
+    'hawkes_intensity': 'UNSTABLE — wf_consistency=0.8',
+    'is_overlap': 'UNSTABLE — sign flip across regimes',
+    'time_since_london_open_min': 'UNSTABLE — wf_consistency=0.8',
+    'time_since_ny_open_min': 'UNSTABLE — wf_consistency=0.8',
+    'time_to_london_close_min': 'UNSTABLE — wf_consistency=0.8',
+    'dist_to_london_high_atr': 'UNSTABLE — wf_consistency=0.8',
+    'is_month_end': 'UNSTABLE — gate_kill > 1, weak signal',
+    'bar_range': 'UNSTABLE — wf_consistency=0.8',
+    'cycle_hurst': 'UNSTABLE — wf_consistency=0.8',
+    'cycle_fractal_dim': 'UNSTABLE — wf_consistency=0.8',
+    'dow_sin': 'UNSTABLE — calendar noise',
+    'dom_cos': 'UNSTABLE — calendar noise',
+    # Cumulative-CVD weak variants (replaced by MT5-style in Phase 1.4)
+    'cvd_momentum': 'WEAK — replaced by cvd_bar_5m in Phase 1.4',
+    'cvd_price_divergence': 'WEAK — replaced by cvd_divergence_at_level',
+    'cvd_slope_1h': 'WEAK — IC near noise floor',
+    'cvd_slope_4h': 'WEAK — IC near noise floor',
+    'cvd_slope_6b': 'WEAK — IC near noise floor',
+    # Calendar NOISE
+    'is_friday': 'NOISE — calendar dummy',
+    'is_monday': 'NOISE — calendar dummy',
+    'is_first_week_of_year': 'NOISE — calendar dummy',
+    'dom_sin': 'NOISE — calendar dummy',
+    'dom': 'NOISE — calendar dummy',
+    'is_month_start': 'NOISE — calendar dummy',
+    'is_quarter_end': 'NOISE — calendar dummy',
+    'is_year_end': 'NOISE — calendar dummy',
+    'woy_sin': 'NOISE — calendar dummy',
+    'woy_cos': 'NOISE — calendar dummy',
+    'is_dst_transition_week': 'NOISE — calendar dummy',
+    'is_event_window': 'NOISE — calendar dummy',
 }
 
 
@@ -220,19 +429,102 @@ def build_dataset_meta(
         else:
             columns_missing.append(spec.name)
 
+    # Phase 1.1: also audit FEATURE specs (in addition to label specs above)
+    feature_present = [s.name for s in ALL_FEATURE_SPECS if s.name in df.columns]
+    feature_missing = [s.name for s in ALL_FEATURE_SPECS if s.name not in df.columns]
+    blacklisted_present = [
+        c for c in df.columns if c in PHASE_1_2_BLACKLIST
+    ]
+
     meta: dict = {
         "schema_version": SCHEMA_VERSION,
+        "git_hash": _current_git_hash(),
+        "built_at_utc": _utc_now_iso(),
         "pipeline_cleanup_phases": PIPELINE_CLEANUP_PHASES,
         "label_specs": [s.as_dict() for s in ALL_LABEL_SCHEMAS],
+        "feature_specs": [s.as_dict() for s in ALL_FEATURE_SPECS],
         "target_columns": list(target_column_names()),
-        "columns_present": columns_present,
-        "columns_missing": columns_missing,
+        "required_ohlcv": list(REQUIRED_OHLCV),
+        "required_regime": list(REQUIRED_REGIME),
+        "phase_1_2_blacklist": PHASE_1_2_BLACKLIST,
+        "label_columns_present": columns_present,
+        "label_columns_missing": columns_missing,
+        "feature_columns_present": feature_present,
+        "feature_columns_missing": feature_missing,
+        "blacklisted_columns_still_present": blacklisted_present,
         "dtype_mismatches": dtype_mismatches,
         "rows": int(len(df)),
+        "n_columns_total": len(df.columns),
     }
     if extra:
         meta["extra"] = extra
     return meta
+
+
+# ── Phase 1.1 git/time helpers + validate() ────────────────────────────────
+def _current_git_hash() -> str | None:
+    """Returns short git hash, or None if not in a repo / git unavailable."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _utc_now_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def validate(df: pd.DataFrame, *, strict: bool = False) -> list[str]:
+    """Phase 1.1: returns list of human-readable validation errors.
+    Empty list = OK.
+
+    Checks:
+      - REQUIRED_OHLCV columns present
+      - REQUIRED_REGIME columns present
+      - Canonical aliases present (obi_net + cvd_cumulative both required,
+        not the raw obi/cvd which are kept as compute aliases only)
+      - No blacklisted column appears alongside its replacement
+
+    strict=True also requires the label-target columns (bias_label,
+    exec_label, next_price_delta) — i.e. the dual-target heads are wired.
+    """
+    errors: list[str] = []
+
+    for c in REQUIRED_OHLCV:
+        if c not in df.columns:
+            errors.append(f"required OHLCV column missing: {c!r}")
+    for c in REQUIRED_REGIME:
+        if c not in df.columns:
+            errors.append(f"required regime column missing: {c!r}")
+
+    # Canonical aliases — the IC audit / verify_data_health expect these.
+    if 'obi_net' not in df.columns:
+        errors.append(
+            "canonical alias `obi_net` missing — Phase 1.1 expects it "
+            "alongside any internal-compute `obi`"
+        )
+    if 'cvd_cumulative' not in df.columns:
+        errors.append(
+            "canonical alias `cvd_cumulative` missing — Phase 1.1 expects it"
+        )
+
+    if strict:
+        for c in target_column_names():
+            if c not in df.columns:
+                errors.append(
+                    f"strict mode: training target {c!r} missing "
+                    f"(dual-target pipeline not fully wired)"
+                )
+
+    return errors
 
 
 def write_dataset_meta(

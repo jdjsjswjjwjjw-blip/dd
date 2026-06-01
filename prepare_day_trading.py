@@ -975,6 +975,11 @@ def apply_bar_level_catboost_parities(df_bars: pd.DataFrame, freq: str) -> pd.Da
     _assign_advisor('liquidity_density', _num_series(df, 'liquidity_density'), liq_dens)
 
     df['obi'] = df['obi'].clip(-1.0, 1.0)
+    # Phase 1.1: canonical name is obi_net (matches SSL data_loader, IC audit,
+    # verify_data_health). `obi` kept as alias for backward compat with the
+    # ~13 internal compute sites that read df['obi'] below. Both names point
+    # to the same Series so updates flow through identically.
+    df['obi_net'] = df['obi']
     df['spoofing_ratio'] = df['spoofing_ratio'].clip(0.0, 1.0)
     df['price_position'] = pd.to_numeric(df['price_position'], errors='coerce').clip(0.0, 1.0).fillna(0.5)
 
@@ -1227,6 +1232,11 @@ def aggregate_mbo_to_bars(df_mbo: pd.DataFrame, freq: str = DAY_TRADE_DEFAULT_BA
     _cvd_first = _cvd_rs.first()
     _cvd_count = _cvd_rs.count()
     bars['cvd'] = _cvd_last.reindex(bars.index).ffill().fillna(0.0)
+    # Phase 1.1: canonical name for the cumulative CVD is cvd_cumulative
+    # (matches IC audit + verify_data_health). `cvd` kept as alias for the
+    # internal compute sites that read bars['cvd'] later. Phase 1.4 will
+    # add the proper MT5-style per-bar CVD features under separate names.
+    bars['cvd_cumulative'] = bars['cvd']
     _delta_full = (_cvd_last - _cvd_first).where(_cvd_count > 1, 0.0).fillna(0.0)
     bars['bar_cvd_delta'] = _delta_full.reindex(bars.index).fillna(0.0)
     if 'session_cvd' in df.columns:
@@ -4260,34 +4270,34 @@ def run_day_trading_refinery(
 
     out_path = os.path.join(output_dir, features_fn)
 
-    # Phase 0 fix: rename columns to match downstream consumer expectations.
-    # The IC audit + event_gate audit + verify_data_health expect specific
-    # canonical names. Without this, downstream tools report "source missing".
+    # Phase 1.1: canonical aliases are now created at compute-source
+    # (prepare_day_trading.py: obi_net at line 982 next to df['obi'].clip,
+    # cvd_cumulative at line 1239 next to bars['cvd'] resampling). This
+    # block is now a defensive fallback for the rare case where one of
+    # them was dropped by an intermediate step (e.g., a feature selection
+    # mode trimming columns). Both names always co-exist in the output.
     _phase0_renames = {}
     if 'obi' in df_out.columns and 'obi_net' not in df_out.columns:
-        _phase0_renames['obi'] = 'obi_net'
-    if 'cvd' in df_out.columns and 'cvd_direction_pct' not in df_out.columns:
-        # The existing `cvd` column is the cumulative line — not the
-        # direction ratio expected by the event gate. We expose BOTH:
-        # keep `cvd` as-is (cumulative), add `cvd_cumulative` as alias
-        # so downstream code can pick the right one. The proper
-        # `cvd_direction_pct` per-bar feature is engineered in Phase 2.
+        df_out['obi_net'] = df_out['obi']
+        _phase0_renames['obi'] = 'obi_net (alias)'
+    if 'cvd' in df_out.columns and 'cvd_cumulative' not in df_out.columns:
         df_out['cvd_cumulative'] = df_out['cvd']
-        # Don't drop or rename `cvd` yet — Phase 2 builds proper variants.
+        _phase0_renames['cvd'] = 'cvd_cumulative (alias)'
     if _phase0_renames:
-        df_out = df_out.rename(columns=_phase0_renames)
-        print(f"   🔧 Phase 0 renames applied: {_phase0_renames}")
+        print(f"   🔧 Phase 1.1 fallback aliases applied: {_phase0_renames}")
 
     df_out.to_parquet(out_path, index=False)
     print(f"\n💾 Dataset محفوظ: {out_path}")
     print(f"   Rows: {len(df_out):,} | Columns: {len(df_out.columns)}")
 
-    # ── C2: dataset_meta.json sidecar — schema source of truth ─────────
-    # Lets external consumers introspect the parquet's label-side schema
-    # (which targets present, which masks they pair with, leakage classes)
-    # without importing the refinery. See modules/dataset_schema.py.
+    # ── C2 + Phase 1.1: dataset_meta.json sidecar + schema validation ──
+    # Sidecar lets external consumers introspect the parquet's label-side
+    # AND feature-side schema without importing the refinery. Phase 1.1
+    # also runs validate() against the canonical contract — any error is
+    # logged (not fatal) so the run still produces the parquet but the
+    # operator sees the contract mismatch.
     try:
-        from modules.dataset_schema import write_dataset_meta
+        from modules.dataset_schema import write_dataset_meta, validate as _schema_validate
         meta_extra = {
             "freq": str(freq),
             "horizon_bars": int(horizon_bars),
@@ -4298,6 +4308,14 @@ def run_day_trading_refinery(
         }
         meta_path = write_dataset_meta(df_out, out_path, extra=meta_extra)
         print(f"   📋 dataset_meta.json: {meta_path}")
+
+        schema_errors = _schema_validate(df_out, strict=False)
+        if schema_errors:
+            print(f"   ⚠️  Phase 1.1 schema validation found {len(schema_errors)} issue(s):")
+            for err in schema_errors:
+                print(f"      • {err}")
+        else:
+            print(f"   ✅ Phase 1.1 schema validation: clean")
     except Exception as e:
         print(f"   ⚠️  dataset_meta sidecar skipped: {e!r}")
 

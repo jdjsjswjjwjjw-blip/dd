@@ -81,15 +81,28 @@ class TestPhase0Renames:
 
 
 class TestPhase0InSource:
-    """Source-level guard — the rename block must stay in
-    prepare_day_trading.py (no silent regressions)."""
+    """Source-level guard — the canonical aliases must stay reachable in
+    prepare_day_trading.py (no silent regressions).
 
-    def test_rename_block_present(self):
+    Phase 0 wrote the rename at the END of the refinery (patch before
+    to_parquet). Phase 1.1 promoted it to compute-source aliasing — the
+    canonical names (obi_net, cvd_cumulative) are now created next to the
+    computation that produces the raw `obi`/`cvd` columns, with the patch
+    block kept as a defensive fallback for the case where one alias was
+    dropped by an intermediate stage. Either evolution must keep the
+    canonical names referenced in source.
+    """
+
+    def test_canonical_names_present(self):
         src = (REPO_ROOT / 'prepare_day_trading.py').read_text()
-        # The Phase 0 comment marker must stay
-        assert 'Phase 0 fix' in src
         assert 'obi_net' in src
         assert 'cvd_cumulative' in src
+        # Phase 1.1 marker — at least one of these must remain so future
+        # readers can find the canonical-alias rationale.
+        assert ('Phase 1.1' in src) or ('Phase 0 fix' in src), (
+            "neither Phase 0 nor Phase 1.1 marker found; the canonical-"
+            "alias rationale must stay documented in source."
+        )
 
 
 class TestPhase0GateRemoval:
