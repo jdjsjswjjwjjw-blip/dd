@@ -122,26 +122,29 @@ class TestDetectorIsUsefulNotTautological:
             f"<0.30 would mean the rule barely generalizes."
         )
 
-    def test_recall_curve_is_monotonic_in_ratio(self):
-        """The threshold-sensitivity curve: recall should RISE as the
-        planted hidden:visible ratio crosses the detector's 2.5x cutoff.
-        This is the empirical evidence that the 2.5x rule is calibrated."""
+    def test_recall_curve_high_above_cutoff(self):
+        """The calibration curve: with the tuned defaults (vol_mult=1.5,
+        refill_seconds=16), recall should be HIGH across all ratio buckets
+        that exceed the vol_mult cutoff. Before tuning the curve rose with
+        ratio (because refill window was the binding constraint and only
+        the largest icebergs accidentally fit in 8s). After tuning, the
+        detector is uniformly sensitive — that's the improvement."""
         sim = IcebergGroundTruthSimulator(IcebergSimConfig(seed=8))
         mbo, gt = sim.generate(n_icebergs=200)
         det = IcebergDetector()
         events = det.detect_events(mbo)
         curve = recall_by_ratio_bucket(events, gt)
 
-        # The lowest ratio bucket (1.5-2.5x) must have LOWER recall than the
-        # highest bucket (6-10x) — the rule correctly discriminates.
-        low_bucket = curve.iloc[0]["recall"]
-        high_bucket = curve.iloc[-1]["recall"]
-        # tolerate NaN if a bucket is empty
-        if not (np.isnan(low_bucket) or np.isnan(high_bucket)):
-            assert high_bucket >= low_bucket, (
-                f"recall should rise with ratio: low={low_bucket:.2f}, "
-                f"high={high_bucket:.2f}"
-            )
+        # Buckets above the 1.5x cutoff: all must have recall >= 0.70
+        # (proves the detector finds the majority of real icebergs, not
+        # just the convenient ones).
+        above_cutoff = curve[curve["ratio_lo"] >= 1.5]
+        for _, row in above_cutoff.iterrows():
+            if not np.isnan(row["recall"]) and row["n"] >= 10:
+                assert row["recall"] >= 0.70, (
+                    f"recall {row['recall']:.2f} too low in bucket "
+                    f"[{row['ratio_lo']}-{row['ratio_hi']}) n={int(row['n'])}"
+                )
 
 
 class TestThresholdSensitivity:
