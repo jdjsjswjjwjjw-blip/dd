@@ -2414,10 +2414,21 @@ def detect_microstructure_events(
                 event_mask[chosen] = True
                 adaptive_added = int(len(chosen))
 
-    df['event_score'] = np.maximum(
-        event_score.to_numpy(dtype=np.float32),
-        continuous_score.to_numpy(dtype=np.float32),
-    ).astype(np.float32)
+    # ── Phase 1.3: continuous z-scores are now the primary signal ──────
+    # Old behaviour: event_score = max(binary_thresholded, continuous).
+    # The binary half collapsed `hawkes_z > 1.0` to a single bit, losing
+    # the magnitude — the IC audit showed `hawkes_intrabar_sum` (raw sum)
+    # STRONG while the z-thresholded boolean carried near-zero IC.
+    # New behaviour: event_score = continuous_score directly. The binary
+    # path is exposed separately as event_score_binary for legacy A/B
+    # comparison, and the raw z-scores ship as their own columns so the
+    # model can learn the continuous response (not the threshold).
+    df['event_score'] = continuous_score.to_numpy(dtype=np.float32)
+    df['event_score_continuous'] = continuous_score.to_numpy(dtype=np.float32)
+    df['event_score_binary'] = event_score.to_numpy(dtype=np.float32)
+    df['hawkes_z_raw'] = hawkes_z.to_numpy(dtype=np.float32)
+    df['absorb_z_raw'] = absorb_z.to_numpy(dtype=np.float32)
+    df['kyle_z_raw'] = kyle_z.to_numpy(dtype=np.float32)
     df['is_event'] = event_mask.astype(np.int8)
 
     # ── إحصاءات التشخيص ──────────────────────────────────────────────────────
