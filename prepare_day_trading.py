@@ -3039,6 +3039,192 @@ def compute_multitask_label_diagnostics(
     return out
 
 
+def compute_strict_execution_labels(
+    df: pd.DataFrame,
+    *,
+    horizon_bars: int = 6,
+    barrier_atr_mult: float = 1.5,
+    min_atr: float = 0.0003,
+) -> pd.DataFrame:
+    """B1 — MT5-faithful strict triple-barrier execution labels.
+
+    Head 2 of the dual-target pipeline. While bias_label (label_by_outcome)
+    is the directional-bias target the SSL backbone / bias model learns —
+    and may carry an MFE/MAE rescue on timeout — the execution head needs
+    a *tradeable* label with no historical look-back: if a barrier is
+    touched, the first touch is frozen; if not, the row is NEUTRAL and
+    masked out (never rescued from the horizon close).
+
+    Delegates to label_engine_v2.label_triple_barrier_atr_vectorized with
+    rescue_on_timeout=False so it shares A1's no-short_tp-bug barrier
+    geometry. Additive: does not read or modify bias_label / path_outcome
+    or any existing column.
+
+    Session-break aware: a row whose forward window (i+1 .. i+horizon)
+    crosses an is_session_break boundary is forced exec_valid=False — a
+    trade cannot span a session gap, so the strict outcome is undefined.
+
+    Columns added:
+        exec_label (int8) : 0=LONG, 1=SHORT, 2=NEUTRAL (strict first-touch)
+        exec_path  (int8) : label_engine_v2 PATH_* (1=TP_LONG, 2=TP_SHORT,
+                            5=TIMEOUT_NEUTRAL); rescue paths never appear.
+        exec_valid (bool) : True iff a hard barrier was touched AND the
+                            forward window did not cross a session break.
+                            This is the per-bar loss mask the execution
+                            head filters on.
+    """
+    from modules.label_engine_v2 import (
+        label_triple_barrier_atr_vectorized,
+        TripleBarrierConfig,
+    )
+
+    out = df.copy()
+    n = len(out)
+    if n == 0 or 'close' not in out.columns:
+        out['exec_label'] = np.zeros(n, dtype=np.int8)
+        out['exec_path'] = np.zeros(n, dtype=np.int8)
+        out['exec_valid'] = np.zeros(n, dtype=bool)
+        return out
+
+    close = pd.to_numeric(out['close'], errors='coerce').to_numpy(dtype=np.float64)
+    atr_col = 'atr_14' if 'atr_14' in out.columns else ('atr' if 'atr' in out.columns else None)
+    if atr_col is None:
+        print("  ⚠️  strict_execution_labels: 'atr_14'/'atr' مفقود — skip")
+        out['exec_label'] = np.full(n, 2, dtype=np.int8)
+        out['exec_path'] = np.zeros(n, dtype=np.int8)
+        out['exec_valid'] = np.zeros(n, dtype=bool)
+        return out
+    atr = pd.to_numeric(out[atr_col], errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
+    atr = np.maximum(atr, float(min_atr))
+
+    horizons = np.full(n, int(horizon_bars), dtype=np.int32)
+    cfg = TripleBarrierConfig(
+        tp_atr_mult=float(barrier_atr_mult),
+        sl_atr_mult=float(barrier_atr_mult),   # symmetric pair (matches A1)
+        min_move_atr_mult=0.0,                  # irrelevant with rescue off
+        horizon_default=int(horizon_bars),
+        rescue_on_timeout=False,                # ← strict: no historical look-back
+    )
+    res = label_triple_barrier_atr_vectorized(close, atr, horizons=horizons, config=cfg)
+    exec_label = res['bias'].astype(np.int8)
+    exec_path = res['path'].astype(np.int8)
+    exec_valid = res['valid'].astype(bool)
+
+    # ── session-break invalidation ────────────────────────────────────
+    # window for row i = bars (i+1 .. i+horizon]; invalidate if any is a break.
+    if 'is_session_break' in out.columns:
+        sb = pd.to_numeric(out['is_session_break'], errors='coerce').fillna(0).to_numpy().astype(np.int64)
+        csum = np.concatenate([[0], np.cumsum(sb)])   # csum[k] = breaks in [0,k)
+        idx = np.arange(n)
+        lo = np.minimum(idx + 1, n)
+        hi = np.minimum(idx + 1 + int(horizon_bars), n)
+        window_break = (csum[hi] - csum[lo]) > 0
+        exec_valid = exec_valid & ~window_break
+
+    out['exec_label'] = exec_label
+    out['exec_path'] = exec_path
+    out['exec_valid'] = exec_valid
+
+    n_long = int((exec_label == 0).sum())
+    n_short = int((exec_label == 1).sum())
+    n_valid = int(exec_valid.sum())
+    print("\n🎯 Strict Execution Labels (B1 — dual-target head 2):")
+    print("─" * 60)
+    print(f"  exec_valid (tradeable, masked-in): {n_valid:,} ({n_valid/max(n,1)*100:.1f}%)")
+    print(f"  exec LONG / SHORT (both directions reachable): {n_long:,} / {n_short:,}")
+    print(f"  exec NEUTRAL (masked-out):         {int((exec_label==2).sum()):,} "
+          f"({(exec_label==2).sum()/max(n,1)*100:.1f}%)")
+    print("─" * 60)
+
+    return out
+
+
+def compute_ssl_directional_target(
+    df: pd.DataFrame,
+    *,
+    horizon_bars: int = 6,
+    use_log: bool = True,
+    clip: float = 0.1,
+) -> pd.DataFrame:
+    """B2 — continuous directional SSL target over a fixed horizon.
+
+    Head 1 of the dual-target pipeline. Where exec_label (B1) is the
+    discrete, masked, tradeable label for the execution head, this is the
+    continuous "where is price going" target the SSL backbone learns on
+    EVERY bar — no event gate, no barrier, no NEUTRAL. Even dead chop bars
+    get a (microscopic) directional value so the backbone keeps learning
+    market context continuously.
+
+        next_price_delta[i] = log(close[i+H] / close[i])     (use_log=True)
+                            = close[i+H] / close[i] - 1       (use_log=False)
+
+    Distinct from the SSL data_loader's on-the-fly `next_price` (a 1-bar
+    log-return feeding the multi-task next_price head): this is the H-bar
+    directional-bias target, persisted in the parquet so the dual-target
+    is explicit and auditable alongside exec_label.
+
+    Causal & gate-free, but right-edge / session-break aware:
+        next_price_delta_valid[i] = False when i+H runs off the dataset OR
+        the window (i+1 .. i+H] crosses an is_session_break (a horizon
+        that spans a weekend/holiday gap is not a real H-bar move).
+
+    Columns added:
+        next_price_delta       (float32)
+        next_price_delta_valid (bool)
+    """
+    out = df.copy()
+    n = len(out)
+    if n == 0 or 'close' not in out.columns:
+        out['next_price_delta'] = np.zeros(n, dtype=np.float32)
+        out['next_price_delta_valid'] = np.zeros(n, dtype=bool)
+        return out
+
+    H = max(int(horizon_bars), 1)
+    close_raw = pd.to_numeric(out['close'], errors='coerce').to_numpy(dtype=np.float64)
+    # CAUSAL fill only (ffill) — never copy a future close backwards.
+    close = pd.Series(close_raw).ffill().to_numpy(dtype=np.float64)
+
+    delta = np.zeros(n, dtype=np.float64)
+    valid = np.zeros(n, dtype=bool)
+    if n > H:
+        c0 = close[:-H]
+        cH = close[H:]
+        ok = np.isfinite(c0) & np.isfinite(cH) & (c0 > 0) & (cH > 0)
+        if use_log:
+            vals = np.log(np.maximum(cH, 1e-9) / np.maximum(c0, 1e-9))
+        else:
+            vals = cH / np.maximum(c0, 1e-9) - 1.0
+        delta[:-H] = np.where(ok, vals, 0.0)
+        valid[:-H] = ok
+
+    delta = np.clip(delta, -float(clip), float(clip))
+
+    # session-break invalidation
+    if 'is_session_break' in out.columns:
+        sb = pd.to_numeric(out['is_session_break'], errors='coerce').fillna(0).to_numpy().astype(np.int64)
+        csum = np.concatenate([[0], np.cumsum(sb)])
+        idx = np.arange(n)
+        lo = np.minimum(idx + 1, n)
+        hi = np.minimum(idx + 1 + H, n)
+        window_break = (csum[hi] - csum[lo]) > 0
+        valid = valid & ~window_break
+
+    out['next_price_delta'] = delta.astype(np.float32)
+    out['next_price_delta_valid'] = valid
+
+    n_valid = int(valid.sum())
+    pos = int((delta[valid] > 0).sum()) if n_valid else 0
+    neg = int((delta[valid] < 0).sum()) if n_valid else 0
+    print(f"\n📈 SSL Directional Target (B2 — dual-target head 1, H={H} bars):")
+    print("─" * 60)
+    print(f"  next_price_delta_valid: {n_valid:,} ({n_valid/max(n,1)*100:.1f}%) "
+          f"— gate-free (every bar gets a value)")
+    print(f"  sign split (valid): up={pos:,} / down={neg:,}")
+    print("─" * 60)
+
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 3: Day Trading Labels
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3864,6 +4050,24 @@ def run_day_trading_refinery(
             df_labeled,
             horizon_bars=int(horizon_bars * 4),  # نافذة أوسع للتشخيص
         )
+
+    # ── 4.6 Strict Execution Labels (B1 — dual-target head 2) ──────────
+    # additive: exec_label/exec_path/exec_valid عبر label_engine_v2 strict
+    # (rescue OFF). لا يلمس bias_label؛ يُغذّي الـ supervised execution head
+    # عبر قناع exec_valid (session-break aware).
+    df_labeled = compute_strict_execution_labels(
+        df_labeled,
+        horizon_bars=int(horizon_bars),
+        barrier_atr_mult=float(tp_atr_mult),
+    )
+
+    # ── 4.7 SSL Directional Target (B2 — dual-target head 1) ───────────
+    # additive: next_price_delta + next_price_delta_valid — continuous
+    # H-bar directional target for SSL backbone، gate-free على كل البارات.
+    df_labeled = compute_ssl_directional_target(
+        df_labeled,
+        horizon_bars=int(horizon_bars),
+    )
 
     # ── 5. Soft Labels ────────────────────────────────────────────
     print("\n🧪 إرفاق Soft Labels...")
