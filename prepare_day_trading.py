@@ -3801,6 +3801,101 @@ def _attach_price_cycle_features(df_bars: pd.DataFrame) -> pd.DataFrame:
 FeatureSelectionMode = str  # 'keep_top' | 'drop_noise' | 'all'
 _FEATURE_SELECTION_MODES: tuple[str, ...] = ('keep_top', 'drop_noise', 'all')
 
+# Phase 1.4 — engineering-fix defaults
+DEFAULT_WARMUP_DROP_BARS: int = 20   # ATR-14 needs ~14 bars to stabilise; 20 is conservative
+
+
+def _apply_phase1_engineering_fixes(
+    df: pd.DataFrame,
+    *,
+    warmup_drop_bars: int = DEFAULT_WARMUP_DROP_BARS,
+) -> pd.DataFrame:
+    """Three IC-audit-driven engineering fixes the Q2 audit surfaced:
+
+    II.B — dist_to_X_atr — three ATR-normalised distance features that
+           replace the scale-dependent versions whose rolling_IR collapsed
+           to ~-4.0 in the audit (london_sess_high, current_vwap, pdh).
+           The new cols are scale-robust — distance in ATR units — so
+           the IC's variance across windows shrinks.
+
+              dist_to_session_high_atr = (close - london_sess_high) / atr_14
+              dist_to_vwap_atr         = (close - current_vwap)     / atr_14
+              dist_to_pdh_atr          = (close - pdh)               / atr_14
+
+    II.C — regime_label_grouped — collapses the two rare regimes
+           (`volatile` n=18 and `low_liquidity` n=44) into a single
+           'rare' bucket. The audit showed IC=0.0 on volatile (n too
+           small) and a sign-flipped IC=+0.30 on low_liquidity (noise),
+           both of which a regime-aware model would learn as spurious
+           edges. The original `regime_label` is preserved unchanged.
+
+    II.D — is_warmup mask — bool flag for the first `warmup_drop_bars`
+           bars where ATR-14 and other windowed indicators haven't
+           stabilised. The audit found WARMUP_RIDER signal on
+           mbp_bar_coverage (IC drops 57.5% after the warmup window),
+           which means the apparent IC on those bars is an artifact.
+           train_event_flag is masked to exclude warmup bars so the
+           training pool doesn't fit the artifact.
+
+    Additive — never modifies the input cols. Safe to call on any
+    refinery-late-stage frame.
+    """
+    out = df.copy()
+    n = len(out)
+
+    # ── II.B: ATR-normalised distance features ─────────────────────────
+    if 'close' in out.columns and 'atr_14' in out.columns:
+        close = pd.to_numeric(out['close'], errors='coerce').astype(np.float64)
+        atr = pd.to_numeric(out['atr_14'], errors='coerce').astype(np.float64)
+        safe_atr = np.where(atr > 1e-12, atr, np.nan)
+        if 'london_sess_high' in out.columns:
+            lsh = pd.to_numeric(out['london_sess_high'], errors='coerce').astype(np.float64)
+            out['dist_to_session_high_atr'] = ((close - lsh) / safe_atr).astype(np.float32)
+        if 'current_vwap' in out.columns:
+            vwap = pd.to_numeric(out['current_vwap'], errors='coerce').astype(np.float64)
+            out['dist_to_vwap_atr'] = ((close - vwap) / safe_atr).astype(np.float32)
+        if 'pdh' in out.columns:
+            pdh = pd.to_numeric(out['pdh'], errors='coerce').astype(np.float64)
+            out['dist_to_pdh_atr'] = ((close - pdh) / safe_atr).astype(np.float32)
+
+    # ── II.C: regime_label_grouped (volatile + low_liquidity → rare) ───
+    if 'regime_label' in out.columns:
+        rare_set = {'volatile', 'low_liquidity'}
+        grouped = out['regime_label'].astype(str).where(
+            ~out['regime_label'].astype(str).isin(rare_set),
+            other='rare',
+        )
+        out['regime_label_grouped'] = grouped
+
+    # ── II.D: is_warmup mask + train_event_flag masking ────────────────
+    is_warmup = np.zeros(n, dtype=bool)
+    if warmup_drop_bars > 0 and n > 0:
+        cut = int(min(warmup_drop_bars, n))
+        is_warmup[:cut] = True
+    out['is_warmup'] = is_warmup
+    # to_numpy() can return a read-only view on newer pandas; .copy()
+    # guarantees we own the buffer before mutating in-place.
+    if 'train_event_flag' in out.columns:
+        tef = pd.to_numeric(out['train_event_flag'], errors='coerce').fillna(0).astype(np.int8).to_numpy().copy()
+        tef[is_warmup] = 0
+        out['train_event_flag'] = tef
+    # Same for exec_valid (B1 mask)
+    if 'exec_valid' in out.columns:
+        ev = out['exec_valid'].astype(bool).to_numpy().copy()
+        ev[is_warmup] = False
+        out['exec_valid'] = ev
+    # Same for next_price_delta_valid (B2 mask)
+    if 'next_price_delta_valid' in out.columns:
+        nv = out['next_price_delta_valid'].astype(bool).to_numpy().copy()
+        nv[is_warmup] = False
+        out['next_price_delta_valid'] = nv
+
+    print(
+        f"   🛠️  Phase 1.4 engineering fixes applied: "
+        f"warmup_drop_bars={warmup_drop_bars} ({int(is_warmup.sum())} bars masked)"
+    )
+    return out
+
 
 def _apply_phase1_feature_selection(
     df: pd.DataFrame,
@@ -3890,6 +3985,8 @@ def _apply_phase1_feature_selection(
         'event_flag', 'train_event_flag', 'kalman_direction',
         'is_session_break', 'session', 'is_london', 'is_overlap', 'is_ny',
         'regime_label', 'regime_cluster',
+        # Phase 1.4 engineering-fix columns (II.C + II.D outputs)
+        'regime_label_grouped', 'is_warmup',
     })
 
     keep = [c for c in df.columns if c in whitelist]
@@ -3946,6 +4043,7 @@ def run_day_trading_refinery(
     apply_event_direction_veto: bool = False,
     add_multitask_diagnostics: bool = True,
     feature_selection: FeatureSelectionMode = 'drop_noise',
+    warmup_drop_bars: int = DEFAULT_WARMUP_DROP_BARS,
 ) -> str:
     """
     Pipeline كاملة: MBO → Day Trading Dataset
@@ -4386,6 +4484,19 @@ def run_day_trading_refinery(
             print(f"   ⚠️ enrichment تخطّي ({type(exc).__name__}: {exc})")
 
     out_path = os.path.join(output_dir, features_fn)
+
+    # ── Phase 1.4 — Engineering fixes from the IC audit ─────────────────
+    # II.B: ATR-normalised distance versions of the 3 scale-dependent
+    #       STRONG features (london_sess_high, current_vwap, pdh).
+    # II.C: regime_label_grouped — merges the two rare regimes
+    #       (volatile n=18, low_liquidity n=44) into 'rare' so training
+    #       doesn't fit noise on sub-50 sample buckets.
+    # II.D: is_warmup — bool flag for the first warmup_drop_bars bars;
+    #       the train_event_flag is masked to exclude them so the warmup
+    #       artifact (mbp_bar_coverage IC drop 0.575) doesn't bleed in.
+    df_out = _apply_phase1_engineering_fixes(
+        df_out, warmup_drop_bars=int(warmup_drop_bars),
+    )
 
     # ── Phase 1.2 — Feature Selection ───────────────────────────────────
     # IC-driven feature filtering BEFORE the parquet is written. Three
@@ -4941,6 +5052,18 @@ if __name__ == '__main__':
         ),
     )
     p.add_argument(
+        '--warmup-drop-bars',
+        type=int, default=DEFAULT_WARMUP_DROP_BARS,
+        help=(
+            f'Phase 1.4 (II.D): mask the first N bars from train_event_flag + '
+            f'exec_valid + next_price_delta_valid (default {DEFAULT_WARMUP_DROP_BARS}). '
+            f'The audit found mbp_bar_coverage warmup_drop=0.575 — apparent IC on '
+            f'those bars is a windowed-indicator artifact, not signal. The bars '
+            f'still ship in the parquet (is_warmup column) for SSL context but are '
+            f'excluded from the training pool. Set 0 to disable.'
+        ),
+    )
+    p.add_argument(
         '--no-seasonal',
         action='store_true',
         help=(
@@ -5033,4 +5156,5 @@ if __name__ == '__main__':
         apply_event_direction_veto=args.apply_event_direction_veto,
         add_multitask_diagnostics=(not args.no_multitask_diagnostics),
         feature_selection=args.feature_selection,
+        warmup_drop_bars=args.warmup_drop_bars,
     )

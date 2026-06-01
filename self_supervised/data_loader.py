@@ -73,6 +73,9 @@ _LEAKAGE_COLS_EXACT: frozenset[str] = frozenset({
     # State labels (categorical, used elsewhere)
     'regime_label', 'regime_cluster', 'market_state_label', 'market_state_code',
     'tradability_label',
+    # Phase 1.4 (II.C): regime_label_grouped is the same kind as regime_label
+    # — categorical state, used elsewhere, not a model feature.
+    'regime_label_grouped',
     # Event-flagging (we keep is_event out because event detection often uses
     # forward signal in some pipelines; safer to exclude than to gamble)
     'is_event', 'event_flag', 'event_score', 'train_event_flag',
