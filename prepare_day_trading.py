@@ -2503,15 +2503,20 @@ def label_by_outcome(
     timeout_mfe_mae: bool = True,
     timeout_mfe_mae_ratio: float = 2.0,
     timeout_mfe_min_move_atr: float = 1.0,
-    ignore_event_direction_veto: bool = False,
+    apply_event_direction_veto: bool = False,
 ) -> pd.DataFrame:
     """
     يلصق الليبل بناءً على أول حاجز يُضرب (First Barrier Hit).
 
-    ignore_event_direction_veto: إذا True، يلغى فيتو event_direction (و Kalman أمبيغوس)
-    على قرار MFE/MAE. على real data، event_direction voting (CVD+OBI+Kalman) قد يخطئ
-    بنسبة عالية → الـ veto يُسقط directional signal حقيقي. التشغيل بـ ignore=True يستخدم
-    raw MFE/MAE فقط؛ event_direction يبقى متاح كـ feature column للنموذج.
+    apply_event_direction_veto (A2): الفيتو مُعطَّل افتراضياً (False). عند True
+    يُسمح لـ event_direction (CVD+OBI+Kalman voting) بمنع اتجاه (allow_long/
+    allow_short) في كل من الـ barrier scan والـ MFE/MAE rescue.
+    لماذا OFF افتراضياً: الـ diagnostic على real data أثبت أن هذا الـ voting
+    يخطئ ~70% من الحالات؛ تفعيله يُسقط ~60% من الـ directional signal الحقيقي
+    ويعيد فرض انحياز اتجاهي فوق الـ scan المتماثل المُصلَّح في A1 (event_dir>0
+    يُلغي short_hit نهائياً → نرجع لـ LONG-bias لكن بالفيتو هذه المرة). الافتراض
+    الآمن هو إبقاؤه مطفأً وترك event_direction عموداً (feature) يتعلّمه النموذج
+    بدل أن يكون veto صلباً. مُتاح للتفعيل التجريبي عبر --apply-event-direction-veto.
 
     Scan بعد A1 (Finding #7): symmetric single-pair barrier.
         - upper = entry + tp_mult × ATR، lower = entry − tp_mult × ATR
@@ -2663,11 +2668,11 @@ def label_by_outcome(
         event_dir_i = int(event_dir_arr[i])
         allow_long = True
         allow_short = True
-        # event_direction veto: مُعطّل افتراضياً عند ignore_event_direction_veto=True
-        # السبب: على real data أثبت الـ diagnostic إن event_direction voting (CVD+OBI+Kalman)
-        # غلط ~70% من الحالات → الـ veto يضيع 60%+ من الـ directional signal الحقيقي.
-        # event_direction يبقى متاح كـ feature column للنموذج يتعلم منه بدل ما يكون veto صلب.
-        if not ignore_event_direction_veto:
+        # event_direction veto (A2): مُعطّل افتراضياً. تفعيله يعيد فرض انحياز
+        # اتجاهي فوق الـ scan المتماثل (A1) ويُسقط ~60% من الـ directional signal
+        # الحقيقي (الـ voting يخطئ ~70% على real data). يُترك event_direction
+        # عموداً يتعلّمه النموذج بدل أن يكون veto صلباً.
+        if apply_event_direction_veto:
             if event_dir_i > 0:
                 allow_short = False
             elif event_dir_i < 0:
@@ -3623,7 +3628,7 @@ def run_day_trading_refinery(
     add_cycle_features_flag: bool = True,
     timeout_mfe_mae_ratio: float = 2.0,
     timeout_mfe_min_move_atr: float = 1.0,
-    ignore_event_direction_veto: bool = False,
+    apply_event_direction_veto: bool = False,
     add_multitask_diagnostics: bool = True,
 ) -> str:
     """
@@ -3814,7 +3819,7 @@ def run_day_trading_refinery(
     print(f"   TP/SL per regime: {REGIME_TP_SL}")
     print(f"   Max bars per regime: {REGIME_MAX_BARS}")
     print(f"   Sprint 19 MFE/MAE: ratio={timeout_mfe_mae_ratio}, min_move_atr={timeout_mfe_min_move_atr}")
-    print(f"   event_direction veto: {'DISABLED (raw MFE/MAE)' if ignore_event_direction_veto else 'enabled'}")
+    print(f"   event_direction veto: {'ENABLED (opt-in)' if apply_event_direction_veto else 'disabled (default — raw symmetric scan)'}")
     df_labeled = label_by_outcome(
         df_bars,
         default_tp_mult=tp_atr_mult,
@@ -3828,7 +3833,7 @@ def run_day_trading_refinery(
         use_event_score_tier_labels=event_score_tier_labels,
         timeout_mfe_mae_ratio=timeout_mfe_mae_ratio,
         timeout_mfe_min_move_atr=timeout_mfe_min_move_atr,
-        ignore_event_direction_veto=ignore_event_direction_veto,
+        apply_event_direction_veto=apply_event_direction_veto,
     )
 
     # توافق backward: أضف label_end_ts إذا لم توجد
@@ -4531,14 +4536,15 @@ if __name__ == '__main__':
         ),
     )
     p.add_argument(
-        '--ignore-event-direction-veto',
+        '--apply-event-direction-veto',
         action='store_true',
         help=(
-            'يلغي فيتو event_direction على قرار MFE/MAE في labeling. '
-            'على real data، إذا كان event_direction voting (CVD+OBI+Kalman) ضعيف '
-            'الدقة، الـ veto يُسقط directional signal حقيقي ويرفع NEUTRAL لـ 97%%. '
-            'استخدم هذا الـ flag لاستخراج اللعنة من البيانات بالاعتماد على MFE/MAE فقط؛ '
-            'event_direction يبقى متاح كـ feature column للنموذج.'
+            'A2: يُفعّل (opt-in) فيتو event_direction في الـ labeling. مُعطَّل '
+            'افتراضياً. تفعيله يسمح لـ event_direction voting (CVD+OBI+Kalman) '
+            'بمنع اتجاه في الـ scan والـ rescue. تحذير: الـ voting يخطئ ~70%% على '
+            'real data، فتفعيله يُسقط ~60%% من الـ directional signal ويعيد فرض '
+            'انحياز اتجاهي فوق الـ symmetric scan (A1). للتجارب فقط؛ event_direction '
+            'يبقى عموداً (feature) يتعلّمه النموذج في الوضع الافتراضي.'
         ),
     )
     p.add_argument(
@@ -4641,6 +4647,6 @@ if __name__ == '__main__':
         add_cycle_features_flag=(not args.no_cycle_features),
         timeout_mfe_mae_ratio=args.timeout_mfe_mae_ratio,
         timeout_mfe_min_move_atr=args.timeout_mfe_min_move_atr,
-        ignore_event_direction_veto=args.ignore_event_direction_veto,
+        apply_event_direction_veto=args.apply_event_direction_veto,
         add_multitask_diagnostics=(not args.no_multitask_diagnostics),
     )

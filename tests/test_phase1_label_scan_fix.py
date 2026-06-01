@@ -58,12 +58,13 @@ def _make_bars(closes: list[float], *, atr: float = 0.001) -> pd.DataFrame:
 
 def _label(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
     """Run label_by_outcome with the veto disabled — A1 tests scan logic,
-    not veto behaviour (that's A2's territory)."""
+    not veto behaviour (that's A2's territory). After A2 the veto-off
+    default is the package default, so this is explicit-for-clarity."""
     return pdt.label_by_outcome(
         df,
         default_tp_mult=1.5,
         default_sl_mult=1.0,
-        ignore_event_direction_veto=True,
+        apply_event_direction_veto=False,
         **kwargs,
     )
 
