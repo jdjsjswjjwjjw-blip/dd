@@ -181,6 +181,32 @@ ORIGINAL_FEATURES: tuple[str, ...] = (
     'cycle_phase_dist_prob', 'cycle_phase_markdown_prob',
     'cycle_position', 'cycle_hurst',
     'cycle_fractal_dim', 'cycle_mtf_alignment',
+    # ── Phase 1.3 — continuous z-scores (replace binary thresholds) ──
+    # finalize_daytrade_parquet_export restricts the output to this
+    # whitelist; before the Phase 1.3/1.4 additions land here, the
+    # downstream Phase 1.4 engineering fixes (CVD family) silently fail
+    # because their input `bar_cvd_delta` was already dropped.
+    'event_score_continuous', 'event_score_binary',
+    'hawkes_z_raw', 'absorb_z_raw', 'kyle_z_raw',
+    # ── Phase 1.4 — MT5-style per-bar CVD (5 features + 1 source) ──
+    'bar_cvd_delta',     # source for the 5 CVD features below
+    'cvd_bar_5m', 'cvd_direction_ratio_5m', 'cvd_intensity_vs_atr',
+    'cvd_divergence_at_level', 'cvd_consecutive_imbalance',
+    # ── Phase 1.1 canonical aliases (kept here so finalize doesn't
+    # drop them before the fallback aliasing block at the end of the
+    # refinery runs) ──
+    'obi_net', 'cvd_cumulative',
+    # ── Phase 1.4 — II.B ATR-normalised distance features ──
+    # Currently added AFTER finalize() so they survive even without
+    # being in this list, but listed here for defensive consistency
+    # in case the call order is rearranged in the future.
+    'dist_to_session_high_atr', 'dist_to_vwap_atr', 'dist_to_pdh_atr',
+    # ── Phase 1.4 — II.C/II.D ──
+    'regime_label_grouped', 'is_warmup',
+    # ── Phase 1.5 — II.A session × feature interactions ──
+    'hawkes_x_session_phase', 'tick_count_x_session_phase',
+    # ── Phase 1.7 — iceberg detection (zeros without MBO ticks) ──
+    'iceberg_count_5m', 'iceberg_total_volume_5m',
 )
 
 # Alias للمانفيست والعقود — نفس ORIGINAL_FEATURES فقط
