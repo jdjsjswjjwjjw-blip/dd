@@ -2513,17 +2513,30 @@ def label_by_outcome(
     بنسبة عالية → الـ veto يُسقط directional signal حقيقي. التشغيل بـ ignore=True يستخدم
     raw MFE/MAE فقط؛ event_direction يبقى متاح كـ feature column للنموذج.
 
-    الفروق الجوهرية عن build_day_trading_labels:
-        1. يعمل على events فقط (is_event == 1) → كفاءة حسابية
-        2. Timeout = نهاية الجلسة الحالية (لا يتجاوز حدودها)
-        3. TP/SL مخصص لكل Regime من REGIME_TP_SL (مع شرائح event_score الاختيارية للحدث)
-        4. Max horizon مخصص لكل Regime من REGIME_MAX_BARS (أو شرائح event_score عند التفعيل)
-        5. في حالة تعارض TP+SL في نفس الـ bar → يُفضّل الأقرب من open
+    Scan بعد A1 (Finding #7): symmetric single-pair barrier.
+        - upper = entry + tp_mult × ATR، lower = entry − tp_mult × ATR
+        - أول لمس يحسم؛ عند لمس الاتجاهين في نفس الـ bar نختار الـ barrier
+          الأقرب لـ open كقياس heuristic لأول-لمس داخل الشمعة.
+        - حالات long_sl/short_sl لم تعد ممكنة (الـ scan الجديد يصدّر {long_tp,
+          short_tp, timeout} فقط).
+    خصائص أخرى:
+        1. Timeout = نهاية الجلسة الحالية (لا يتجاوز حدودها)
+        2. TP/SL multipliers مخصصة لكل Regime من REGIME_TP_SL (مع شرائح
+           event_score الاختيارية للحدث)
+        3. Max horizon مخصص لكل Regime من REGIME_MAX_BARS (أو شرائح
+           event_score عند التفعيل)
 
     الأعمدة المُضافة:
         bias_label     (int8):   0=LONG, 1=SHORT, 2=NEUTRAL
-        path_outcome   (int8):   0=long_tp, 1=short_tp, 2=long_sl, 3=short_sl, 4=timeout, 5=weak_long, 6=weak_short
-        neutral_reason (int8):   0=none, 1=timeout, 2=long_sl, 3=short_sl, 4=kalman, 5=weak_event
+        path_outcome   (int8):   0=long_tp, 1=short_tp, 4=timeout.
+            ملاحظة: codes 2,3,5,6 (long_sl/short_sl/weak_long/weak_short)
+            لم تعد تُنتَج بعد إصلاح A1 (symmetric single-pair scan) +
+            Phase 0 (إزالة weak-event branch). الكودات محفوظة في الـ enum
+            للاتساق الخلفي مع readers تاريخية فقط — لا تتوقّع رؤيتها في
+            مخرجات جديدة.
+        neutral_reason (int8):   0=none, 1=timeout, 4=kalman.
+            codes 2,3 (long_sl/short_sl) و 5 (weak_event) محفوظة في الـ enum
+            للاتساق الخلفي فقط — الـ scan الجديد لا يصدّرها.
         trade_duration (int16):  عدد bars لنهاية الحدث
         signal_quality (int8):   0=ضعيف, 1=جيد, 2=ممتاز (جلسة لندن/overlap)
         forward_return (float32): عائد إلى إغلاق شمعة نهاية الأفق القصوى المسموحة للصف
@@ -2665,15 +2678,23 @@ def label_by_outcome(
                 elif kalman_dir_i == -1 and event_score_i < float(kalman_event_floor):
                     allow_long = False
 
-        tp_dist = tp_mult * atr_i
-        sl_dist = sl_mult * atr_i
+        # A1 root fix (Finding #7): symmetric single-pair barrier scan.
+        # The old four-barrier scan (tp_long, sl_long, tp_short, sl_short) had
+        # a fatal LONG-first ordering bug: any downward path crossing tp_short
+        # at -tp_dist necessarily crossed sl_long at -sl_dist first (since
+        # tp_dist > sl_dist). The code evaluated the LONG side before SHORT,
+        # so it captured long_sl and never reached short_tp. Empirical proof:
+        # Q2 2025 had 0 short_tp labels out of 17,304 bars — mathematically
+        # impossible to short-profit under the old scan. Fix: one symmetric
+        # pair (upper, lower) at distance barrier_mult*ATR; first touch wins.
+        # On rare same-bar dual hits we tie-break by distance-to-open.
+        # path_outcome 2,3,5,6 (long_sl/short_sl/weak_long/weak_short) are
+        # no longer produced; codes preserved in the enum for backward read
+        # compatibility, but the new scan emits only {0,1,4}.
+        barrier_mult = float(tp_mult)
+        upper = entry + barrier_mult * atr_i
+        lower = entry - barrier_mult * atr_i
 
-        tp_long  = entry + tp_dist
-        sl_long  = entry - sl_dist
-        tp_short = entry - tp_dist
-        sl_short = entry + sl_dist
-
-        # ── امشِ bar بـ bar حتى أول ضربة ──────────────────────────────────────
         first_ev: tuple[str, int] | None = None
 
         for j in range(i + 1, sess_end + 1):
@@ -2681,55 +2702,28 @@ def label_by_outcome(
             l = float(low[j])
             o = float(open_[j]) if np.isfinite(open_[j]) else 0.5 * (h + l)
 
-            lt = h >= tp_long
-            ls = l <= sl_long
-            st = l <= tp_short
-            ss = h >= sl_short
+            long_hit  = allow_long  and (h >= upper)
+            short_hit = allow_short and (l <= lower)
 
-            if not allow_long:
-                lt = False
-                ls = False
-            if not allow_short:
-                st = False
-                ss = False
-
-            picked: str | None = None
-
-            # LONG side
-            if lt and ls:
-                d_tp = abs(tp_long  - o)
-                d_sl = abs(sl_long  - o)
-                picked = 'long_tp' if d_tp <= d_sl else 'long_sl'
-            elif lt:
-                picked = 'long_tp'
-            elif ls:
-                picked = 'long_sl'
-
-            # SHORT side (لو لم يُحسم من LONG)
-            if picked is None:
-                if st and ss:
-                    d_tp = abs(tp_short - o)
-                    d_sl = abs(sl_short - o)
-                    picked = 'short_tp' if d_tp <= d_sl else 'short_sl'
-                elif st:
-                    picked = 'short_tp'
-                elif ss:
-                    picked = 'short_sl'
-
-            if picked is not None:
-                first_ev = (picked, j)
+            if long_hit and short_hit:
+                # Same-bar ambiguity: pick barrier closer to bar open as the
+                # likely first-touch heuristic (intra-bar order unobservable
+                # on bar data).
+                d_up = abs(upper - o)
+                d_lo = abs(lower - o)
+                first_ev = (('long_tp' if d_up <= d_lo else 'short_tp'), j)
+                break
+            if long_hit:
+                first_ev = ('long_tp', j)
+                break
+            if short_hit:
+                first_ev = ('short_tp', j)
                 break
 
         # ── تعيين الليبل ─────────────────────────────────────────────────────
-        # دالة قرار MFE/MAE — تُستدعى في كل حالة لا تنتهي بـ TP صريح.
-        # المشكلة القديمة: timeout → NEUTRAL، و *_sl → NEUTRAL تلقائياً.
-        #   في 5min/6B الـ TP barrier نادراً يُضرب، وفي trend صاعد الـ sl_short
-        #   (فوق entry) يُضرب قبل tp_long → يُصنَّف short_sl → NEUTRAL.
-        #   النتيجة: ≈99% NEUTRAL، train_pool ≈ 10 صفوف.
-        # الإصلاح (مطابق منطق modules.label_engine_v2.label_triple_barrier_atr):
-        #   في كل حالة non-TP، نفحص MFE/MAE على نافذة [i+1, sess_end]؛
-        #   الفائز إن كان ضِعف الخاسر (ratio) و>=min_move يحدد الاتجاه.
-        #   يحترم allow_long/allow_short (فيتو اتجاه الحدث + Kalman).
+        # MFE/MAE rescue يُستدعى فقط عند timeout (لم يُلمَس barrier صريح). في
+        # الـ scan الجديد (symmetric single-pair) أي لمس = TP صريح في اتجاهه؛
+        # حالات long_sl/short_sl لم تعد ممكنة فحُذِفت فروعها.
         def _mfe_mae_decide(end_idx: int) -> int:
             if (not timeout_mfe_mae) or end_idx <= i:
                 return 2
@@ -2748,7 +2742,7 @@ def label_by_outcome(
             return 2
 
         if first_ev is None:
-            # Timeout — لم يُضرب أي barrier → قرار MFE/MAE على كامل النافذة.
+            # Timeout — لم يُلمَس أي barrier → قرار MFE/MAE على كامل النافذة.
             trade_duration[i] = max(0, sess_end - i)
             decided = _mfe_mae_decide(sess_end)
             bias_label[i]   = decided
@@ -2774,33 +2768,6 @@ def label_by_outcome(
                 bias_label[i]   = 1   # SHORT ✅ (TP صريح)
                 path_outcome[i] = 1
                 signal_quality[i] = sq
-            elif ev_type == 'long_sl':
-                path_outcome[i] = 2
-                if sl_to_opposite:
-                    bias_label[i] = 1  # وضع aggressive: SL → الاتجاه المعاكس
-                    signal_quality[i] = 1
-                else:
-                    # كان NEUTRAL تلقائياً → الآن MFE/MAE على كامل النافذة
-                    decided = _mfe_mae_decide(sess_end)
-                    bias_label[i] = decided
-                    if decided == 2:
-                        neutral_reason[i] = NEUTRAL_REASON_LONG_SL
-                    else:
-                        signal_quality[i] = 1
-                        neutral_reason[i] = NEUTRAL_REASON_NONE
-            elif ev_type == 'short_sl':
-                path_outcome[i] = 3
-                if sl_to_opposite:
-                    bias_label[i] = 0
-                    signal_quality[i] = 1
-                else:
-                    decided = _mfe_mae_decide(sess_end)
-                    bias_label[i] = decided
-                    if decided == 2:
-                        neutral_reason[i] = NEUTRAL_REASON_SHORT_SL
-                    else:
-                        signal_quality[i] = 1
-                        neutral_reason[i] = NEUTRAL_REASON_NONE
 
     # ── كتابة النتائج ─────────────────────────────────────────────────────────
     df['bias_label']     = bias_label
@@ -3097,162 +3064,6 @@ def _apply_train_event_pool(
     )
     above_atr = pd.to_numeric(out['atr_14'], errors='coerce').fillna(0.0) >= floor
     out['train_event_flag'] = (base.astype(bool) & strong_session & above_atr).astype(np.int8)
-    return out
-
-
-def build_day_trading_labels(
-    df: pd.DataFrame,
-    horizon_bars: int = 6,       # عدد شموع الأفق؛ المدة التقويمية = horizon × مدة شمعة واحدة (مثلاً freq=1min و horizon=60 → ساعة)
-    tp_atr_mult: float = 1.5,    # TP = 1.5 × ATR
-    sl_atr_mult: float = 1.0,    # SL = 1.0 × ATR
-    min_atr: float = 0.0003,     # حد أدنى لـ ATR (3 pips لـ GBPUSD)
-    *,
-    strict_train_pool: bool = False,
-    timeout_mfe_mae: bool = True,
-    timeout_mfe_mae_ratio: float = 2.0,
-    timeout_mfe_min_move_atr: float = 1.0,
-) -> pd.DataFrame:
-    """
-    يبني labels للـ Day Trading على مسار سببي داخل الأفق:
-
-    - يمشي bar-by-bar للأمام حتى أول لمس لأي حاجز TP/SL (long أو short).
-    - داخل نفس الشمعة إذا لُمس TP وSL معًا لنفس الاتجاه، يُفضّل الأقرب لسعر الافتتاح (proxy بسيط).
-    - فوز TP → bias LONG/SHORT مع جودة جلسة.
-    - ضرب SL → NEUTRAL (لا نُصنّف صفقة خاسرة كـ LONG/SHORT).
-    - timeout → NEUTRAL.
-
-    لا يعتمد على price_move عند إغلاق الأفق لاختيار الاتجاه (كان يسبب LONG رغم خسارة SL الحقيقية).
-    """
-    df = df.copy().sort_values('ts_event').reset_index(drop=True)
-    n = len(df)
-
-    bias_label = np.full(n, 2, dtype=np.int8)
-    signal_quality = np.zeros(n, dtype=np.int8)
-    forward_return = np.zeros(n, dtype=np.float32)
-    path_outcome = np.full(n, 4, dtype=np.int8)   # 4 = TIMEOUT
-    label_end_ts = df['ts_event'].copy()
-
-    atr = df['atr_14'].to_numpy(dtype=np.float64)
-    close = df['close'].to_numpy(dtype=np.float64)
-    high = df['high'].to_numpy(dtype=np.float64)
-    low = df['low'].to_numpy(dtype=np.float64)
-    if 'open' in df.columns:
-        open_px = pd.to_numeric(df['open'], errors='coerce').to_numpy(dtype=np.float64)
-    else:
-        open_px = np.array(close, dtype=np.float64)
-    ts = df['ts_event'].values
-
-    for i in range(n - horizon_bars):
-        atr_i = max(float(atr[i]), float(min_atr))
-        tp_dist = float(tp_atr_mult * atr_i)
-        sl_dist = float(sl_atr_mult * atr_i)
-        entry = float(close[i])
-
-        tp_long = entry + tp_dist
-        sl_long = entry - sl_dist
-        tp_short = entry - tp_dist
-        sl_short = entry + sl_dist
-
-        horizon_end = min(i + horizon_bars, n - 1)
-        label_end_ts.iloc[i] = ts[horizon_end]
-        fwd_close = float(close[horizon_end])
-        forward_return[i] = float((fwd_close - entry) / max(entry, 1e-8))
-
-        first_ev: tuple[str, int] | None = None
-
-        for j in range(i + 1, min(i + horizon_bars + 1, n)):
-            h = float(high[j])
-            l = float(low[j])
-            o = float(open_px[j]) if np.isfinite(open_px[j]) else 0.5 * (h + l)
-
-            lt = h >= tp_long
-            ls = l <= sl_long
-            st = l <= tp_short
-            ss = h >= sl_short
-
-            picked: str | None = None
-
-            if lt and ls:
-                d_tp = abs(tp_long - o)
-                d_sl = abs(sl_long - o)
-                picked = 'long_tp' if d_tp <= d_sl else 'long_sl'
-            elif lt:
-                picked = 'long_tp'
-            elif ls:
-                picked = 'long_sl'
-            elif st and ss:
-                d_tp = abs(tp_short - o)
-                d_sl = abs(sl_short - o)
-                picked = 'short_tp' if d_tp <= d_sl else 'short_sl'
-            elif st:
-                picked = 'short_tp'
-            elif ss:
-                picked = 'short_sl'
-
-            if picked is not None:
-                first_ev = (picked, j)
-                label_end_ts.iloc[i] = ts[j]
-                break
-
-        london_ok = bool(df['is_london'].iloc[i] or df['is_overlap'].iloc[i])
-
-        # قرار MFE/MAE — لكل حالة non-TP (timeout, long_sl, short_sl).
-        # يحلّ مشكلة ≈99% NEUTRAL: الـ TP نادراً يُضرب على 5min، والـ *_sl
-        # outcomes كانت تُصنَّف NEUTRAL تلقائياً. (منطق modules.label_engine_v2.)
-        def _mfe_mae_decide() -> int:
-            if not timeout_mfe_mae:
-                return 2
-            win = close[i + 1: horizon_end + 1]
-            if win.size == 0:
-                return 2
-            d = win - entry
-            mfe = max(0.0, float(np.max(d)))
-            mae = max(0.0, float(-np.min(d)))
-            min_move = float(timeout_mfe_min_move_atr) * atr_i
-            ratio = float(timeout_mfe_mae_ratio)
-            if mfe > ratio * mae and mfe >= min_move:
-                return 0
-            if mae > ratio * mfe and mae >= min_move:
-                return 1
-            return 2
-
-        if first_ev is None:
-            decided = _mfe_mae_decide()
-            bias_label[i] = decided
-            path_outcome[i] = 4
-            signal_quality[i] = 0 if decided == 2 else (2 if london_ok else 1)
-        elif first_ev[0] == 'long_tp':
-            bias_label[i] = 0
-            path_outcome[i] = 0
-            signal_quality[i] = 2 if london_ok else 1
-        elif first_ev[0] == 'long_sl':
-            decided = _mfe_mae_decide()
-            bias_label[i] = decided
-            path_outcome[i] = 2
-            signal_quality[i] = 0 if decided == 2 else 1
-        elif first_ev[0] == 'short_tp':
-            bias_label[i] = 1
-            path_outcome[i] = 1
-            signal_quality[i] = 2 if london_ok else 1
-        elif first_ev[0] == 'short_sl':
-            decided = _mfe_mae_decide()
-            bias_label[i] = decided
-            path_outcome[i] = 3
-            signal_quality[i] = 0 if decided == 2 else 1
-
-    out = df.copy()
-    out['bias_label'] = bias_label
-    out['signal_quality'] = signal_quality
-    out['forward_return'] = forward_return
-    out['path_outcome'] = path_outcome
-    out['label_end_ts'] = label_end_ts
-    out['label_horizon_steps'] = horizon_bars
-    out['effective_horizon'] = np.full(n, int(horizon_bars), dtype=np.int32)
-    out['timeout_move_exceeded_band'] = np.zeros(n, dtype=np.int8)
-
-    out['event_flag'] = ((out['bias_label'] != 2) & (out['signal_quality'] > 0)).astype(np.int8)
-    out = _apply_train_event_pool(out, strict_session_atr=strict_train_pool)
-
     return out
 
 
