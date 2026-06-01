@@ -3786,6 +3786,111 @@ def _attach_price_cycle_features(df_bars: pd.DataFrame) -> pd.DataFrame:
     return df_bars
 
 
+# Phase 1.2 — three operating modes, declared at module scope for typing/imports
+FeatureSelectionMode = str  # 'keep_top' | 'drop_noise' | 'all'
+_FEATURE_SELECTION_MODES: tuple[str, ...] = ('keep_top', 'drop_noise', 'all')
+
+
+def _apply_phase1_feature_selection(
+    df: pd.DataFrame,
+    *,
+    mode: FeatureSelectionMode = 'drop_noise',
+) -> pd.DataFrame:
+    """IC-driven feature filter applied just before parquet write.
+
+    The Q2 IC audit identified 50+ NOISE/UNSTABLE features that drag
+    training and 6 STRONG + ~10 MODERATE that carry the signal. This
+    function operationalises that audit. The decision matrix lives in
+    modules/dataset_schema.py (PHASE_1_2_BLACKLIST + TOP_IC_FEATURES +
+    the Phase 1.3/1.4/1.5 NEW spec families).
+
+    Modes:
+        keep_top   — only schema-declared whitelist survives. Smallest,
+                     production-grade output. The output WILL have the
+                     three required-set columns plus every label-target,
+                     plus every audited/new feature spec, plus a small
+                     fixed list of context columns the SSL data_loader
+                     and IC re-audit need (session/regime/event metadata).
+                     Everything else is dropped.
+        drop_noise — every column EXCEPT those in PHASE_1_2_BLACKLIST
+                     survives. Wider safety net; lets the operator see
+                     what else is in the parquet while still removing
+                     the proven-bad cols. The default.
+        all        — no filtering. Use only to (a) re-run the IC audit
+                     against the unfiltered baseline so you can confirm
+                     drop_noise didn't accidentally remove a STRONG
+                     feature, or (b) debug a column the schema doesn't
+                     yet know about.
+
+    Always-preserved columns (across all modes) are computed once and
+    reported in the log so the operator can see what stayed.
+    """
+    from modules.dataset_schema import (
+        REQUIRED_OHLCV, REQUIRED_REGIME,
+        ALL_FEATURE_SPECS, ALL_LABEL_SCHEMAS, DIAGNOSTIC_SCHEMAS,
+        PHASE_1_2_BLACKLIST,
+    )
+
+    mode = mode or 'drop_noise'
+    if mode not in _FEATURE_SELECTION_MODES:
+        raise ValueError(
+            f"feature_selection mode must be one of {_FEATURE_SELECTION_MODES}; "
+            f"got {mode!r}"
+        )
+
+    n_in = len(df.columns)
+
+    if mode == 'all':
+        print(f"   🎚️  feature_selection=all → no filtering ({n_in} cols)")
+        return df
+
+    if mode == 'drop_noise':
+        bad = set(PHASE_1_2_BLACKLIST.keys())
+        dropped = [c for c in df.columns if c in bad]
+        keep = [c for c in df.columns if c not in bad]
+        df_out = df[keep]
+        print(
+            f"   🎚️  feature_selection=drop_noise → dropped {len(dropped)} "
+            f"NOISE/UNSTABLE col(s); {n_in} → {len(df_out.columns)}"
+        )
+        if dropped:
+            print(f"      removed: {', '.join(sorted(dropped)[:8])}"
+                  f"{'…' if len(dropped) > 8 else ''}")
+        return df_out
+
+    # mode == 'keep_top' — strict whitelist
+    whitelist: set[str] = set()
+    whitelist.update(REQUIRED_OHLCV)
+    whitelist.update(REQUIRED_REGIME)
+    # canonical aliases + their raw computes (internal-compute readers
+    # depend on the raw names; keeping both is the documented contract)
+    whitelist.update({'obi', 'obi_net', 'cvd', 'cvd_cumulative'})
+    # every label-side spec (bias_label + exec_* + next_price_delta* +
+    # multitask diagnostics)
+    whitelist.update(s.name for s in ALL_LABEL_SCHEMAS)
+    whitelist.update(s.name for s in DIAGNOSTIC_SCHEMAS)
+    # every audited + new feature spec
+    whitelist.update(s.name for s in ALL_FEATURE_SPECS)
+    # Context columns the data_loader / IC re-audit need (session split,
+    # event metadata, kalman direction — kept as features by the IC re-
+    # audit even when the label-time veto is off).
+    whitelist.update({
+        'is_event', 'event_score', 'event_score_tier', 'event_direction',
+        'event_flag', 'train_event_flag', 'kalman_direction',
+        'is_session_break', 'session', 'is_london', 'is_overlap', 'is_ny',
+        'regime_label', 'regime_cluster',
+    })
+
+    keep = [c for c in df.columns if c in whitelist]
+    dropped = [c for c in df.columns if c not in whitelist]
+    df_out = df[keep]
+    print(
+        f"   🎚️  feature_selection=keep_top → strict whitelist; "
+        f"{n_in} → {len(df_out.columns)} cols ({len(dropped)} dropped)"
+    )
+    return df_out
+
+
 def run_day_trading_refinery(
     mbo_dir: str | None,
     mbp_path: str | None,
@@ -3829,6 +3934,7 @@ def run_day_trading_refinery(
     timeout_mfe_min_move_atr: float = 1.0,
     apply_event_direction_veto: bool = False,
     add_multitask_diagnostics: bool = True,
+    feature_selection: FeatureSelectionMode = 'drop_noise',
 ) -> str:
     """
     Pipeline كاملة: MBO → Day Trading Dataset
@@ -4269,6 +4375,15 @@ def run_day_trading_refinery(
             print(f"   ⚠️ enrichment تخطّي ({type(exc).__name__}: {exc})")
 
     out_path = os.path.join(output_dir, features_fn)
+
+    # ── Phase 1.2 — Feature Selection ───────────────────────────────────
+    # IC-driven feature filtering BEFORE the parquet is written. Three
+    # modes:
+    #   keep_top   : only the audited TOP_IC_FEATURES + the Phase
+    #                1.3/1.4/1.5 new features + required + label specs
+    #   drop_noise : remove only the explicit BAD list (NOISE/UNSTABLE)
+    #   all        : no filtering (for debugging / IC re-audit baseline)
+    df_out = _apply_phase1_feature_selection(df_out, mode=feature_selection)
 
     # Phase 1.1: canonical aliases are now created at compute-source
     # (prepare_day_trading.py: obi_net at line 982 next to df['obi'].clip,
@@ -4802,6 +4917,19 @@ if __name__ == '__main__':
         ),
     )
     p.add_argument(
+        '--feature-selection',
+        choices=list(_FEATURE_SELECTION_MODES),
+        default='drop_noise',
+        help=(
+            'Phase 1.2 IC-driven feature filtering applied before parquet write. '
+            'keep_top = strict whitelist (only audited STRONG/MODERATE + new '
+            'Phase 1.3/1.4/1.5 + required + label specs + context). '
+            'drop_noise = remove only the 30+ NOISE/UNSTABLE_WALKFORWARD '
+            'columns identified by the Q2 IC audit (default). '
+            'all = no filtering (debugging / IC re-audit baseline only).'
+        ),
+    )
+    p.add_argument(
         '--no-seasonal',
         action='store_true',
         help=(
@@ -4893,4 +5021,5 @@ if __name__ == '__main__':
         timeout_mfe_min_move_atr=args.timeout_mfe_min_move_atr,
         apply_event_direction_veto=args.apply_event_direction_veto,
         add_multitask_diagnostics=(not args.no_multitask_diagnostics),
+        feature_selection=args.feature_selection,
     )
