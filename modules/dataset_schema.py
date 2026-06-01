@@ -194,6 +194,7 @@ FAMILY_ICEBERG = "iceberg"            # Phase 1.5
 FAMILY_DIST_ATR = "dist_to_x_atr"     # Phase 1.4-aux (II.B fix)
 FAMILY_INTERACTION = "interaction"    # Phase 1.5-aux (II.A fix)
 FAMILY_CONTEXT = "context"            # event metadata kept as features
+FAMILY_COMPASS = "liquidity_compass"  # Phase 1.7 — OFI / Δ-divergence / VWAP-z
 
 
 # IC-verdict tags (from the Q2 audit — drives Phase 1.2's blacklist)
@@ -335,6 +336,17 @@ PHASE_1_6_KEY_LEVEL_FEATURES: tuple[FeatureSpec, ...] = (
     FeatureSpec("dist_to_pwl_atr", FAMILY_DIST_ATR, IC_VERDICT_NEW,
                 "1.13: (close - pwl) / atr_14 — scale-robust dist to prev-week low."),
 )
+# Phase 1.7: the "Liquidity Compass" — three instantaneous institutional-
+# pressure derivatives that replace the heavy raw-CVD / microstructure family
+# in the structure-only day-trade design. cvd_divergence_at_level is the third
+# tool (already specced under FAMILY_CVD_MT5). These two complete the trio so
+# keep_top keeps them; the structure_compass event gate is built on all three.
+PHASE_1_7_COMPASS_FEATURES: tuple[FeatureSpec, ...] = (
+    FeatureSpec("order_flow_imbalance", FAMILY_COMPASS, IC_VERDICT_NEW,
+                "1.7: OFI = (buy_vol - sell_vol)/total ∈ [-1,1] — instantaneous flow imbalance."),
+    FeatureSpec("vwap_z_score", FAMILY_COMPASS, IC_VERDICT_NEW,
+                "1.7: VWAP stretch — session-VWAP deviation in std units (mean-reversion tell)."),
+)
 
 
 # Required-by-pipeline columns (not features themselves but must be present)
@@ -355,6 +367,7 @@ ALL_FEATURE_SPECS: tuple[FeatureSpec, ...] = (
     *PHASE_1_5_NEW_FEATURES,
     *PHASE_1_5_INTERACTION_FEATURES,
     *PHASE_1_6_KEY_LEVEL_FEATURES,
+    *PHASE_1_7_COMPASS_FEATURES,
 )
 
 

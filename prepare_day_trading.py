@@ -144,6 +144,8 @@ ORIGINAL_FEATURES: tuple[str, ...] = (
     'obi', 'bid_wall_strength', 'ask_wall_strength',
     'distance_to_wall', 'gap_size', 'liquidity_density',
     'micro_price', 'current_vwap', 'vwap_z_score',
+    # Liquidity Compass (3 institutional-pressure tools — structure-only design)
+    'order_flow_imbalance',  # vwap_z_score + cvd_divergence_at_level already listed
     # Levels (daily + weekly key levels — structure-aware context)
     'pdh', 'pdl', 'dist_to_pdh', 'price_position',
     'pwh', 'pwl', 'weekly_price_position',
@@ -2323,6 +2325,162 @@ def build_rolling_lob_tensors_mbo_only(
 # STEP 3a: Event Gate — يكشف لحظات الـ Informed Flow الحقيقي (المشكلة F + I)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+def _compute_delta_divergence_at_level(
+    close: np.ndarray,
+    atr: np.ndarray,
+    cvd_bar: np.ndarray,
+    levels: list[tuple[np.ndarray, int]],
+    *,
+    proximity_atr: float = 0.3,
+) -> np.ndarray:
+    """Delta-divergence-at-level — the strongest reversal tell.
+
+    When price touches a STRUCTURAL level (within `proximity_atr` ATR) but the
+    bar's signed delta (CVD) pushes the OTHER way, the market is rejecting the
+    move. Returns int8 ∈ {-1, 0, +1}:
+        +1 = bullish divergence  (near resistance/ceiling + delta SHORT → rally rejected)
+        -1 = bearish divergence  (near support/floor   + delta LONG  → dip rejected)
+
+    `levels` is a list of (level_array, sign_bull): sign_bull < 0 marks a
+    ceiling (resistance), > 0 a floor (support). Shared by the event gate and
+    the cvd_divergence_at_level feature so the two never drift apart.
+    """
+    n = len(close)
+    atr_safe = np.where(atr > 1e-12, atr, np.nan)
+    divergence = np.zeros(n, dtype=np.int8)
+    for level, sign_bull in levels:
+        proximity = np.abs(close - level) / atr_safe < proximity_atr
+        if sign_bull < 0:        # ceiling: bullish divergence
+            bull = proximity & (cvd_bar < 0)
+            divergence[bull] = np.where(divergence[bull] == 0, np.int8(1), divergence[bull])
+        else:                    # floor: bearish divergence
+            bear = proximity & (cvd_bar > 0)
+            divergence[bear] = np.where(divergence[bear] == 0, np.int8(-1), divergence[bear])
+    return divergence
+
+
+def _structure_level_arrays(df: pd.DataFrame) -> list[tuple[np.ndarray, int]]:
+    """The key structural levels available on `df`, tagged ceiling(-1)/floor(+1).
+    Includes the daily AND weekly levels (pwh/pwl wired in 1.13) + session
+    extremes. Missing columns are skipped silently."""
+    spec = (
+        ('pdh', -1), ('pwh', -1), ('london_sess_high', -1),
+        ('pdl', +1), ('pwl', +1), ('london_sess_low', +1),
+    )
+    out: list[tuple[np.ndarray, int]] = []
+    for col, sign in spec:
+        if col in df.columns:
+            arr = pd.to_numeric(df[col], errors='coerce').astype(np.float64).to_numpy()
+            out.append((arr, sign))
+    return out
+
+
+def detect_structure_compass_events(
+    df: pd.DataFrame,
+    *,
+    level_proximity_atr: float = 0.5,
+    ofi_thresh: float = 0.30,
+    vwap_stretch_z: float = 1.5,
+    divergence_proximity_atr: float = 0.3,
+) -> pd.DataFrame:
+    """Structure + Liquidity-Compass event gate (the structure-only design).
+
+    An event is a STRUCTURALLY significant moment confirmed by INSTITUTIONAL
+    pressure — not a microstructure z-score spike. Two conjoined conditions:
+
+      structural trigger  = (active session: london/overlap/ny — the seasonal
+                             map's "when") AND (price within level_proximity_atr
+                             of a key level: pdh/pdl/pwh/pwl/session hi-lo)
+
+      compass confirmation = ANY of the 3 liquidity-compass tools fires:
+                             • OFI       : |order_flow_imbalance| > ofi_thresh
+                             • Δ-divergence-at-level (the reversal tell)
+                             • VWAP-Z stretch : |vwap_z_score| > vwap_stretch_z
+
+      is_event = structural_trigger AND compass_confirmation
+
+    NO min_event_rate floor — the rate is whatever structure+pressure naturally
+    coincide at, never a manufactured quota. NO kyle/hawkes/absorb domination.
+    Non-circular: structure says WHEN/WHERE, the compass says HOW HARD.
+
+    Sets the same output contract as detect_microstructure_events:
+        is_event (int8), event_score / event_score_continuous /
+        event_score_binary (float32). The deprecated microstructure z columns
+        ship as zeros in this mode (the gate doesn't use them).
+    """
+    df = df.copy()
+    n = len(df)
+
+    def _num(col, default=0.0):
+        return pd.to_numeric(df.get(col, pd.Series(default, index=df.index)),
+                             errors='coerce').fillna(default).astype(np.float64).to_numpy()
+
+    close = _num('close')
+    atr = _num('atr_14', 1e-9)
+    safe_atr = np.where(atr > 1e-12, atr, np.nan)
+    cvd_bar = _num('bar_cvd_delta')
+    ofi = np.clip(_num('order_flow_imbalance'), -1.0, 1.0)
+    vwap_z = _num('vwap_z_score')
+
+    # ── active session (the seasonal map's "when") ─────────────────────────
+    sess_flags = [c for c in ('is_london', 'is_overlap', 'is_ny') if c in df.columns]
+    if sess_flags:
+        active = np.zeros(n, dtype=bool)
+        for c in sess_flags:
+            active |= pd.to_numeric(df[c], errors='coerce').fillna(0).astype(bool).to_numpy()
+    else:
+        active = np.ones(n, dtype=bool)   # no session info → don't block
+
+    # ── near a key structural level (the "where") ──────────────────────────
+    levels = _structure_level_arrays(df)
+    if levels:
+        dists = np.vstack([np.abs(close - lv) / safe_atr for lv, _ in levels])
+        min_dist_atr = np.nanmin(dists, axis=0)
+        min_dist_atr = np.where(np.isfinite(min_dist_atr), min_dist_atr, np.inf)
+    else:
+        min_dist_atr = np.zeros(n)        # no levels → don't block on proximity
+    near_level = min_dist_atr < level_proximity_atr
+
+    structural_trigger = active & near_level
+
+    # ── compass confirmation (the 3 liquidity tools) ───────────────────────
+    divergence = _compute_delta_divergence_at_level(
+        close, atr, cvd_bar, levels, proximity_atr=divergence_proximity_atr,
+    )
+    compass_ofi = np.abs(ofi) > ofi_thresh
+    compass_div = divergence != 0
+    compass_vwap = np.abs(vwap_z) > vwap_stretch_z
+    compass_any = compass_ofi | compass_div | compass_vwap
+
+    is_event = structural_trigger & compass_any
+
+    # ── continuous score for the model: proximity × pressure, session-gated ─
+    level_prox_score = np.clip(1.0 - min_dist_atr / max(level_proximity_atr, 1e-9), 0.0, 1.0)
+    compass_mag = np.clip(
+        np.clip(np.abs(ofi), 0.0, 1.0) * 0.40
+        + (divergence != 0).astype(np.float64) * 0.30
+        + np.clip(np.abs(vwap_z) / 3.0, 0.0, 1.0) * 0.30,
+        0.0, 1.0,
+    )
+    event_score_continuous = (active.astype(np.float64) * level_prox_score * compass_mag).astype(np.float32)
+
+    df['event_score'] = event_score_continuous
+    df['event_score_continuous'] = event_score_continuous
+    df['event_score_binary'] = is_event.astype(np.float32)
+    df['is_event'] = is_event.astype(np.int8)
+    # Deprecated microstructure z-scores — zero in this mode (export contract).
+    for c in ('hawkes_z_raw', 'absorb_z_raw', 'kyle_z_raw'):
+        df[c] = np.float32(0.0)
+
+    n_evt = int(is_event.sum())
+    print(
+        f"  📊 Structure+Compass gate: {n_evt:,}/{n:,} = {n_evt/max(n,1):.1%} events "
+        f"(natural rate, no floor) | trigger: active∧near-level, confirm: OFI/Δ-div/VWAP-z"
+    )
+    return df
+
+
 def detect_microstructure_events(
     df: pd.DataFrame,
     *,
@@ -3992,34 +4150,18 @@ def _apply_phase1_engineering_fixes(
             intensity = np.where(np.isfinite(safe_atr), np.abs(cvd_bar) / safe_atr, 0.0)
             out['cvd_intensity_vs_atr'] = intensity.astype(np.float32)
 
-        # (4) cvd_divergence_at_level — bullish divergence when price is
-        # near a structural ceiling (PDH/london_sess_high) but CVD bar is
-        # SHORT (sell pressure), bearish divergence at floors (PDL/sess_low)
-        # with LONG bar. Output ∈ {-1, 0, +1}: +1=bullish div, -1=bearish.
+        # (4) cvd_divergence_at_level — bullish divergence when price is near
+        # a structural ceiling (PDH/PWH/london_sess_high) but CVD bar is SHORT,
+        # bearish at floors (PDL/PWL/sess_low) with LONG bar. Now includes the
+        # WEEKLY levels (pwh/pwl, wired in 1.13) and shares the exact same
+        # _compute_delta_divergence_at_level helper the structure-compass event
+        # gate uses, so the feature and the gate never disagree.
         if all(c in out.columns for c in ('close', 'atr_14')):
             close = pd.to_numeric(out['close'], errors='coerce').astype(np.float64).to_numpy()
             atr = pd.to_numeric(out['atr_14'], errors='coerce').astype(np.float64).to_numpy()
-            atr_safe = np.where(atr > 1e-12, atr, np.nan)
-            divergence = np.zeros(n, dtype=np.int8)
-            for level_col, sign_bull in (
-                ('pdh', -1),
-                ('pdl', +1),
-                ('london_sess_high', -1),
-                ('london_sess_low', +1),
-            ):
-                if level_col not in out.columns:
-                    continue
-                level = pd.to_numeric(out[level_col], errors='coerce').astype(np.float64).to_numpy()
-                proximity = np.abs(close - level) / atr_safe < 0.3   # within 0.3 ATR
-                # bullish (+1): near ceiling AND short cvd → market rejects rally
-                # bearish (-1): near floor AND long cvd → market rejects dip
-                if sign_bull < 0:    # ceiling test
-                    bull = proximity & (cvd_bar < 0)
-                    divergence[bull] = np.where(divergence[bull] == 0, +1, divergence[bull])
-                else:                 # floor test
-                    bear = proximity & (cvd_bar > 0)
-                    divergence[bear] = np.where(divergence[bear] == 0, -1, divergence[bear])
-            out['cvd_divergence_at_level'] = divergence
+            out['cvd_divergence_at_level'] = _compute_delta_divergence_at_level(
+                close, atr, cvd_bar, _structure_level_arrays(out), proximity_atr=0.3,
+            )
 
         # (5) cvd_consecutive_imbalance — streak counter of same-sign cvd_bar
         # above a magnitude threshold (the bar's |cvd| > median). Resets on
@@ -4167,6 +4309,7 @@ def run_day_trading_refinery(
     event_threshold_scale: float = 1.0,
     event_threshold_shift: float = 0.0,
     min_event_rate: float = 0.12,
+    event_gate_mode: str = 'microstructure',
     kalman_event_floor: float = _KALMAN_EVENT_FLOOR,
     weak_event_to_directional: bool = False,
     weak_event_min_move_atr: float = 0.35,
@@ -4372,13 +4515,17 @@ def run_day_trading_refinery(
         df_bars['mbo_bar_coverage'] = _mbo_bar_coverage_from_tick_series(df_bars['num_trades'])
     elif 'mbo_bar_coverage' not in df_bars.columns:
         df_bars['mbo_bar_coverage'] = np.float32(0.0)
-    print(f"\n🔍 كشف Microstructure Events (Event Gate — المشكلة F+I)...")
-    df_bars = detect_microstructure_events(
-        df_bars,
-        threshold_scale=event_threshold_scale,
-        threshold_shift=event_threshold_shift,
-        min_event_rate=min_event_rate,
-    )
+    if event_gate_mode == 'structure_compass':
+        print(f"\n🔍 كشف Events (Structure + Liquidity-Compass gate — structure-only)...")
+        df_bars = detect_structure_compass_events(df_bars)
+    else:
+        print(f"\n🔍 كشف Microstructure Events (Event Gate — المشكلة F+I)...")
+        df_bars = detect_microstructure_events(
+            df_bars,
+            threshold_scale=event_threshold_scale,
+            threshold_shift=event_threshold_shift,
+            min_event_rate=min_event_rate,
+        )
     print("\n🧭 Directional voting (CVD + OBI + Kalman)...")
     df_bars = add_event_direction(df_bars)
 
@@ -5007,7 +5154,19 @@ if __name__ == '__main__':
         default=0.12,
         help=(
             'floor مستهدف لنسبة event_flag (يُقصّ ضمن [0, 60%%])؛ '
-            'أعلى من الـ default يوسّع التدريب عند تضيّق البوابة، default=0.12'
+            'أعلى من الـ default يوسّع التدريب عند تضيّق البوابة، default=0.12. '
+            '(يُتجاهل عند --event-gate-mode structure_compass — لا floor)'
+        ),
+    )
+    p.add_argument(
+        '--event-gate-mode',
+        choices=('microstructure', 'structure_compass'),
+        default='microstructure',
+        help=(
+            'microstructure = البوابة القديمة (hawkes/absorb/kyle z + floor). '
+            'structure_compass = البوابة الهيكلية الجديدة: حدث = (session نشط ∧ '
+            'قريب من key level) ∧ تأكيد compass (OFI/Δ-divergence/VWAP-z)، '
+            'بدون floor مصطنع — للـ structure-only day-trade. default=microstructure'
         ),
     )
     p.add_argument(
@@ -5296,6 +5455,7 @@ if __name__ == '__main__':
         event_threshold_scale=args.event_threshold_scale,
         event_threshold_shift=args.event_threshold_shift,
         min_event_rate=args.min_event_rate,
+        event_gate_mode=args.event_gate_mode,
         kalman_event_floor=args.kalman_event_floor,
         weak_event_to_directional=args.weak_event_to_directional,
         weak_event_min_move_atr=args.weak_event_min_move_atr,
