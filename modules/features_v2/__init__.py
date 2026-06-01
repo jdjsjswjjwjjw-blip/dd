@@ -6,5 +6,11 @@ and can be invoked independently of the main refinery (useful for
 unit-testing on synthetic data + per-feature IC re-audits).
 
 Currently:
-    iceberg — Korajczyk-Murphy-style iceberg detector for MBO tick streams.
+    iceberg     — Korajczyk-Murphy-style iceberg detector for MBO tick streams.
+    absorption  — Absorption Intensity Index wrapper over the production engine.
+
+Each detector ships with a market-realistic ground-truth simulator
+(*_simulator.py) that plants events + volume/price-matched confounders so
+precision/recall is MEASURED against a planting log, not assumed against a
+tautological fixture.
 """
