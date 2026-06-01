@@ -3436,11 +3436,14 @@ def _build_daytrade_contract(
     dataset_id = hashlib.sha256(
         json.dumps(contract_seed, sort_keys=True).encode('utf-8'),
     ).hexdigest()[:16]
+    # C2: schema_version bumped to phase1-c2 (Phase 0 + A1 + A2 + B1 + B2
+    # + C1 + C2 all live). The dataset_meta.json sidecar carries the full
+    # label-spec list; this contract field is the short tag for manifests.
     return {
         'source_csv': os.path.abspath(str(mbo_path)),
         'mbp_source': None if not mbp_path else os.path.abspath(str(mbp_path)),
         'dataset_id': dataset_id,
-        'schema_version': 'v19-daytrade-event-gate',
+        'schema_version': 'phase1-c2',
         'label_mode': 'v19-daytrading',
         'session_profile': str(session_profile),
         'split_time': split_meta.get('split_time'),
@@ -4278,6 +4281,25 @@ def run_day_trading_refinery(
     df_out.to_parquet(out_path, index=False)
     print(f"\n💾 Dataset محفوظ: {out_path}")
     print(f"   Rows: {len(df_out):,} | Columns: {len(df_out.columns)}")
+
+    # ── C2: dataset_meta.json sidecar — schema source of truth ─────────
+    # Lets external consumers introspect the parquet's label-side schema
+    # (which targets present, which masks they pair with, leakage classes)
+    # without importing the refinery. See modules/dataset_schema.py.
+    try:
+        from modules.dataset_schema import write_dataset_meta
+        meta_extra = {
+            "freq": str(freq),
+            "horizon_bars": int(horizon_bars),
+            "tp_atr_mult": float(tp_atr_mult),
+            "sl_atr_mult": float(sl_atr_mult),
+            "session_profile": str(session_profile),
+            "apply_event_direction_veto": bool(apply_event_direction_veto),
+        }
+        meta_path = write_dataset_meta(df_out, out_path, extra=meta_extra)
+        print(f"   📋 dataset_meta.json: {meta_path}")
+    except Exception as e:
+        print(f"   ⚠️  dataset_meta sidecar skipped: {e!r}")
 
     mbp_bar_cov_stats = _coverage_stats(df_out.get('mbp_bar_coverage', 0.0), low_threshold=0.30)
     mbp_roll_cov_stats = _coverage_stats(df_out.get('mbp_roll_lob_coverage', 0.0), low_threshold=0.50)
