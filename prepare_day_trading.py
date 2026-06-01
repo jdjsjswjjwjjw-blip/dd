@@ -3909,6 +3909,86 @@ def _apply_phase1_engineering_fixes(
         nv[is_warmup] = False
         out['next_price_delta_valid'] = nv
 
+    # ── Phase 1.4 core — MT5-style CVD features (5 cols) ───────────────
+    # The audit's per-event-status IC flagged `volume_burst`, `tick_count`,
+    # `volume` as STRONG/MODERATE — bar-level flow carries signal. The
+    # existing `cvd` is a cumulative line (rolling sum), `cvd_slope_*`
+    # variants were WEAK (audit dropped them). Phase 1.4 ships five
+    # explicit MT5-style per-bar deltas, derived from `bar_cvd_delta`
+    # (already computed at the bar-resample stage).
+    if 'bar_cvd_delta' in out.columns:
+        cvd_bar = pd.to_numeric(out['bar_cvd_delta'], errors='coerce').fillna(0.0).astype(np.float64).to_numpy()
+
+        # (1) cvd_bar_5m — per-bar signed volume (the MT5 delta concept,
+        # but from MBO aggressor side, not a tick-rule approximation).
+        out['cvd_bar_5m'] = cvd_bar.astype(np.float32)
+
+        # (2) cvd_direction_ratio_5m — |buy-sell|/total ∈ [0,1]. Uses bar
+        # volume as the denominator. NaN-safe on zero-volume bars.
+        if 'volume' in out.columns:
+            vol = pd.to_numeric(out['volume'], errors='coerce').fillna(0.0).astype(np.float64).to_numpy()
+            safe_vol = np.where(vol > 1e-12, vol, np.nan)
+            ratio = np.where(np.isfinite(safe_vol), np.abs(cvd_bar) / safe_vol, 0.0)
+            out['cvd_direction_ratio_5m'] = np.clip(ratio, 0.0, 1.0).astype(np.float32)
+
+        # (3) cvd_intensity_vs_atr — |cvd_bar| / atr_14, normalised intensity.
+        if 'atr_14' in out.columns:
+            atr = pd.to_numeric(out['atr_14'], errors='coerce').astype(np.float64).to_numpy()
+            safe_atr = np.where(atr > 1e-12, atr, np.nan)
+            intensity = np.where(np.isfinite(safe_atr), np.abs(cvd_bar) / safe_atr, 0.0)
+            out['cvd_intensity_vs_atr'] = intensity.astype(np.float32)
+
+        # (4) cvd_divergence_at_level — bullish divergence when price is
+        # near a structural ceiling (PDH/london_sess_high) but CVD bar is
+        # SHORT (sell pressure), bearish divergence at floors (PDL/sess_low)
+        # with LONG bar. Output ∈ {-1, 0, +1}: +1=bullish div, -1=bearish.
+        if all(c in out.columns for c in ('close', 'atr_14')):
+            close = pd.to_numeric(out['close'], errors='coerce').astype(np.float64).to_numpy()
+            atr = pd.to_numeric(out['atr_14'], errors='coerce').astype(np.float64).to_numpy()
+            atr_safe = np.where(atr > 1e-12, atr, np.nan)
+            divergence = np.zeros(n, dtype=np.int8)
+            for level_col, sign_bull in (
+                ('pdh', -1),
+                ('pdl', +1),
+                ('london_sess_high', -1),
+                ('london_sess_low', +1),
+            ):
+                if level_col not in out.columns:
+                    continue
+                level = pd.to_numeric(out[level_col], errors='coerce').astype(np.float64).to_numpy()
+                proximity = np.abs(close - level) / atr_safe < 0.3   # within 0.3 ATR
+                # bullish (+1): near ceiling AND short cvd → market rejects rally
+                # bearish (-1): near floor AND long cvd → market rejects dip
+                if sign_bull < 0:    # ceiling test
+                    bull = proximity & (cvd_bar < 0)
+                    divergence[bull] = np.where(divergence[bull] == 0, +1, divergence[bull])
+                else:                 # floor test
+                    bear = proximity & (cvd_bar > 0)
+                    divergence[bear] = np.where(divergence[bear] == 0, -1, divergence[bear])
+            out['cvd_divergence_at_level'] = divergence
+
+        # (5) cvd_consecutive_imbalance — streak counter of same-sign cvd_bar
+        # above a magnitude threshold (the bar's |cvd| > median). Resets on
+        # sign flip or weak bar.
+        median_abs = float(np.nanmedian(np.abs(cvd_bar))) if n else 0.0
+        strong_enough = np.abs(cvd_bar) > median_abs
+        signs = np.sign(cvd_bar) * strong_enough     # ±1 if strong, else 0
+        streak = np.zeros(n, dtype=np.int16)
+        cur = 0
+        prev_sign = 0
+        for i in range(n):
+            s = signs[i]
+            if s == 0:
+                cur = 0
+                prev_sign = 0
+            elif s == prev_sign:
+                cur += int(s)
+            else:
+                cur = int(s)
+                prev_sign = int(s)
+            streak[i] = cur
+        out['cvd_consecutive_imbalance'] = streak
+
     print(
         f"   🛠️  Phase 1.4 engineering fixes applied: "
         f"warmup_drop_bars={warmup_drop_bars} ({int(is_warmup.sum())} bars masked)"
