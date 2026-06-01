@@ -3858,6 +3858,25 @@ def _apply_phase1_engineering_fixes(
             pdh = pd.to_numeric(out['pdh'], errors='coerce').astype(np.float64)
             out['dist_to_pdh_atr'] = ((close - pdh) / safe_atr).astype(np.float32)
 
+    # ── II.A: session × feature interactions ───────────────────────────
+    # The audit's per-session split showed `hawkes_intrabar_sum` and
+    # `tick_count` SIGN-FLIP between sessions:
+    #     Asia (0)         IC = +0.060
+    #     NY-close (3)     IC = -0.257
+    # The aggregate IC = -0.106 hides this 5× reversal — a model without
+    # an interaction term sees an average that's wrong everywhere.
+    # Fix: explicit session × feature product so the model can learn the
+    # per-session sign + magnitude. We use session_phase as the integer
+    # code (already engineered by add_seasonal_features).
+    if 'session_phase' in out.columns:
+        sp = pd.to_numeric(out['session_phase'], errors='coerce').fillna(-1).astype(np.float32).to_numpy()
+        if 'hawkes_intrabar_sum' in out.columns:
+            h = pd.to_numeric(out['hawkes_intrabar_sum'], errors='coerce').fillna(0).astype(np.float32).to_numpy()
+            out['hawkes_x_session_phase'] = (h * sp).astype(np.float32)
+        if 'tick_count' in out.columns:
+            t = pd.to_numeric(out['tick_count'], errors='coerce').fillna(0).astype(np.float32).to_numpy()
+            out['tick_count_x_session_phase'] = (t * sp).astype(np.float32)
+
     # ── II.C: regime_label_grouped (volatile + low_liquidity → rare) ───
     if 'regime_label' in out.columns:
         rare_set = {'volatile', 'low_liquidity'}
