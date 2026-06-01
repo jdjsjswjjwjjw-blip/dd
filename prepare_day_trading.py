@@ -4584,6 +4584,21 @@ def run_day_trading_refinery(
 
     out_path = os.path.join(output_dir, features_fn)
 
+    # ── Phase 1.5 — Iceberg detection (conditional on MBO availability) ─
+    # Pure-additive: writes iceberg_count_5m + iceberg_total_volume_5m.
+    # If MBO ticks aren't supplied (the bar-only Q2 baseline), the cols
+    # ship as zeros and the sidecar reports them as missing-but-spec'd.
+    # When mbo_ticks is wired in (future runs with a tick frame), the
+    # Korajczyk-Murphy detector fills in real signal. See
+    # modules/features_v2/iceberg.py for the rule + the detector tests.
+    try:
+        from modules.features_v2.iceberg import attach_iceberg_features
+        df_out = attach_iceberg_features(df_out, mbo=None)
+    except Exception as e:
+        print(f"   ⚠️  iceberg detector skipped: {e!r}")
+        df_out['iceberg_count_5m'] = np.zeros(len(df_out), dtype=np.int32)
+        df_out['iceberg_total_volume_5m'] = np.zeros(len(df_out), dtype=np.float32)
+
     # ── Phase 1.4 — Engineering fixes from the IC audit ─────────────────
     # II.B: ATR-normalised distance versions of the 3 scale-dependent
     #       STRONG features (london_sess_high, current_vwap, pdh).
