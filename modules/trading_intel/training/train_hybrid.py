@@ -60,6 +60,13 @@ LEAKAGE_PATTERNS = [
     'neutral_reason', 'event_label_tier', 'train_event_flag',
     'is_train_slice', 'is_holdout_slice', 'is_purged_slice',
     'dataset_slice', 'signal_quality',
+    # C1: multi-task diagnostics (forward-window MFE/MAE/stop_first/etc.)
+    'mfe', 'mae', 'stop_first', 'time_to_first_touch',
+    'net_expectancy_proxy', 'neutral_type', 'tradability_label',
+    # C1: B1/B2 dual-target heads — strict exec labels + SSL continuous
+    # target. Substring match below catches `exec_label/path/valid` and
+    # `next_price_delta(_valid)` plus any future siblings.
+    'exec_', 'next_price_',
 ]
 
 

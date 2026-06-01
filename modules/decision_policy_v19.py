@@ -149,7 +149,10 @@ def _side_stats(frame: pd.DataFrame, side_label: int, cost_pips: float, side_pro
         forward_pips = np.abs(pd.to_numeric(frame.get("forward_return", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64))
         tick_size = max(_safe_float(frame.attrs.get("tick_size", 1.0), 1.0), 1e-8)
         forward_pips = forward_pips / tick_size
-    labels = pd.to_numeric(frame.get("bias_label", 1), errors="coerce").fillna(1).astype(np.int32).to_numpy()
+    # C1: safe default is NEUTRAL (2), not SHORT (1). The old default
+    # silently labeled every row as SHORT when bias_label was missing,
+    # which would inject a massive directional bias into the policy loss.
+    labels = pd.to_numeric(frame.get("bias_label", 2), errors="coerce").fillna(2).astype(np.int32).to_numpy()
     covered = pd.to_numeric(frame.get("policy_covered", 0), errors="coerce").fillna(0).astype(np.int8).to_numpy()
     weights = (
         np.clip(np.asarray(side_probs, dtype=np.float64).reshape(-1), 0.0, 1.0)

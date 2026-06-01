@@ -84,6 +84,18 @@ _LEAKAGE_COLS_EXACT: frozenset[str] = frozenset({
     'cycle_phase_acc_prob', 'cycle_phase_markup_prob',
     'cycle_phase_dist_prob', 'cycle_phase_markdown_prob',
     'cycle_position',
+    # C1: Multi-task diagnostic columns (compute_multitask_label_diagnostics).
+    # These look forward over horizon_bars*4 windows — leakage if used as
+    # SSL features. Previously uncovered: only the `mfe_*`/`mae_*` PREFIX
+    # was guarded, but the bare `mfe`/`mae` columns and the other
+    # diagnostics slipped through. Adding them by name closes the gap.
+    'mfe', 'mae', 'stop_first_flag', 'time_to_first_touch',
+    'net_expectancy_proxy',
+    # C1: Dual-target heads B1/B2 — strict exec labels + continuous SSL
+    # directional target. Both look forward, both are training targets,
+    # neither may appear in the SSL feature vector.
+    'exec_label', 'exec_path', 'exec_valid',
+    'next_price_delta', 'next_price_delta_valid',
 })
 
 # Any column whose name starts with one of these prefixes is excluded
@@ -94,6 +106,10 @@ _LEAKAGE_PREFIXES: tuple[str, ...] = (
     'fwd_',        # fwd_ret_clean
     'mfe_',        # max favourable excursion — forward only
     'mae_',        # max adverse excursion — forward only
+    # C1: future-extension guards so any new B1/B2-family column added to
+    # the parquet is excluded by default (fail-closed)
+    'exec_',       # exec_label / exec_path / exec_valid + any sibling
+    'next_price_', # next_price_delta / next_price_delta_valid + any sibling
 )
 
 

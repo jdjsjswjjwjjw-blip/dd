@@ -66,6 +66,12 @@ LEAKAGE_PATTERNS = [
     "dataset_slice", "signal_quality",
     # Avoid leaking target_ret used by Sharpe regularizer
     "target_ret_",
+    # C1: multi-task diagnostics (forward-window MFE/MAE/stop_first/etc.)
+    "mfe", "mae", "stop_first", "time_to_first_touch",
+    "net_expectancy_proxy", "neutral_type", "tradability_label",
+    # C1: B1/B2 dual-target heads — substring match catches exec_label/
+    # path/valid + next_price_delta(_valid) + any future siblings.
+    "exec_", "next_price_",
 ]
 
 
