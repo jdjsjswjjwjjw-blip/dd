@@ -8,8 +8,9 @@ aware sizing.
 
 > **Branch:** `claude/task-d-RcDhu`
 > **Baseline tag:** `v1-baseline-pre-cleanup` (commit `c7b88dd`)
+> **Latest cleanup tag:** `phase1.8-closure` (commit `916c017`) — see [§ Phase 0/1 Pipeline Cleanup](#-phase-01-pipeline-cleanup-19-commits)
 > **Architecture authority:** [`SUBSYSTEMS.md`](SUBSYSTEMS.md)
-> **Tests:** 793 passing + 2 skipped, 0 failures
+> **Tests:** 1,020 collected · 250 covering the Phase 0/1 cleanup gate · 0 failures
 
 ---
 
@@ -361,14 +362,20 @@ python tools/calibrate_slippage.py \
 ### Scenario 1 — Run the proven baseline (no ML)
 
 ```bash
-# 1. Build features + labels from raw MBO/MBP
+# 1. Build features + labels from raw MBO/MBP (with Phase 1 cleanup defaults)
 python prepare_day_trading.py \
     --mbo /path/to/6BH5.mbo.parquet \
     --mbp /path/to/6BH5.mbp10.parquet \
     --output q1_6BH5 \
-    --freq 15min
+    --freq 15min \
+    --feature-selection drop_noise \
+    --warmup-drop-bars 20
 
-# 2. Backtest with strict anti-leakage mode (holdout only)
+# 2. Validate the cleanup empirically (Phase 1.6 — 11-gate harness)
+python tools/diagnostics/phase1_revalidate.py \
+    --parquet q1_6BH5/day_trading_features.parquet
+
+# 3. Backtest with strict anti-leakage mode (holdout only)
 python self_supervised/backtest_day_trade.py \
     --features q1_6BH5/day_trading_features.parquet \
     --output backtests/baseline_strict \
@@ -378,6 +385,18 @@ python self_supervised/backtest_day_trade.py \
 Expected output: ~78 % hit rate, ~2-3 % annualized return on the holdout slice
 with 1-bp RT cost. See [`SUBSYSTEMS.md § Subsystem A`](SUBSYSTEMS.md) for the
 data contract.
+
+**The new flags (added in Phase 1 cleanup — defaults are safe):**
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--feature-selection {keep_top,drop_noise,all}` | `drop_noise` | IC-driven feature filter (Phase 1.2). `drop_noise` removes the 30+ NOISE/UNSTABLE columns the Q2 audit identified; `keep_top` is the strict whitelist; `all` is debugging only. |
+| `--warmup-drop-bars N` | `20` | Phase 1.4 (II.D) — masks the first N bars from `train_event_flag`, `exec_valid`, `next_price_delta_valid` so the windowed-indicator warmup artifact does not bleed into training. |
+| `--apply-event-direction-veto` | OFF | Phase 1.A2 — the event_direction veto is OFF by default (the CVD+OBI+Kalman vote is wrong ~70% of the time on real data). Pass this flag to re-enable it for experiments only. |
+
+The refinery also writes a **`dataset_meta.json` sidecar** next to the parquet
+(Phase 1.1 — schema source of truth + git hash + built-at-utc + present/absent
+feature audit). The sidecar drives the validation harness in step 2.
 
 ### Scenario 2 — Add the SSL embedding layer
 
@@ -496,7 +515,7 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 │   ├── response.py                   ← PredictionResponse dataclass
 │   └── runner.py                     ← ProductionRunner orchestrator
 │
-├── tests/                           ← 732 tests (2 skipped)
+├── tests/                           ← 1,020 tests (+250 from Phase 0/1 cleanup)
 │   ├── test_lob_features_v2.py     ← LOB layer (23 tests)
 │   ├── test_short_term_ssl.py      ← Short-term heads (19 tests)
 │   ├── test_hybrid_model.py        ← Hybrid fusion (16 tests)
@@ -518,7 +537,15 @@ to get the final `TradeDecision` (adaptive TP, regime-aware size, reason).
 ### Run the full active test suite
 ```bash
 python -m pytest tests/ -q
-# Expect: 732 passed, 2 skipped, 0 failed
+# Expect: 1,020 collected · 0 failed
+# (732 pre-cleanup + 250 Phase 0/1 cleanup gate + ~38 IC audit harness)
+```
+
+### Run only the Phase 0/1 cleanup gate (fast — ~3 s, 250 tests)
+```bash
+python -m pytest tests/test_phase0_pipeline_fixes.py \
+                 tests/test_phase1_*.py \
+                 tests/test_label_engine_v2.py -q
 ```
 
 ### Run just the SSL + hybrid + diagnostics sweep
@@ -573,10 +600,123 @@ crosses subsystem lines (e.g., day_trade importing SSL training code).
 
 ---
 
+## 🔧 Phase 0/1 Pipeline Cleanup (19 commits)
+
+A comprehensive cleanup of the day_trade pipeline triggered by the Q2 2025
+IC audit on the v1 baseline parquet, which revealed three systemic issues
+the rule pipeline could not solve on its own:
+
+| Audit finding | Empirical evidence | Fix |
+|---|---|---|
+| **The event gate kills signal** | `mean_gate_kill_ratio = 0.581` on Q2 — 50% of useful features carried as much edge on non-event bars as on event bars; 5 of 6 STRONG features had ratio > 1.0 (the gate was *anti-selecting*) | Phase 0 — removed the `if not is_ev_arr[i]: continue` filter from `label_by_outcome`; events become a feature, not a label-time veto |
+| **`short_tp` count = 0 on Q2** | The four-barrier scan evaluated LONG before SHORT with `tp_dist > sl_dist` — any downward path crossed `sl_long` before `tp_short`. Mathematically impossible to produce a short_tp label, regardless of price action | A1 — symmetric single-pair barrier scan. First touch wins; same-bar dual hit tie-broken by distance-to-open |
+| **The veto default re-imposes the bias the scan fix removed** | The `event_direction` veto was ON by default while the code's own help text documented it as harmful (the CVD+OBI+Kalman vote is wrong ~70% on real data) | A2 — renamed/inverted to `apply_event_direction_veto: bool = False`. Veto is opt-in only |
+
+The cleanup landed as 19 commits split across two waves:
+
+### Wave 1 — IC audit + Phase 0 fixes (6 commits)
+| Commit | What changed |
+|---|---|
+| `5b8f14d` | IC audit tool — empirical edge measurement (Spearman + Pearson + MI on 4 horizons) |
+| `117e95f` | Hardened with 4 honesty layers (look-ahead detection, walk-forward stability, redundancy clustering, noise floor) |
+| `7fc20f8` | Per-event-status IC — directly tests the gate-kill hypothesis; this is the commit that produced the 0.581 number |
+| `4e164a0` | Phase 0 — `obi → obi_net` + `cvd_cumulative` alias |
+| `0d4f6d6` | Phase 0 — removed the event gate filter from `label_by_outcome` |
+| `58ca42c` | `label_engine_v2` gains `rescue_on_timeout=False` + `valid` mask — foundation for B1 |
+
+### Wave 2 — A1/A2 + dual-target heads + schema (5 commits)
+| Commit | What changed |
+|---|---|
+| `e4f7407` | **A1+A3** — symmetric scan; deleted dead `build_day_trading_labels` (154 lines) |
+| `3c8f247` | **A2** — `apply_event_direction_veto` (default False); old `--ignore-event-direction-veto` removed |
+| `9b3d549` | **B1+B2** — `exec_label`/`exec_path`/`exec_valid` (execution head) + `next_price_delta`/`_valid` (SSL continuous target) |
+| `23d2049` | **C1** — SSL leakage guard extended for 10 new + 3 previously-uncovered columns; fixed `decision_policy_v19:152` SHORT→NEUTRAL default |
+| `ad74daf` | **C2** — `modules/dataset_schema.py` source of truth + `dataset_meta.json` sidecar |
+
+### Wave 3 — Feature-engineering cleanup driven by the IC audit (8 commits)
+| Commit | What changed |
+|---|---|
+| `b3bf27c` | **Phase 1.1** — Feature schema + canonical aliases at compute-source + `validate()` |
+| `6073f52` | **Phase 1.2** — IC-driven feature selection (`keep_top` / `drop_noise` / `all`); blacklist of 33 NOISE/UNSTABLE cols |
+| `9db8710` | **Phase 1.3** — continuous z-scores become primary (the binary `hawkes_z > 1.0` thresholding collapsed signal); raw `hawkes_z_raw`/`absorb_z_raw`/`kyle_z_raw` exposed |
+| `b1cb862` | **Phase 1.4 (II.B + II.C + II.D)** — `dist_to_X_atr` for the 3 scale-dependent STRONG features + `regime_label_grouped` (volatile + low_liquidity → 'rare') + `is_warmup` mask |
+| `98497ce` | **Phase 1.5 (II.A)** — `hawkes_x_session_phase` + `tick_count_x_session_phase` — fixes the sign-flip pair the audit identified (IC = +0.06 in Asia vs -0.26 in NY-close) |
+| `9a94bb3` | **Phase 1.6** — 5 MT5-style CVD features (bar-level delta + concentration + intensity vs ATR + divergence at levels + streak) |
+| `0393ec4` | **Phase 1.7** — Iceberg detector (Korajczyk-Murphy rule) in `modules/features_v2/` + refinery wire |
+| `916c017` | **Phase 1.8** — Integration smoke test + 11-gate empirical re-validation harness in `tools/diagnostics/phase1_revalidate.py` |
+
+### New artefacts introduced by the cleanup
+
+| Path | Role |
+|---|---|
+| `modules/dataset_schema.py` | Single source of truth — 13 label specs + 22 feature specs + blacklist + `validate()` |
+| `modules/features_v2/iceberg.py` | Korajczyk-Murphy iceberg detector for MBO tick streams |
+| `tools/diagnostics/ic_audit.py` | The audit tool that drove the entire cleanup |
+| `tools/diagnostics/phase1_revalidate.py` | 11-gate empirical harness — run after `prepare_day_trading.py` to verify the cleanup on real data |
+| `<parquet_dir>/dataset_meta.json` | Sidecar — schema_version + git_hash + built_at_utc + feature audit + dtype mismatches |
+| 14 new test modules under `tests/test_phase1_*.py` | 250 tests covering every cleanup commit + cross-round integration smoke |
+
+### New columns the refinery now writes
+
+| Column class | Names |
+|---|---|
+| Label heads (3) | `bias_label` (Phase 0/A1/A2 corrected) · `exec_label`/`exec_path`/`exec_valid` (B1) · `next_price_delta`/`_valid` (B2) |
+| Continuous z-scores (Phase 1.3) | `event_score_continuous` · `hawkes_z_raw` · `absorb_z_raw` · `kyle_z_raw` |
+| Scale-robust distances (II.B) | `dist_to_session_high_atr` · `dist_to_vwap_atr` · `dist_to_pdh_atr` |
+| Regime grouping (II.C) | `regime_label_grouped` |
+| Warmup mask (II.D) | `is_warmup` |
+| Session interactions (II.A) | `hawkes_x_session_phase` · `tick_count_x_session_phase` |
+| MT5-style CVD (Phase 1.6) | `cvd_bar_5m` · `cvd_direction_ratio_5m` · `cvd_intensity_vs_atr` · `cvd_divergence_at_level` · `cvd_consecutive_imbalance` |
+| Iceberg (Phase 1.7) | `iceberg_count_5m` · `iceberg_total_volume_5m` (zeros when MBO tick stream not supplied) |
+
+### Empirical re-validation — how to confirm the cleanup on your data
+
+```bash
+# After running prepare_day_trading.py with the new flags:
+python tools/diagnostics/phase1_revalidate.py \
+    --parquet outputs/your_run/day_trading_features_<tag>.parquet \
+    --baseline-ic /path/to/pre-cleanup/ic_summary.json   # optional, for comparison
+```
+
+The 11 gates and their expected post-cleanup values:
+
+| Gate | Pre-cleanup | Post-cleanup target |
+|---|---|---|
+| NEUTRAL ratio | 80 % | **≤ 55 %** (target ~42-50 %) |
+| `short_tp` count | **0** ❌ | **≥ 1** ✅ — empirical proof of A1 |
+| `long_tp` count | ~700 (anti-bias) | ≥ 1, balanced with short |
+| Dead `path_outcome` codes (2/3/5/6) | nonzero | **0** |
+| `exec_valid` coverage | n/a | ≥ 5 % |
+| `next_price_delta_valid` coverage | n/a | ≥ 70 % (gate-free target) |
+| TOP_IC whitelist features present | varies | all present |
+| Phase 1.2 blacklist absent | leaked | **clean** (no NOISE/UNSTABLE in output) |
+| `validate(strict=True)` | n/a | clean |
+| 19 Phase 1.3/1.4/1.5 engineered features | n/a | all present |
+| `dataset_meta.json` schema_version | absent | matches `SCHEMA_VERSION` |
+
+Exit code 0 = all gates passed.
+
+### What still depends on real data (Phase 2+)
+
+The cleanup is code-complete and proven on synthetic + cross-validated against
+the data_loader leakage guard. The remaining work is **empirical**, not code:
+
+- Run the refinery on real Q2 (or Q1+Q2 combined) → confirm the 11 gates pass
+- Re-run `tools/diagnostics/ic_audit.py` on the post-cleanup parquet → confirm
+  `gate_kill_ratio` drops from 0.581 to near 0
+- Train the multi-task heads (`exec_label` + `next_price_delta` + `bias_label`)
+  — `train_hybrid.py` still trains on `bias_label` only; B1/B2 targets are
+  ready but the loops haven't been migrated yet
+- Backtest on the new dual-target outputs (`backtest_day_trade.py` works
+  unchanged on the new parquet — it reads `event_flag`/`event_direction` only)
+
+---
+
 ## 🏗️ Development phases (the journey to current state)
 
-The codebase went through 5 development phases. Every phase is a documented
-commit on `claude/task-d-RcDhu`:
+The codebase went through 5 original development phases (Phase 0..4b) plus the
+2025-06 cleanup wave above. Every phase is a documented commit on
+`claude/task-d-RcDhu`:
 
 | Commit | Phase | What changed |
 |---|---|---|
@@ -589,8 +729,9 @@ commit on `claude/task-d-RcDhu`:
 | `3d5cabb` | **Review fixes** | 6 HIGH/MEDIUM findings from code review addressed |
 | `fb1ad5d` | **Refactor** | Consolidate new code into `modules/trading_intel/` package |
 | `64abe04` | **Subsystem docs + lint** | SUBSYSTEMS.md + boundary lint + 4 enforcement tests |
+| `5b8f14d`..`916c017` | **IC audit + Phase 0/1 cleanup** | 19 commits — see [§ Phase 0/1 Pipeline Cleanup](#-phase-01-pipeline-cleanup-19-commits) above |
 
-> **Phase 1** (proposal's "isolate baseline + 6-year evaluation") is the next
+> **Phase 2** (full multi-task training + 6-year evaluation) is the next
 > data-dependent step. It's blocked on 6-year MBO/MBP-10 from Databento.
 
 ---
