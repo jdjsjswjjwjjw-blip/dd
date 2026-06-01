@@ -57,12 +57,22 @@ class TripleBarrierConfig:
         الحد الأدنى للحركة كمضاعف ATR (يمنع labeling لحركات أصغر من noise).
     horizon_default : int
         أفق افتراضي إذا لم تُمرَّر horizons.
+    rescue_on_timeout : bool
+        True  (افتراضي): سلوك directional-forecast — عند timeout بدون لمس barrier
+              يُفحص MFE/MAE والفائز ضِعف الخاسر يحدد الاتجاه (rescue).
+        False (strict / execution): يُلغى الـ MFE/MAE rescue تماماً. أي صف لم
+              يلمس barrier صريح داخل الأفق يبقى DIR_NEUTRAL و valid=False — يُقنَّع
+              من loss الـ execution head. هذا هو وضع "بدون غش تاريخي" المطابق لـ MT5:
+              لو ضُرب الحاجز يثبُت أول لمس، ولو لم يُضرب لا نسترجع نتيجة من إغلاق
+              الأفق. ملاحظة: لمس الـ barrier نفسه strict في الوضعين (أول لمس يكسب،
+              لا يُعاد النظر في النافذة بعده) — الـ rescue يخص حالة الـ timeout فقط.
     """
     tp_atr_mult: float = 2.0
     sl_atr_mult: float = 1.0
     mfe_mae_ratio: float = 2.0
     min_move_atr_mult: float = 1.0
     horizon_default: int = 20
+    rescue_on_timeout: bool = True
 
 
 DEFAULT_CONFIG = TripleBarrierConfig()
@@ -142,6 +152,9 @@ def label_triple_barrier_atr(
         mfe        : float64 (n,) - max favorable excursion (مطلقة)
         mae        : float64 (n,) - max adverse excursion (مطلقة)
         end_idx    : int32 (n,)  - الصف الذي اتخذ فيه القرار (barrier hit أو نهاية الأفق)
+        valid      : bool (n,)   - True فقط حين لُمس barrier صريح (PATH_TP_LONG/SHORT).
+                                   هو قناع تدريب الـ execution head: صفوف الـ timeout
+                                   (وأي rescue) تكون valid=False. مستقل عن الوضع.
     """
     prices = np.asarray(prices, dtype=np.float64)
     atr = np.asarray(atr, dtype=np.float64)
@@ -154,6 +167,7 @@ def label_triple_barrier_atr(
             "mfe": np.zeros(0, dtype=np.float64),
             "mae": np.zeros(0, dtype=np.float64),
             "end_idx": np.zeros(0, dtype=np.int32),
+            "valid": np.zeros(0, dtype=bool),
         }
 
     if len(atr) != n:
@@ -171,11 +185,13 @@ def label_triple_barrier_atr(
     mfe_arr = np.zeros(n, dtype=np.float64)
     mae_arr = np.zeros(n, dtype=np.float64)
     end_idx_arr = np.arange(n, dtype=np.int32)
+    valid = np.zeros(n, dtype=bool)
 
     tp_mult = float(config.tp_atr_mult)
     sl_mult = float(config.sl_atr_mult)
     ratio = float(config.mfe_mae_ratio)
     min_mult = float(config.min_move_atr_mult)
+    rescue_on_timeout = bool(config.rescue_on_timeout)
 
     for t in range(n - 1):
         entry = prices[t]
@@ -220,16 +236,23 @@ def label_triple_barrier_atr(
             bias[t] = DIR_LONG
             path[t] = PATH_TP_LONG
             end_idx_arr[t] = hit_idx
+            valid[t] = True
             continue
         if hit_direction == DIR_SHORT:
             bias[t] = DIR_SHORT
             path[t] = PATH_TP_SHORT
             end_idx_arr[t] = hit_idx
+            valid[t] = True
             continue
 
-        # Timeout — MFE/MAE fallback
+        # Timeout — لم يُلمَس barrier صريح داخل الأفق.
         end_idx_arr[t] = end - 1
 
+        # strict mode: لا rescue. يبقى DIR_NEUTRAL + valid=False (مُقنَّع من execution loss).
+        if not rescue_on_timeout:
+            continue
+
+        # MFE/MAE fallback (directional-forecast mode).
         # noise filter: لو الحركتين أصغر من min_move، خليها NEUTRAL
         if mfe < min_move and mae < min_move:
             continue
@@ -249,6 +272,7 @@ def label_triple_barrier_atr(
         "mfe": mfe_arr,
         "mae": mae_arr,
         "end_idx": end_idx_arr,
+        "valid": valid,
     }
 
 
@@ -279,6 +303,7 @@ def label_triple_barrier_atr_vectorized(
             "mfe": np.zeros(0, dtype=np.float64),
             "mae": np.zeros(0, dtype=np.float64),
             "end_idx": np.zeros(0, dtype=np.int32),
+            "valid": np.zeros(0, dtype=bool),
         }
 
     if len(atr) != n:
@@ -296,6 +321,7 @@ def label_triple_barrier_atr_vectorized(
     sl_mult = float(config.sl_atr_mult)
     ratio = float(config.mfe_mae_ratio)
     min_mult = float(config.min_move_atr_mult)
+    rescue_on_timeout = bool(config.rescue_on_timeout)
 
     # build (n, h_max) future-price matrix:
     # M[t, k] = prices[t + 1 + k] لكل k في [0, h_max). out-of-range clamped to n-1.
@@ -364,22 +390,27 @@ def label_triple_barrier_atr_vectorized(
     path[short_wins] = PATH_TP_SHORT
     end_idx_arr[short_wins] = (np.arange(n)[short_wins] + 1 + first_lower_k[short_wins]).astype(np.int32)
 
-    # timeout → MFE/MAE
+    # valid = لُمس barrier صريح (مطابق للـ loop: يُضبط عند hit فقط، لا عند rescue/timeout).
+    valid = long_wins | short_wins
+
+    # timeout → نهاية الأفق
     timeout_end = np.minimum(np.arange(n) + horizons, n - 1).astype(np.int32)
     end_idx_arr[timeout] = timeout_end[timeout]
 
-    # MFE/MAE decision (only on timeout rows)
-    is_long_mfe = timeout & (mfe > ratio * mae) & (mfe >= min_move)
-    is_short_mfe = timeout & (mae > ratio * mfe) & (mae >= min_move) & (~is_long_mfe)
-    bias[is_long_mfe] = DIR_LONG
-    path[is_long_mfe] = PATH_TIMEOUT_MFE_LONG
-    bias[is_short_mfe] = DIR_SHORT
-    path[is_short_mfe] = PATH_TIMEOUT_MFE_SHORT
+    # MFE/MAE decision (only on timeout rows) — strict mode يلغيها تماماً.
+    if rescue_on_timeout:
+        is_long_mfe = timeout & (mfe > ratio * mae) & (mfe >= min_move)
+        is_short_mfe = timeout & (mae > ratio * mfe) & (mae >= min_move) & (~is_long_mfe)
+        bias[is_long_mfe] = DIR_LONG
+        path[is_long_mfe] = PATH_TIMEOUT_MFE_LONG
+        bias[is_short_mfe] = DIR_SHORT
+        path[is_short_mfe] = PATH_TIMEOUT_MFE_SHORT
 
     # mask out invalid rows where active window was empty (no future)
     no_future = horizon_mask.any(axis=1) & valid_mask.any(axis=1)
     bias[~no_future] = DIR_NEUTRAL
     path[~no_future] = PATH_TIMEOUT_NEUTRAL
+    valid &= no_future
 
     return {
         "bias": bias,
@@ -387,6 +418,7 @@ def label_triple_barrier_atr_vectorized(
         "mfe": mfe,
         "mae": mae,
         "end_idx": end_idx_arr,
+        "valid": valid,
     }
 
 

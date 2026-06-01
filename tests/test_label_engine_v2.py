@@ -388,5 +388,111 @@ class TestVectorizedSpeed(unittest.TestCase):
         )
 
 
+class TestStrictModeAndValidMask(unittest.TestCase):
+    """strict mode (rescue_on_timeout=False) + قناع valid لتغذية الـ dual-target.
+
+    الخلفية: الـ execution head يحتاج labels مطابقة لـ MT5 بدون أي
+    استرجاع تاريخي (MFE/MAE rescue). strict mode يثبّت أول لمس barrier،
+    وأي timeout يبقى NEUTRAL + valid=False (يُقنَّع من loss الـ head).
+    الـ SSL backbone يستخدم هدفاً اتجاهياً منفصلاً، فلا يتأثر بهذا القناع.
+    """
+
+    def _rescue_scenario(self):
+        # يصعد لـ MFE=1.5 (دون upper=102) و MAE≈0 → في الوضع الافتراضي
+        # rescue LONG؛ في strict NEUTRAL. لا barrier صريح يُلمَس.
+        prices = np.array([100.0, 100.5, 101.0, 101.5, 101.0])
+        atr = np.full(5, 1.0)
+        return prices, atr
+
+    def test_default_rescues_but_strict_does_not(self):
+        prices, atr = self._rescue_scenario()
+        cfg_default = TripleBarrierConfig(
+            tp_atr_mult=2.0, sl_atr_mult=1.0, mfe_mae_ratio=2.0,
+            min_move_atr_mult=1.0, horizon_default=20,
+        )
+        cfg_strict = TripleBarrierConfig(
+            tp_atr_mult=2.0, sl_atr_mult=1.0, mfe_mae_ratio=2.0,
+            min_move_atr_mult=1.0, horizon_default=20, rescue_on_timeout=False,
+        )
+        r_def = label_triple_barrier_atr(prices, atr, config=cfg_default)
+        r_str = label_triple_barrier_atr(prices, atr, config=cfg_strict)
+
+        # default: rescue → LONG عبر MFE/MAE
+        self.assertEqual(r_def["bias"][0], DIR_LONG)
+        self.assertEqual(r_def["path"][0], PATH_TIMEOUT_MFE_LONG)
+        # strict: لا rescue → NEUTRAL
+        self.assertEqual(r_str["bias"][0], DIR_NEUTRAL)
+        self.assertEqual(r_str["path"][0], PATH_TIMEOUT_NEUTRAL)
+        # valid=False في الحالتين (لا لمس barrier صريح)
+        self.assertFalse(bool(r_def["valid"][0]))
+        self.assertFalse(bool(r_str["valid"][0]))
+
+    def test_valid_true_only_on_hard_barrier_hit(self):
+        # صعود يلمس upper=102 → LONG + valid=True
+        prices = np.array([100.0, 100.5, 101.0, 102.0, 103.0])
+        atr = np.full(5, 1.0)
+        cfg = TripleBarrierConfig(tp_atr_mult=2.0, sl_atr_mult=1.0,
+                                  horizon_default=10, rescue_on_timeout=False)
+        r = label_triple_barrier_atr(prices, atr, config=cfg)
+        self.assertEqual(r["bias"][0], DIR_LONG)
+        self.assertEqual(r["path"][0], PATH_TP_LONG)
+        self.assertTrue(bool(r["valid"][0]))
+
+    def test_no_short_tp_bug_downward_move_is_short(self):
+        """Regression guard لـ Finding #7: في barrier متماثل بزوج واحد،
+        الحركة الهابطة لازم تتصنّف SHORT (ربح short حقيقي) — مش long_sl→neutral
+        زي الـ four-barrier المكسور في label_by_outcome."""
+        prices = np.array([100.0, 99.5, 99.0, 98.0, 97.0])
+        atr = np.full(5, 1.0)  # upper=102 (لا يُلمَس)، lower=99 (يُلمَس عند j=2)
+        cfg = TripleBarrierConfig(tp_atr_mult=2.0, sl_atr_mult=1.0,
+                                  horizon_default=10, rescue_on_timeout=False)
+        r = label_triple_barrier_atr(prices, atr, config=cfg)
+        self.assertEqual(r["bias"][0], DIR_SHORT)
+        self.assertEqual(r["path"][0], PATH_TP_SHORT)
+        self.assertTrue(bool(r["valid"][0]))
+        self.assertEqual(r["end_idx"][0], 2)
+
+    def test_valid_equals_hard_hit_invariant(self):
+        # على بيانات عشوائية: valid ≡ (path ∈ {TP_LONG, TP_SHORT}) — في الوضعين.
+        np.random.seed(7)
+        n = 1500
+        prices = 100.0 + np.cumsum(np.random.randn(n) * 0.3)
+        atr = np.full(n, 0.5)
+        for rescue in (True, False):
+            cfg = TripleBarrierConfig(horizon_default=20, rescue_on_timeout=rescue)
+            r = label_triple_barrier_atr(prices, atr, config=cfg)
+            hard = np.isin(r["path"], [PATH_TP_LONG, PATH_TP_SHORT])
+            np.testing.assert_array_equal(r["valid"], hard)
+
+    def test_loop_vec_parity_strict_mode(self):
+        np.random.seed(11)
+        n = 2000
+        prices = 100.0 + np.cumsum(np.random.randn(n) * 0.3)
+        atr = np.full(n, 0.5)
+        for rescue in (True, False):
+            cfg = TripleBarrierConfig(horizon_default=20, rescue_on_timeout=rescue)
+            r_loop = label_triple_barrier_atr(prices, atr, config=cfg)
+            r_vec = label_triple_barrier_atr_vectorized(prices, atr, config=cfg)
+            np.testing.assert_array_equal(r_loop["bias"], r_vec["bias"])
+            np.testing.assert_array_equal(r_loop["path"], r_vec["path"])
+            np.testing.assert_array_equal(r_loop["valid"], r_vec["valid"])
+            np.testing.assert_array_equal(r_loop["end_idx"], r_vec["end_idx"])
+
+    def test_valid_key_present_and_shaped(self):
+        prices = np.array([100.0, 101.0, 102.0])
+        atr = np.full(3, 1.0)
+        for fn in (label_triple_barrier_atr, label_triple_barrier_atr_vectorized):
+            r = fn(prices, atr)
+            self.assertIn("valid", r)
+            self.assertEqual(len(r["valid"]), 3)
+            self.assertEqual(r["valid"].dtype, np.bool_)
+
+    def test_empty_input_has_valid_key(self):
+        for fn in (label_triple_barrier_atr, label_triple_barrier_atr_vectorized):
+            r = fn(np.array([]), np.array([]))
+            self.assertIn("valid", r)
+            self.assertEqual(len(r["valid"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
