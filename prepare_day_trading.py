@@ -106,23 +106,51 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
 
 # ─── Session Windows (UTC) ────────────────────────────────────────────────────
+# C1 unification: SINGLE SOURCE OF TRUTH = session_features.SESSION_WINDOWS.
+# daytrade_default is DERIVED from it (no hard-coded 4th definition that
+# contradicts seasonal_map + session_features). The reference is hour-based;
+# we render hh:mm for this module's _session_time_mask. (`london_ny` removed —
+# it was dead: defined but never consumed anywhere.)
+from modules.session_features import SESSION_WINDOWS as _SESSION_WINDOWS
+
+
+def _hhmm_from_hour(h: float) -> str:
+    hh = int(h)
+    mm = int(round((float(h) - hh) * 60))
+    return f"{hh:02d}:{mm:02d}"
+
+
+_DEFAULT_SESSIONS = {
+    k: (_hhmm_from_hour(_SESSION_WINDOWS[k][0]), _hhmm_from_hour(_SESSION_WINDOWS[k][1]))
+    for k in ('asia', 'london', 'overlap', 'ny')
+}
+
 SESSION_PROFILES: dict[str, dict[str, tuple[str, str]]] = {
-    'daytrade_default': {
-        'asia': ('00:00', '07:00'),
-        'london': ('07:00', '12:00'),
-        'overlap': ('12:00', '16:00'),
-        'london_ny': ('13:30', '16:00'),
-        'ny': ('13:30', '20:00'),
-    },
+    # asia 00-08, london 07-16, overlap 13-16, ny 13-22 (= session_features)
+    'daytrade_default': dict(_DEFAULT_SESSIONS),
+    # stage1_like is a deliberate ALTERNATIVE profile (opt-in via --session-profile),
+    # not the C1 contradiction; left explicit.
     'stage1_like': {
         'asia': ('00:00', '08:00'),
         'london': ('08:00', '13:00'),
         'overlap': ('13:00', '16:00'),
-        'london_ny': ('13:30', '16:00'),
         'ny': ('13:30', '20:00'),
     },
 }
 SESSIONS: dict[str, tuple[str, str]] = dict(SESSION_PROFILES['daytrade_default'])
+
+# ── C1 / B1: london level window DELIBERATELY DECOUPLED from the session flag ──
+# The validated "London top" edge (IC≈-0.11, p≈1e-19 — CLAUDE.md "النقاط السليمة")
+# was measured on the 07:00-12:00 morning window. `is_london` now marks the full
+# unified 07:00-16:00 session (above). These are intentionally NOT the same:
+#   • london_sess_high/low are built over LONDON_LEVEL_WINDOW (07:00-12:00), so the
+#     validated feature is byte-identical to before — zero IC re-validation needed.
+#   • After 12:00 (london AFTERNOON, where is_london is still 1) the level is the
+#     FROZEN MORNING extreme carried forward — read it as "retest of the morning
+#     high/low", NOT "high so far including the afternoon".
+# Moving this to the full session (07:00-16:00) = option B2: it CHANGES the STRONG
+# feature and requires a deliberate IC re-validation (workflow step M1).
+LONDON_LEVEL_WINDOW: tuple[str, str] = ('07:00', '12:00')
 
 # إطار الشمعة الافتراضي لمسار اليوم (pandas offset؛ يُوحَّد مع CLI وسطح بايثون)
 DAY_TRADE_DEFAULT_BAR_FREQ: str = '1min'
@@ -818,7 +846,7 @@ def _combine_first_valid(primary: pd.Series, fallback: pd.Series) -> pd.Series:
 
 def add_london_session_running_levels(df: pd.DataFrame) -> pd.DataFrame:
     """
-    مستويات نافذة لندن (``SESSIONS['london']``) بشكل **سببي**:
+    مستويات نافذة لندن (``LONDON_LEVEL_WINDOW`` = 07:00-12:00 (منفصلة عمداً عن علَم is_london 07:00-16:00؛ بعد 12:00 = قمة الصباح المجمّدة)) بشكل **سببي**:
 
     - أثناء لندن: قمة/قاع **جاريان** حتى إغلاق الشمعة الحالية.
     - بعد انتهاء لندن في نفس اليوم: يُجمَّدان على آخر قمة/قاع وُصلا إليهما في الجلسة.
@@ -836,7 +864,7 @@ def add_london_session_running_levels(df: pd.DataFrame) -> pd.DataFrame:
 
     ts = pd.to_datetime(out['ts_event'], errors='coerce')
     t = ts.dt.time
-    london_start, london_end = SESSIONS['london']
+    london_start, london_end = LONDON_LEVEL_WINDOW   # B1: 07-12 (decoupled from is_london 07-16)
     in_lon = _session_time_mask(t, london_start, london_end).to_numpy(dtype=bool)
     day = ts.dt.normalize().to_numpy()
 

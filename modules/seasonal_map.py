@@ -39,11 +39,13 @@ import numpy as np
 import pandas as pd
 
 
-# Session windows in UTC hours (matches modules/session_features.py)
-LONDON_OPEN_HOUR = 7   # 07:00 UTC
-LONDON_CLOSE_HOUR = 16  # 16:00 UTC
-NY_OPEN_HOUR = 13      # 13:00 UTC
-NY_CLOSE_HOUR = 22     # 22:00 UTC
+# Session windows in UTC hours — SINGLE SOURCE OF TRUTH (C1): derive from
+# session_features.SESSION_WINDOWS instead of hard-coding a parallel definition.
+# Values are identical to the previous literals (london 7-16, ny 13-22), so this
+# changes NOTHING in the seasonal features — it only removes the duplication.
+from modules.session_features import SESSION_WINDOWS as _SESSION_WINDOWS
+LONDON_OPEN_HOUR, LONDON_CLOSE_HOUR = _SESSION_WINDOWS['london']   # (7, 16) UTC
+NY_OPEN_HOUR, NY_CLOSE_HOUR = _SESSION_WINDOWS['ny']               # (13, 22) UTC
 
 
 def _coerce_ts(ts_series: pd.Series) -> pd.DatetimeIndex:
