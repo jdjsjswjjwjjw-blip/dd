@@ -929,6 +929,30 @@ def top_features(
 # ══════════════════════════════════════════════════════════════════════════════
 # Per-regime / per-session breakdowns (optional)
 # ══════════════════════════════════════════════════════════════════════════════
+def exclusive_session_label(df: pd.DataFrame) -> np.ndarray:
+    """M1: assign each bar to EXACTLY ONE session by priority.
+
+    After C1 the session flags overlap by construction (overlap ⊂ london ∩ ny:
+    london 07-16, ny 13-22, overlap 13-16). The old per-session encoding summed
+    them (is_london*1 + is_ny*2 + is_overlap*3) → ambiguous codes {0,1,2,6} that
+    mis-attributed the per-session IC. Here, priority overlap > ny > london wins
+    (most-specific last), so the groups are clean and human-readable:
+        london  = 07-13   ny = 16-22   overlap = 13-16   other = off + asia
+    'other' lumps off + asia because is_asia is not exported yet — separating it
+    is M2, not M1. This only re-defines the per-session DIAGNOSTIC groups; the
+    overall / per-event IC verdicts do not use it and are unchanged.
+    """
+    n = len(df)
+    is_lon = df["is_london"].astype(bool).to_numpy()
+    is_ny_ = df.get("is_ny", pd.Series(0, index=df.index)).astype(bool).to_numpy()
+    is_ovl = df.get("is_overlap", pd.Series(0, index=df.index)).astype(bool).to_numpy()
+    sess = np.full(n, "other", dtype=object)
+    sess[is_lon] = "london"      # 07-13 (13-16 overwritten → overlap)
+    sess[is_ny_] = "ny"          # 16-22 (13-16 overwritten → overlap)
+    sess[is_ovl] = "overlap"     # 13-16 — most-specific, wins
+    return sess
+
+
 def per_group_ic(
     df: pd.DataFrame, feature_cols: list[str], horizons: tuple[int, ...],
     group_col: str, close_col: str = "close",
@@ -1099,9 +1123,9 @@ def main() -> int:
 
     if args.per_session and "is_london" in df.columns:
         feature_cols = _select_feature_columns(df, _DEFAULT_EXCLUDE)
-        sess = df["is_london"].astype(int) * 1 + \
-               df.get("is_ny", 0).astype(int) * 2 + \
-               df.get("is_overlap", 0).astype(int) * 3
+        # M1: exclusive priority session encoding (overlap > ny > london; rest
+        # 'other'). Replaces the additive sum that produced ambiguous codes.
+        sess = exclusive_session_label(df)
         df2 = df.copy()
         df2["_session_code"] = sess
         sess_df = per_group_ic(
