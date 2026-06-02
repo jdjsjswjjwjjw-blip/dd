@@ -29,11 +29,10 @@ import prepare_day_trading as pdt
 # Phase 1.3/1.4 engineered signal. If finalize() drops any of these, the
 # downstream Phase 1.4 engineering fix silently degrades.
 PHASE_1_3_1_4_WHITELIST = frozenset({
-    # Phase 1.3 — continuous z-scores
+    # Phase 1.3 — continuous z-scores (absorb_z_raw is DEPTH → D1-excluded below)
     'event_score_continuous',
     'event_score_binary',
     'hawkes_z_raw',
-    'absorb_z_raw',
     'kyle_z_raw',
     # Phase 1.4 — MT5 CVD (source + 5 derived)
     'bar_cvd_delta',
@@ -42,11 +41,7 @@ PHASE_1_3_1_4_WHITELIST = frozenset({
     'cvd_intensity_vs_atr',
     'cvd_divergence_at_level',
     'cvd_consecutive_imbalance',
-    # Phase 1.1 canonical aliases
-    'obi_net',
-    'cvd_cumulative',
-    # Phase 1.4/1.5/1.7 post-finalize cols (defensive — currently added
-    # AFTER finalize, but pinned here so a future re-ordering can't drop)
+    # Phase 1.4 post-finalize cols (defensive)
     'dist_to_session_high_atr',
     'dist_to_vwap_atr',
     'dist_to_pdh_atr',
@@ -54,8 +49,9 @@ PHASE_1_3_1_4_WHITELIST = frozenset({
     'is_warmup',
     'hawkes_x_session_phase',
     'tick_count_x_session_phase',
-    'iceberg_count_5m',
-    'iceberg_total_volume_5m',
+    # NOTE (D1): absorb_z_raw, obi_net, cvd_cumulative, iceberg_count_5m,
+    # iceberg_total_volume_5m were here pre-D1. They are DEPTH/duplicate and are
+    # now intentionally EXCLUDED from export (_D1_DEPTH_EXCLUDED_FROM_EXPORT).
 })
 
 
@@ -66,13 +62,14 @@ class TestOriginalFeaturesWhitelist:
             'event_score_continuous',
             'event_score_binary',
             'hawkes_z_raw',
-            'absorb_z_raw',
             'kyle_z_raw',
         ):
             assert col in wl, (
                 f"Phase 1.3 column {col!r} missing from ORIGINAL_FEATURES — "
                 f"finalize_daytrade_parquet_export will silently drop it."
             )
+        # D1: absorb_z_raw is the absorption z-score (depth) → intentionally excluded
+        assert 'absorb_z_raw' not in wl, "absorb_z_raw is depth → must be D1-excluded"
 
     def test_phase_1_4_cvd_in_whitelist(self):
         wl = set(pdt.ORIGINAL_FEATURES)
@@ -94,15 +91,15 @@ class TestOriginalFeaturesWhitelist:
                 f"Phase 1.4 CVD column {col!r} missing from ORIGINAL_FEATURES"
             )
 
-    def test_canonical_aliases_in_whitelist(self):
-        """obi_net + cvd_cumulative are the canonical names the IC audit,
-        verify_data_health, and SSL data_loader expect. The fallback block
-        at end-of-refinery re-adds them if missing, but they should already
-        be in the whitelist so the fallback is a defensive no-op, not a
-        load-bearing fix."""
+    def test_canonical_aliases_excluded_by_d1(self):
+        """D1: obi_net / cvd_cumulative were EXACT duplicates (= obi / cvd). They
+        are now EXCLUDED from export — obi itself is depth (not exported); cvd
+        keeps its canonical name only. Assert the duplicates AND obi are gone."""
         wl = set(pdt.ORIGINAL_FEATURES)
-        assert 'obi_net' in wl
-        assert 'cvd_cumulative' in wl
+        assert 'obi_net' not in wl
+        assert 'cvd_cumulative' not in wl
+        assert 'obi' not in wl          # obi is depth → D1-excluded
+        assert 'cvd' in wl              # cvd (canonical flow) is KEPT
 
     def test_all_phase_1_x_engineered_cols_present(self):
         """Single shot — every column the Phase 1.X wave produces must
@@ -135,11 +132,14 @@ class TestFinalizeBehaviour:
             'bar_cvd_delta': np.zeros(n, dtype=np.float32),
         })
         out = pdt.finalize_daytrade_parquet_export(df)
-        # All 5 Phase 1.3/1.4 inputs must survive
+        # Kept Phase 1.3/1.4 inputs must survive
         for col in (
-            'event_score_continuous', 'hawkes_z_raw',
-            'absorb_z_raw', 'kyle_z_raw', 'bar_cvd_delta',
+            'event_score_continuous', 'hawkes_z_raw', 'kyle_z_raw', 'bar_cvd_delta',
         ):
             assert col in out.columns, (
                 f"{col!r} dropped by finalize() — whitelist regression"
             )
+        # D1: absorb_z_raw is depth → must be DROPPED by finalize
+        assert 'absorb_z_raw' not in out.columns, (
+            "absorb_z_raw should be dropped by finalize() (D1 depth exclusion)"
+        )

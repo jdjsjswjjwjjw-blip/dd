@@ -243,11 +243,14 @@ class TestPhase1Markers:
     def test_every_round_has_a_marker_in_source(self):
         src = (REPO_ROOT / "prepare_day_trading.py").read_text()
         markers = {
-            "Phase 1.1 fallback aliases applied": "R1",
+            # R1 (canonical-alias fallback) and R7 (iceberg attach) were changed by
+            # D1: obi_net/cvd_cumulative duplicates dropped; iceberg deferred to the
+            # depth track. Their markers now assert the D1 decisions in source.
+            "D1: obi_net / cvd_cumulative were EXACT duplicates": "R1 (D1)",
             "Phase 1.2 — Feature Selection": "R2",
             "Phase 1.3: continuous z-scores": "R3",
             "Phase 1.4 — Engineering fixes from the IC audit": "R4 + R5 + R6",
-            "Phase 1.5 — Iceberg detection": "R7",
+            "D1: iceberg DEFERRED to the depth track": "R7 (D1)",
         }
         for marker, round_name in markers.items():
             assert marker in src, (

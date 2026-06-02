@@ -242,6 +242,32 @@ ORIGINAL_FEATURES: tuple[str, ...] = (
     'iceberg_count_5m', 'iceberg_total_volume_5m',
 )
 
+# ── D1 (workflow §4): market-DEPTH + order-level features are NOT exported ──
+# Depth belongs to the raw MBP-10 tensor → SSL/CNN/LSTM, not the structure model.
+# These remain COMPUTED in-memory (the event gate reads absorption/kyle z, the
+# directional voting reads obi) — those consumers run on df_bars BEFORE finalize,
+# so nothing internal breaks. Exact duplicates (obi_net=obi, cvd_cumulative=cvd)
+# are dropped too. KEPT (NOT depth): cycle_phase_*/cycle_position (structural
+# cycle → D2, separate), mbp/mbo coverage (quality metrics), hawkes/tick (structure).
+# Phase 2 (separate) updates the downstream model feature-dim (138 → new count).
+_D1_DEPTH_EXCLUDED_FROM_EXPORT: frozenset[str] = frozenset({
+    # microstructure / order-level (MBO)
+    'absorption_intensity', 'cancel_ratio', 'spoofing_ratio', 'liquidity_trap',
+    'kyle_lambda', 'vnet', 'kyle_lambda_intrabar_mean', 'inter_event_time',
+    'correction_depth', 'liquidity_sweep', 'absorb_z_raw',
+    'buy_absorption_approx', 'sell_absorption_approx',
+    # order-book depth (MBP-10)
+    'obi', 'bid_wall_strength', 'ask_wall_strength', 'distance_to_wall',
+    'gap_size', 'liquidity_density', 'micro_price', 'lob_imbalance', 'liquidity_gaps',
+    # iceberg (MBO; currently zeros — never fed MBO ticks; deferred to depth track)
+    'iceberg_count_5m', 'iceberg_total_volume_5m',
+    # exact duplicates of kept canonical columns
+    'obi_net', 'cvd_cumulative',
+})
+ORIGINAL_FEATURES = tuple(
+    f for f in ORIGINAL_FEATURES if f not in _D1_DEPTH_EXCLUDED_FROM_EXPORT
+)
+
 # Alias للمانفيست والعقود — نفس ORIGINAL_FEATURES فقط
 DAY_TRADING_FEATURES: list[str] = list(ORIGINAL_FEATURES)
 
@@ -4908,20 +4934,16 @@ def run_day_trading_refinery(
 
     out_path = os.path.join(output_dir, features_fn)
 
-    # ── Phase 1.5 — Iceberg detection (conditional on MBO availability) ─
-    # Pure-additive: writes iceberg_count_5m + iceberg_total_volume_5m.
-    # If MBO ticks aren't supplied (the bar-only Q2 baseline), the cols
-    # ship as zeros and the sidecar reports them as missing-but-spec'd.
-    # When mbo_ticks is wired in (future runs with a tick frame), the
-    # Korajczyk-Murphy detector fills in real signal. See
-    # modules/features_v2/iceberg.py for the rule + the detector tests.
-    try:
-        from modules.features_v2.iceberg import attach_iceberg_features
-        df_out = attach_iceberg_features(df_out, mbo=None)
-    except Exception as e:
-        print(f"   ⚠️  iceberg detector skipped: {e!r}")
-        df_out['iceberg_count_5m'] = np.zeros(len(df_out), dtype=np.int32)
-        df_out['iceberg_total_volume_5m'] = np.zeros(len(df_out), dtype=np.float32)
+    # ── D1: iceberg DEFERRED to the depth track — NOT exported here ──
+    # The previous `attach_iceberg_features(df_out, mbo=None)` only ever produced
+    # ZEROS: the detector (modules/features_v2/iceberg.py, tuned to F1≈85% on the
+    # phase1.10 ground-truth simulator) is NEVER fed MBO ticks in the day_trade
+    # path, so the iceberg_count_5m / iceberg_total_volume_5m columns carried no
+    # signal. They are no longer added to the parquet (also removed from
+    # ORIGINAL_FEATURES via _D1_DEPTH_EXCLUDED_FROM_EXPORT).
+    # 🚩 TODO(depth track): build iceberg from REAL MBO ticks there (mbo != None)
+    #     so the detector produces actual signal, fused late with the structure
+    #     model. Until then iceberg is intentionally absent, not silently zero.
 
     # ── Phase 1.4 — Engineering fixes from the IC audit ─────────────────
     # II.B: ATR-normalised distance versions of the 3 scale-dependent
@@ -4945,21 +4967,10 @@ def run_day_trading_refinery(
     #   all        : no filtering (for debugging / IC re-audit baseline)
     df_out = _apply_phase1_feature_selection(df_out, mode=feature_selection)
 
-    # Phase 1.1: canonical aliases are now created at compute-source
-    # (prepare_day_trading.py: obi_net at line 982 next to df['obi'].clip,
-    # cvd_cumulative at line 1239 next to bars['cvd'] resampling). This
-    # block is now a defensive fallback for the rare case where one of
-    # them was dropped by an intermediate step (e.g., a feature selection
-    # mode trimming columns). Both names always co-exist in the output.
-    _phase0_renames = {}
-    if 'obi' in df_out.columns and 'obi_net' not in df_out.columns:
-        df_out['obi_net'] = df_out['obi']
-        _phase0_renames['obi'] = 'obi_net (alias)'
-    if 'cvd' in df_out.columns and 'cvd_cumulative' not in df_out.columns:
-        df_out['cvd_cumulative'] = df_out['cvd']
-        _phase0_renames['cvd'] = 'cvd_cumulative (alias)'
-    if _phase0_renames:
-        print(f"   🔧 Phase 1.1 fallback aliases applied: {_phase0_renames}")
+    # D1: obi_net / cvd_cumulative were EXACT duplicates (= obi / cvd) re-aliased
+    # here after finalize. Both are now dropped from the export — obi is depth
+    # (not exported), cvd keeps its canonical name only — so the aliasing is
+    # removed to prevent the duplicates re-appearing in the parquet.
 
     df_out.to_parquet(out_path, index=False)
     print(f"\n💾 Dataset محفوظ: {out_path}")
