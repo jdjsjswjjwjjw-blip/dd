@@ -1791,29 +1791,58 @@ def attach_mbp_bar_coverage(
 def _normalize_lob_tensor_nonflat(
     tensors: np.ndarray,
     *,
-    min_samples: int = 10,
+    lookback_bars: int = 222,        # نافذة سببية على محور الـbars (≈يوم تداول؛ 0 = expanding)
+    min_prior_samples: int = 50,     # حد أدنى من القيم السابقة الصالحة لتطبيع شمعة
     eps: float = 1e-12,
     clip_std: float = 6.0,
 ) -> np.ndarray:
-    """FIX #4: (µ,σ) لكل زوج (مستوى سعر، قناة) عبر N×T — ثم قصّ لحصر ذيول الشواذ."""
+    """C3 FIX — z-score سببي بنافذة سابقة لكل (مستوى سعر، قناة).
+
+    سابقاً: (µ,σ) محسوبان عبر N×T كله (السلسلة الكاملة) ⇒ تطبيع الشمعة i كان
+    يستعمل إحصاءً يحتوي bars > i (المستقبل) = تسرّب أمامي بالبناء (مشكلة C3).
+
+    الآن: إحصاء تطبيع الشمعة i من bars [i-lookback_bars, i-1] فقط — ماضٍ صرف،
+    أبداً الشمعة i نفسها ولا ما بعدها.
+
+    شرط مسبق (محقَّق): محور N زمني — المستدعون يرتّبون df_bars بـ ts_event.
+    منهجياً = DeepLOB prior-window z-score / quant-exec-kit §4 causal_zscore_normalize
+    (quant-rigor-guard RULE 1: لا إحصاءات dataset-wide؛ RULE 5: نافذة سابقة لا عالمية).
+    التطبيع السببي لا يحتاج fit-on-train/apply-on-test — لا تسرّب عبر حدّ الـsplit.
+
+    الشموع التي بلا ماضٍ كافٍ (< min_prior_samples) تُترك خاماً (warmup) — تُسقَط
+    لاحقاً عبر is_warmup؛ معالجة المحاذاة منفصلة (C2).
+    """
     out = tensors.astype(np.float32, copy=True)
     if out.ndim != 4:
         return out
     n_b, t_b, p_b, c_b = out.shape
-    for c in range(c_b):
-        for p in range(p_b):
-            sl = out[:, :, p, c].reshape(-1)
-            nz = sl[np.abs(sl) > eps]
-            if len(nz) < min_samples:
-                continue
-            mu = float(np.mean(nz))
-            sd = float(np.std(nz))
-            if sd > 1e-8:
-                col = (out[:, :, p, c] - mu) / sd
-                if clip_std is not None and clip_std > 0:
-                    col = np.clip(col, -clip_std, clip_std)
-                out[:, :, p, c] = col.astype(np.float32)
-    return out
+
+    M = out.astype(np.float64)
+    mask = np.abs(M) > eps                                   # تجاهل الأصفار البنيوية (كالسابق)
+    s1 = np.where(mask, M, 0.0).sum(axis=1)                  # (N,P,C) مجاميع كل شمعة عبر T
+    s2 = np.where(mask, M * M, 0.0).sum(axis=1)
+    cnt = mask.sum(axis=1).astype(np.float64)
+
+    def _prior(arr: np.ndarray) -> np.ndarray:
+        """prior[i] = مجموع bars [i-lookback_bars, i-1] (يستبعد الشمعة i وما بعدها)."""
+        cum = np.cumsum(arr, axis=0)
+        prior = np.zeros_like(cum)
+        prior[1:] = cum[:-1]                                 # expanding: bars [0, i-1]
+        if 0 < lookback_bars < n_b:                          # قصّ إلى نافذة [i-lookback, i-1]
+            prior[lookback_bars + 1:] -= cum[:-lookback_bars - 1]
+        return prior
+
+    p_s1, p_s2, p_cnt = _prior(s1), _prior(s2), _prior(cnt)
+    safe = np.maximum(p_cnt, 1.0)
+    mu = p_s1 / safe                                         # (N,P,C) — من الماضي فقط
+    sd = np.sqrt(np.maximum(p_s2 / safe - mu * mu, 0.0))
+
+    ok = (p_cnt >= float(min_prior_samples)) & (sd > 1e-8)   # غير الكافي = warmup → خام
+    sd_safe = np.where(sd > 1e-8, sd, 1.0)
+    z = (M - mu[:, None, :, :]) / sd_safe[:, None, :, :]
+    if clip_std is not None and clip_std > 0:
+        z = np.clip(z, -clip_std, clip_std)
+    return np.where(ok[:, None, :, :], z.astype(np.float32), out)
 
 
 def _coverage_stats(series: pd.Series | np.ndarray, *, low_threshold: float) -> dict:
