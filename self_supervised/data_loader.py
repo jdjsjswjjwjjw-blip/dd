@@ -369,6 +369,12 @@ class SSLDataset(Dataset):
                 f"Length mismatch: df={len(self.df)} vs lob={len(self.lob_tensors)}"
             )
 
+        # C2-b: length is NOT enough — the tensor is paired with the parquet
+        # POSITIONALLY (tensor[i] ↔ df.iloc[i] ↔ label[i]). Verify off-by-zero
+        # timestamp alignment when lob_timestamps is available (safe fallback to
+        # length-only for older runs without the sidecar — see the TODO inside).
+        self._verify_lob_alignment(lob_timestamps_path)
+
         # ── Load real OrderBatches if provided ──
         if self.use_real_orders:
             ob_features = os.path.join(order_batches_dir, 'order_features.npy')
@@ -454,6 +460,60 @@ class SSLDataset(Dataset):
         # Fit z-score on TRAIN slice only (S1 fix)
         self._compute_context_stats()
         self._precompute_targets()
+
+    def _verify_lob_alignment(self, lob_timestamps_path: Optional[str]) -> None:
+        """C2-b — verify LOB tensor ↔ parquet alignment OFF-BY-ZERO, not just by
+        length. tensor[i] is paired with df.iloc[i] positionally; a timestamp
+        mismatch means every LOB window trains against the WRONG bar's label
+        (look-ahead / misalignment leakage). quant-rigor-guard RULE 1 + RULE 8.
+
+        TODO(after Phase 0): turn the missing-file fallback below into a HARD
+        FAILURE — no training without a saved lob_tensor_timestamps.npy. The
+        safe fallback exists ONLY so foundation-phase work on older runs (built
+        before the timestamps sidecar) is not broken; once Phase 0 is complete,
+        an unverifiable alignment must STOP the run, not merely warn.
+        """
+        # ── back-compat: file not provided/found → warn + length-only (no break)
+        if not lob_timestamps_path or not os.path.exists(lob_timestamps_path):
+            print(
+                "  ⚠️  lob_timestamps not provided/found — LOB↔parquet alignment\n"
+                "      verified by LENGTH ONLY (older run without the timestamps\n"
+                "      sidecar). Pass lob_tensor_timestamps_<tag>.npy to enable the\n"
+                "      off-by-zero timestamp check (tensor[i] ↔ bar[i]). "
+                "[TODO: hard-fail after Phase 0]"
+            )
+            return
+
+        # saved by prepare_day_trading as int64 ns-since-epoch (UTC)
+        lob_ns = np.load(lob_timestamps_path).astype("int64").ravel()
+        parq_ns = pd.to_datetime(self.df["ts_event"], utc=True).to_numpy("datetime64[ns]").astype("int64")
+        if len(lob_ns) != len(parq_ns):
+            raise ValueError(
+                f"❌ C2 LOB↔parquet: timestamps length {len(lob_ns)} != parquet rows "
+                f"{len(parq_ns)} — the .npy and .parquet are not from the same run."
+            )
+        mism = int(np.count_nonzero(lob_ns != parq_ns))
+        if mism:
+            i = int(np.argmax(lob_ns != parq_ns))
+            lob_dt = pd.Timestamp(int(lob_ns[i]), unit="ns", tz="UTC")
+            parq_dt = pd.Timestamp(int(parq_ns[i]), unit="ns", tz="UTC")
+            raise ValueError(
+                "\n❌ C2 — LOB↔parquet MISALIGNMENT: refusing to train.\n\n"
+                f"  Row {i}: LOB tensor timestamp {lob_dt} != parquet bar timestamp {parq_dt}\n"
+                f"  ({mism} of {len(parq_ns)} rows differ).\n\n"
+                "  WHY THIS MATTERS: the tensor is paired with the parquet by POSITION\n"
+                "  (tensor[i] ↔ df.iloc[i] ↔ label[i]). A timestamp mismatch means every\n"
+                "  LOB window would train against the WRONG bar's label — look-ahead /\n"
+                "  misalignment leakage that silently inflates the backtest and fails live.\n\n"
+                "  HOW TO FIX: the .npy and .parquet are from different runs or out of order.\n"
+                "  Rebuild the LOB tensors against THIS parquet (prepare_day_trading.py with\n"
+                "  the same --artifact-tag), or pass the matching lob_tensor_timestamps_<tag>.npy.\n"
+                "  Do NOT train until the timestamps match off-by-zero."
+            )
+        print(
+            f"  ✅ LOB↔parquet alignment verified off-by-zero "
+            f"({len(parq_ns):,} rows, timestamps match)."
+        )
 
     def _build_segment_mask(self, n_total: int) -> None:
         """Compute per-bar mask: True iff the bar can be used as a sample
