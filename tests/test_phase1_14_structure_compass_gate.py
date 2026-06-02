@@ -146,3 +146,52 @@ class TestCausality:
         for cut in (40, 80, 119):
             trunc = P.detect_structure_compass_events(df.iloc[: cut + 1].copy())["is_event"].to_numpy()
             assert np.array_equal(full[: cut + 1], trunc), f"verdict changed at cut={cut}"
+
+
+class TestPostGateIntegration:
+    """Drive the new gate through the stages that run right after it
+    (direction voting → engineering fixes → feature selection) on a frame
+    that carries the full compass trio, proving the structure-only run path
+    is wired end-to-end and the 3 compass tools survive keep_top."""
+
+    def _frame(self, n: int = 120) -> pd.DataFrame:
+        rng = np.random.RandomState(5)
+        close = 100 + np.cumsum(rng.randn(n) * 0.4)
+        return pd.DataFrame({
+            "ts_event": pd.date_range("2025-04-07 08:00", periods=n, freq="5min", tz="UTC"),
+            "open": close, "high": close + 0.3, "low": close - 0.3, "close": close,
+            "volume": np.abs(rng.randn(n)) * 100 + 50,
+            "atr_14": np.full(n, 0.5),
+            "regime_label": np.where(np.arange(n) % 2 == 0, "trending", "ranging"),
+            "is_session_break": np.zeros(n, dtype=np.int8),
+            "is_london": np.ones(n, dtype=int), "is_overlap": np.zeros(n, dtype=int),
+            "is_ny": np.zeros(n, dtype=int),
+            # the full compass trio present (unlike the bare unit fixtures)
+            "order_flow_imbalance": rng.uniform(-1, 1, n),
+            "vwap_z_score": rng.randn(n) * 2,
+            "bar_cvd_delta": rng.randn(n) * 4,
+            "cvd": np.cumsum(rng.randn(n) * 4), "obi": rng.uniform(-1, 1, n),
+            "kalman_direction": rng.choice([-1, 0, 1], n),
+            "pdh": close + rng.uniform(0, 1, n), "pdl": close - rng.uniform(0, 1, n),
+            "pwh": close + rng.uniform(0, 2, n), "pwl": close - rng.uniform(0, 2, n),
+            "london_sess_high": close + rng.uniform(0, 0.6, n),
+            "london_sess_low": close - rng.uniform(0, 0.6, n),
+        })
+
+    def test_gate_then_direction_then_engineering_no_crash(self):
+        from modules.features_v2.iceberg import attach_iceberg_features
+        df = P.detect_structure_compass_events(self._frame())
+        df = P.add_event_direction(df)
+        df = attach_iceberg_features(df, mbo=None)
+        df = P._apply_phase1_engineering_fixes(df, warmup_drop_bars=20)
+        assert "is_event" in df.columns and "event_direction" in df.columns
+        assert len(df) == 120
+
+    def test_compass_trio_survives_keep_top(self):
+        df = P.detect_structure_compass_events(self._frame())
+        df = P.add_event_direction(df)
+        df = P._apply_phase1_engineering_fixes(df, warmup_drop_bars=20)
+        df = P._apply_phase1_feature_selection(df, mode="keep_top")
+        for c in ("order_flow_imbalance", "vwap_z_score", "cvd_divergence_at_level"):
+            assert c in df.columns, f"compass tool {c} dropped by keep_top"
+
