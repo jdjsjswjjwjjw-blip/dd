@@ -2149,6 +2149,7 @@ def build_rolling_lob_tensors_from_mbp(
     freq: str,
     lookback_bars: int = DEEPLOB_TIME_STEPS_DEFAULT,
     levels: int = 10,
+    normalize: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     لكل شمعة i: tensor (lookback, 20, 9) حيث البعد الزمني = شموع سابقة حقيقية.
@@ -2325,7 +2326,11 @@ def build_rolling_lob_tensors_from_mbp(
             filled += 1
         roll_cov[bi] = float(filled) / float(T)
 
-    tensors = _normalize_lob_tensor_nonflat(tensors)
+    # normalize=False returns the RAW log1p depth channels so the D4 fidelity
+    # harness (tools/diagnostics/validate_lob_vs_mbp.py) can decode ch3/ch4 and
+    # compare level-by-level to the source MBP-10. Production always normalizes.
+    if normalize:
+        tensors = _normalize_lob_tensor_nonflat(tensors)
     snap_ratio = float(bars_with_snapshot) / float(max(n_bars, 1))
     mean_roll_cov = float(np.mean(roll_cov)) if len(roll_cov) else 0.0
     low_roll_ratio = float(np.mean(roll_cov < 0.50)) if len(roll_cov) else 1.0
