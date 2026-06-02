@@ -330,6 +330,8 @@ def check_model_forward(batch: dict):
 
     config = DeepLOBConfig()
     config.multi_task_heads.direction_weight = 0.0
+    # D1 Phase 2 (DERIVE): match the context encoder to the real emitted dim.
+    config.context_encoder.n_input_features = batch['context'].shape[-1]
     model = HierarchicalLOBTransformer(config).eval()
 
     _assert(model.lob_image_encoder is not None,
@@ -373,6 +375,8 @@ def check_loss_masking(model, batch: dict):
     device = torch.device('cpu')
     config = DeepLOBConfig()
     config.multi_task_heads.direction_weight = 0.0
+    # (model is the already-derived one from check_model_forward; this local
+    #  config only supplies multi_task_heads loss weights — no encoder built.)
     cfg_w = config.multi_task_heads
 
     # Push batch to device dict matching pretrain_lob inputs

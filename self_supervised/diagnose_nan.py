@@ -171,6 +171,8 @@ def main():
     device = torch.device(args.device)
     config = DeepLOBConfig()
     config.multi_task_heads.direction_weight = 0.0
+    # D1 Phase 2 (DERIVE): match the context encoder to the real emitted dim.
+    config.context_encoder.n_input_features = holdout_batch['context'].shape[-1]
     model = HierarchicalLOBTransformer(config).to(device).eval()
 
     # Use first holdout batch

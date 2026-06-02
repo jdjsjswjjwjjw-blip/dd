@@ -38,6 +38,11 @@ def load_lob_model(checkpoint_path: str, device: torch.device) -> HierarchicalLO
     if saved_cfg is None:
         print("⚠️  Checkpoint has no 'config' — using current DeepLOBConfig() defaults. "
               "If defaults have changed since training, embeddings will differ.")
+        # D1 Phase 2: the normal path uses the checkpoint's saved config, which
+        # carries the DERIVED context dim — so extraction rebuilds at the right
+        # size. This fallback assumes the default dim; a derived-dim checkpoint
+        # without a saved config will fail loudly at load_state_dict(strict=True),
+        # which is correct (better a hard error than a silently wrong architecture).
         config = DeepLOBConfig()
     elif isinstance(saved_cfg, DeepLOBConfig):
         config = saved_cfg

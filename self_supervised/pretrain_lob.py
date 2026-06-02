@@ -401,6 +401,14 @@ def main():
     print("🏗️  Building HierarchicalLOBTransformer...")
     config = DeepLOBConfig()
     config.multi_task_heads.direction_weight = 0.0
+    # D1 Phase 2 (DERIVE): the context encoder's input dim must match the REAL
+    # number of context features the Dataset emits (post-D1 ≠ the old fixed 138).
+    # Same proven pattern as pretrain_cycle.py derives cycle_dim. No magic number.
+    ctx_dim = next(iter(train_loader))['context'].shape[-1]
+    if config.context_encoder.n_input_features != ctx_dim:
+        print(f"   context dim: config default {config.context_encoder.n_input_features} "
+              f"→ DERIVED {ctx_dim} (from actual context features)")
+        config.context_encoder.n_input_features = ctx_dim
     model = HierarchicalLOBTransformer(config).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"   Parameters: {n_params:,}")

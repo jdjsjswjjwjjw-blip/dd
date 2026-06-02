@@ -127,9 +127,14 @@ def _is_leakage_column(col: str) -> bool:
 
 
 def _build_context_features(
-    df_row: pd.Series, available_cols: list[str], target_dim: int = 138,
+    df_row: pd.Series, available_cols: list[str], target_dim: Optional[int] = None,
 ) -> np.ndarray:
-    """يبني context vector من DataFrame row (138-dim default)."""
+    """يبني context vector من DataFrame row.
+
+    D1 Phase 2 (DERIVE): `target_dim=None` (الافتراضي الجديد) يُخرج البُعد الحقيقي
+    `len(available_cols)` — لا حشو وهمي بأصفار ولا قصّ صامت. التمرير الصريح لرقم
+    يبقى متاحاً (حشو/قصّ) للتوافق الخلفي فقط، لكنه لم يَعُد المسار الافتراضي.
+    """
     values = []
     for col in available_cols:
         v = df_row.get(col, 0.0)
@@ -138,6 +143,8 @@ def _build_context_features(
         except (ValueError, TypeError):
             values.append(0.0)
     arr = np.array(values, dtype=np.float32)
+    if target_dim is None:
+        return arr                                   # honest dim = len(available_cols)
     if len(arr) < target_dim:
         arr = np.concatenate([arr, np.zeros(target_dim - len(arr), dtype=np.float32)])
     else:
@@ -328,7 +335,7 @@ class SSLDataset(Dataset):
         order_batches_dir: Optional[str] = None,
         lookback_bars: int = 50,
         n_orders: int = 20,
-        context_dim: int = 138,
+        context_dim: Optional[int] = None,
         min_idx: Optional[int] = None,
         max_idx: Optional[int] = None,
         # Train-period bounds for fitting normalization stats. If None,
@@ -346,7 +353,10 @@ class SSLDataset(Dataset):
     ):
         self.lookback_bars = lookback_bars
         self.n_orders = n_orders
-        self.context_dim = context_dim
+        # D1 Phase 2: optional CAP only. The actual emitted context dim is the
+        # number of kept (non-leakage) columns — set as self.context_dim after
+        # the blacklist runs below, then DERIVED by the model. None = no cap.
+        self._context_dim_cap = context_dim
         self.order_batches_dir = order_batches_dir
         self.use_real_orders = order_batches_dir is not None
         self.embargo_bars = int(embargo_bars)
@@ -451,10 +461,15 @@ class SSLDataset(Dataset):
         numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
         excluded = [c for c in numeric_cols if _is_leakage_column(c)]
         kept = [c for c in numeric_cols if not _is_leakage_column(c)]
-        self.context_cols = kept[:context_dim]
-        print(f"     context features: {len(self.context_cols)} (capped at {context_dim}, "
-              f"excluded {len(excluded)} leakage-prone)")
-        if len(self.context_cols) == 0:
+        # D1 Phase 2 (DERIVE): no fixed 138 anymore. The context dim is the REAL
+        # number of kept causal features — phantom zero-pad and silent truncation
+        # are both gone. An optional cap remains for back-compat only.
+        self.context_cols = kept if self._context_dim_cap is None else kept[:self._context_dim_cap]
+        self.context_dim = len(self.context_cols)     # the dim actually emitted
+        cap_note = "no cap" if self._context_dim_cap is None else f"capped at {self._context_dim_cap}"
+        print(f"     context features: {self.context_dim} ({cap_note}, "
+              f"excluded {len(excluded)} leakage-prone) — model dim DERIVED from this")
+        if self.context_dim == 0:
             raise RuntimeError("No causal context features available — check blacklist.")
 
         # Fit z-score on TRAIN slice only (S1 fix)

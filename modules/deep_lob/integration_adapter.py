@@ -257,7 +257,11 @@ class BridgeAdapter:
         bar_mask = torch.ones(1, 1, dtype=torch.bool)
         if "context" in features:
             context = torch.from_numpy(features["context"]).unsqueeze(0).float()
-            # Pad/truncate to 138
+            # TODO(D1 Phase 2 — inference path, deferred): replace the literal
+            # 138 here and below with self.model.config.context_encoder.
+            # n_input_features (the model carries the DERIVED dim post-D1).
+            # Deferred intentionally — the training path is derived; this
+            # inference adapter is not exercised yet.
             n_ctx = context.shape[1]
             if n_ctx < 138:
                 context = torch.cat([

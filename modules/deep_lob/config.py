@@ -133,8 +133,13 @@ class BarLSTMConfig:
 
 @dataclass
 class ContextEncoderConfig:
-    """Encodes the 138 features الموجودة كـ context vector."""
+    """Encodes the causal context features الموجودة كـ context vector."""
 
+    # D1 Phase 2: FALLBACK only — DERIVED at runtime from the real number of
+    # context features the Dataset emits (pretrain_lob / verify_integration /
+    # diagnose_nan all set this from `batch['context'].shape[-1]`). After D1 the
+    # true count ≠ the old fixed 138, and is data-dependent, so never rely on
+    # this literal. Checkpoints persist the derived value via asdict(config).
     n_input_features: int = 138
     hidden_dim: int = 64
     output_dim: int = 32
