@@ -4379,6 +4379,26 @@ def _apply_phase1_feature_selection(
     return df_out
 
 
+_C4_REQUIRE_MBP_MSG = (
+    "❌ C4 — --require-mbp is set but MBP-10 is unavailable.\n"
+    "  Refusing to build LOB tensors from the MBO-only reconstruction (book rebuilt\n"
+    "  from trades, NOT real order-book depth — quant-rigor-guard RULE 5).\n"
+    "  Fix: pass --mbp <path> to a valid MBP10 file, or drop --require-mbp to allow\n"
+    "  the weak path explicitly."
+)
+
+_C4_MBO_ONLY_WARNING = (
+    "\n" + "═" * 70 + "\n"
+    "  🚨 C4 — LOB tensors built via MBO-ONLY RECONSTRUCTION (weak path).\n"
+    "     MBP-10 unavailable → the book was rebuilt from trades, NOT real depth.\n"
+    "     • Spatial reads (walls / liquidity map / bottoms-vs-tops) degraded (RULE 5).\n"
+    "     • Pass --mbp <path> for the strong from_mbp path, or --require-mbp to refuse.\n"
+    "     • Permanently recorded: lob_tensor_source='mbo_only_reconstructed'\n"
+    "       (artifact_manifest.json + dataset_meta.json).\n"
+    + "═" * 70
+)
+
+
 def run_day_trading_refinery(
     mbo_dir: str | None,
     mbp_path: str | None,
@@ -4388,6 +4408,7 @@ def run_day_trading_refinery(
     tp_atr_mult: float = 1.5,
     sl_atr_mult: float = 1.0,
     build_lob_tensors: bool = True,
+    require_mbp: bool = False,
     *,
     session_profile: str = 'daytrade_default',
     strict_train_pool: bool = False,
@@ -4696,6 +4717,7 @@ def run_day_trading_refinery(
     df_final['mbp_roll_lob_coverage'] = np.float32(0.0)
 
     # ── 6. LOB tensors: نافذة DeepLOB = 50 شمعة تاريخية حقيقية (وليس شرائح داخل bar واحد)
+    lob_tensor_source: str | None = None   # C4: which path produced the LOB tensor
     if build_lob_tensors:
         tensors_path = os.path.join(output_dir, lob_fn)
         ts_path = os.path.join(output_dir, lob_ts_fn)
@@ -4716,6 +4738,7 @@ def run_day_trading_refinery(
             # C2 guard: a reused tensor must align to THIS run's bars off-by-zero
             # (not just match length) — the .npy and the parquet are paired by row.
             _assert_lob_tensor_aligned(tensor_ts, df_final, where="reuse")
+            lob_tensor_source = 'reused_from_dir'   # C4: origin = the prior run's path
             if int(tensors.shape[0]) != int(len(df_final)):
                 raise ValueError(
                     f"❌ reuse LOB: عدد الصفوف غير متطابق "
@@ -4755,7 +4778,15 @@ def run_day_trading_refinery(
                     lookback_bars=DEEPLOB_TIME_STEPS_DEFAULT,
                     levels=10,
                 )
+                lob_tensor_source = 'mbp_10'
             else:
+                # C4: MBP-10 absent → weak MBO-only reconstruction (book rebuilt from
+                # trades, no real depth — RULE 5). Refuse it in production via
+                # --require-mbp; otherwise build it with a LOUD warning + a permanent
+                # source flag. Observability only — no change to the build logic.
+                if require_mbp:
+                    raise ValueError(_C4_REQUIRE_MBP_MSG)
+                print(_C4_MBO_ONLY_WARNING)
                 tensors, tensor_ts, roll_cov = build_rolling_lob_tensors_mbo_only(
                     df_mbo,
                     df_final,
@@ -4763,6 +4794,7 @@ def run_day_trading_refinery(
                     lookback_bars=DEEPLOB_TIME_STEPS_DEFAULT,
                     n_levels=20,
                 )
+                lob_tensor_source = 'mbo_only_reconstructed'
             # C2 guard: tensor + roll_cov are assigned POSITIONALLY onto df_final
             # below — verify off-by-zero alignment before that assignment + save.
             _assert_lob_tensor_aligned(tensor_ts, df_final, where="build")
@@ -4948,6 +4980,7 @@ def run_day_trading_refinery(
             "sl_atr_mult": float(sl_atr_mult),
             "session_profile": str(session_profile),
             "apply_event_direction_veto": bool(apply_event_direction_veto),
+            "lob_tensor_source": lob_tensor_source,   # C4: also in dataset_meta (2nd place)
         }
         meta_path = write_dataset_meta(df_out, out_path, extra=meta_extra)
         print(f"   📋 dataset_meta.json: {meta_path}")
@@ -5077,6 +5110,7 @@ def run_day_trading_refinery(
         'original_features_export_only': True,
         'day_trading_context_features': DAY_TRADING_FEATURES,
         'lob_tensors_built'           : bool(build_lob_tensors),
+        'lob_tensor_source'           : lob_tensor_source,   # C4: mbp_10 | mbo_only_reconstructed | reused_from_dir | None
         'lob_roll_lookback_bars'      : DEEPLOB_TIME_STEPS_DEFAULT,
         'lob_tensor_layout'           : 'rolling_bars_time_x_20_levels_x_3ch_peak_mbp_when_available',
         'mbp_bar_coverage_stats'      : mbp_bar_cov_stats,
@@ -5219,6 +5253,9 @@ if __name__ == '__main__':
     p.add_argument('--tp_mult', type=float, default=1.5, help='TP = tp_mult * ATR')
     p.add_argument('--sl_mult', type=float, default=1.0, help='SL = sl_mult × ATR')
     p.add_argument('--no_lob',  action='store_true', help='تخطي بناء LOB tensors')
+    p.add_argument('--require-mbp', action='store_true',
+                   help='يرفض بناء LOB من mbo_only الضعيف عند غياب MBP-10 '
+                        '(أمان إنتاجي: لا عمق وهمي بصمت — RULE 5). default=off')
     p.add_argument(
         '--session_profile',
         '--session-profile',
@@ -5541,6 +5578,7 @@ if __name__ == '__main__':
         tp_atr_mult=args.tp_mult,
         sl_atr_mult=args.sl_mult,
         build_lob_tensors=build_lob_run,
+        require_mbp=args.require_mbp,
         session_profile=args.session_profile,
         strict_train_pool=args.strict_train_pool,
         event_threshold_scale=args.event_threshold_scale,
