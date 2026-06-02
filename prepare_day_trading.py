@@ -1873,6 +1873,34 @@ def _normalize_lob_tensor_nonflat(
     return np.where(ok[:, None, :, :], z.astype(np.float32), out)
 
 
+def _assert_lob_tensor_aligned(tensor_ts: np.ndarray, bars: pd.DataFrame, *, where: str) -> None:
+    """C2 — alignment guard: tensor row i must pair with bars.iloc[i] off-by-zero.
+
+    The LOB tensor (and roll_cov) are produced in the builder's INTERNAL
+    ts_event sort order, then assigned POSITIONALLY onto df_final and saved
+    beside the parquet. The SSL consumer (self_supervised/data_loader.py) aligns
+    tensor[i] ↔ parquet.iloc[i] by position and currently checks LENGTH only.
+    A silent reorder of either side would mispair every LOB window with a
+    neighbouring bar's label — the worst leak in the late-fusion merge
+    (quant-rigor-guard RULE 1 + RULE 8). This makes that failure impossible by
+    construction: raise loudly the moment tensor_ts != bars['ts_event'].
+    """
+    bar_ts = pd.to_datetime(bars['ts_event']).to_numpy('datetime64[ns]')
+    tns_ts = np.asarray(tensor_ts, dtype='datetime64[ns]')
+    if len(tns_ts) != len(bar_ts):
+        raise ValueError(
+            f"❌ C2 LOB alignment [{where}]: tensor rows={len(tns_ts)} != bars={len(bar_ts)}"
+        )
+    mism = int(np.count_nonzero(tns_ts != bar_ts))
+    if mism:
+        i = int(np.argmax(tns_ts != bar_ts))
+        raise ValueError(
+            f"❌ C2 LOB alignment [{where}]: tensor_ts != df.ts_event in {mism} row(s) "
+            f"(first @ idx {i}: tensor={tns_ts[i]} vs bar={bar_ts[i]}). "
+            f"Tensor row order MUST match the saved parquet row order off-by-zero."
+        )
+
+
 def _coverage_stats(series: pd.Series | np.ndarray, *, low_threshold: float) -> dict:
     vals = pd.to_numeric(pd.Series(series), errors='coerce').fillna(0.0).astype(np.float64).to_numpy()
     if vals.size == 0:
@@ -4685,6 +4713,9 @@ def run_day_trading_refinery(
             tensors = np.load(src_t, allow_pickle=False)
             ts_raw = np.load(src_ts, allow_pickle=False)
             tensor_ts = ts_raw.astype('datetime64[ns]')
+            # C2 guard: a reused tensor must align to THIS run's bars off-by-zero
+            # (not just match length) — the .npy and the parquet are paired by row.
+            _assert_lob_tensor_aligned(tensor_ts, df_final, where="reuse")
             if int(tensors.shape[0]) != int(len(df_final)):
                 raise ValueError(
                     f"❌ reuse LOB: عدد الصفوف غير متطابق "
@@ -4732,6 +4763,9 @@ def run_day_trading_refinery(
                     lookback_bars=DEEPLOB_TIME_STEPS_DEFAULT,
                     n_levels=20,
                 )
+            # C2 guard: tensor + roll_cov are assigned POSITIONALLY onto df_final
+            # below — verify off-by-zero alignment before that assignment + save.
+            _assert_lob_tensor_aligned(tensor_ts, df_final, where="build")
             df_final['mbp_roll_lob_coverage'] = roll_cov.astype(np.float32)
 
             np.save(tensors_path, tensors)
