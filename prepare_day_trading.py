@@ -1653,11 +1653,15 @@ def assign_regime_label(
     volatile_hawkes_z: float = 1.5,
     trending_atr_ratio: float = 0.8,
     trending_strength_min: float = 0.55,
-    low_liquidity_cov: float = 0.30,
+    low_liquidity_frac: float = 0.5,
 ) -> pd.DataFrame:
     """
     يعين regime_label بشكل سببي على مستوى الشموع.
     مهم: volatile يتطلب BOTH (ATR مرتفع + Hawkes مرتفع) لتجنب false positives.
+
+    low_liquidity (B): مفصول عن MBP — نشاط tick (tick_count/volume) تحت median
+    نافذة متحرّكة (ماضية، نفس نمط atr_med/cvd_ref). regime يبقى في مسار day_trade
+    الهيكلي ومستقلٌّ عن العمق → labels قابلة للاستنساخ مع/بدون MBP (R1/R10).
     """
     out = df.copy()
     if len(out) == 0:
@@ -1687,9 +1691,15 @@ def assign_regime_label(
         & ((cvd_signed.abs() > (cvd_ref + 1e-12)) | (trend_strength > float(trending_strength_min)))
     )
 
-    if 'mbp_bar_coverage' in out.columns:
-        cov = pd.to_numeric(out['mbp_bar_coverage'], errors='coerce').fillna(0.0).astype(np.float64)
-        lowliq_mask = cov < float(low_liquidity_cov)
+    # B: low_liquidity من نشاط التيب (mbp-independent). ميل tick_count إن وُجد،
+    # وإلا volume. nan-في-البدء (قبل اكتمال النافذة) → False (لا نصنّف بفقر معلومة).
+    liq_src = 'tick_count' if 'tick_count' in out.columns else (
+        'volume' if 'volume' in out.columns else None
+    )
+    if liq_src is not None:
+        liq = pd.to_numeric(out[liq_src], errors='coerce').astype(np.float64)
+        liq_med = liq.rolling(roll_window, min_periods=min_periods).median()
+        lowliq_mask = (liq < float(low_liquidity_frac) * liq_med).fillna(False)
     else:
         lowliq_mask = pd.Series(False, index=out.index)
 
