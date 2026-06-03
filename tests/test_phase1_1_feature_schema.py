@@ -198,15 +198,25 @@ class TestValidate:
         errors = validate(_refinery_like_frame())
         assert errors == [], f"unexpected errors: {errors}"
 
-    def test_missing_obi_net_flagged(self):
-        df = _refinery_like_frame().drop(columns=["obi_net"])
+    def test_dropped_aliases_no_longer_flagged_post_d1(self):
+        """Post-D1: obi_net / cvd_cumulative were removed from the export
+        contract (they were depth-coupled duplicates of obi / cvd). The
+        validator must NO LONGER complain about their absence on the
+        canonical exported frame — earlier the validator and the export
+        whitelist disagreed (Issue 3)."""
+        df = _refinery_like_frame().drop(columns=["obi_net", "cvd_cumulative"])
         errors = validate(df)
-        assert any("obi_net" in e for e in errors)
+        joined = " | ".join(errors)
+        assert "obi_net" not in joined
+        assert "cvd_cumulative" not in joined
 
-    def test_missing_cvd_cumulative_flagged(self):
-        df = _refinery_like_frame().drop(columns=["cvd_cumulative"])
+    def test_missing_cvd_flagged(self):
+        """The live canonical flow column is `cvd` (source of Phase 1.4's
+        per-bar CVD features). Dropping it must still be reported — the
+        validator did not lose its teeth in Issue 3."""
+        df = _refinery_like_frame().drop(columns=["cvd"])
         errors = validate(df)
-        assert any("cvd_cumulative" in e for e in errors)
+        assert any("cvd" in e for e in errors), f"got {errors}"
 
     def test_missing_required_ohlcv_flagged(self):
         df = _refinery_like_frame().drop(columns=["high"])

@@ -523,8 +523,10 @@ def validate(df: pd.DataFrame, *, strict: bool = False) -> list[str]:
     Checks:
       - REQUIRED_OHLCV columns present
       - REQUIRED_REGIME columns present
-      - Canonical aliases present (obi_net + cvd_cumulative both required,
-        not the raw obi/cvd which are kept as compute aliases only)
+      - Per-bar signed CVD (`cvd`) present — Phase 1.4's source for the
+        five MT5-style per-bar CVD features (`cvd_bar_5m`, `cvd_intensity_vs_atr`,
+        …). After D1 the depth-side duplicate `cvd_cumulative` was dropped from
+        the export contract — the live canonical name is `cvd`.
       - No blacklisted column appears alongside its replacement
 
     strict=True also requires the label-target columns (bias_label,
@@ -539,15 +541,13 @@ def validate(df: pd.DataFrame, *, strict: bool = False) -> list[str]:
         if c not in df.columns:
             errors.append(f"required regime column missing: {c!r}")
 
-    # Canonical aliases — the IC audit / verify_data_health expect these.
-    if 'obi_net' not in df.columns:
+    # Live canonical flow column. D1 removed the depth-coupled duplicates
+    # (`obi_net`, `cvd_cumulative`) from the export contract — they were
+    # aliases of `obi` / `cvd`. `cvd` is Phase 1.4's source for the five
+    # MT5-style per-bar CVD features and must be present.
+    if 'cvd' not in df.columns:
         errors.append(
-            "canonical alias `obi_net` missing — Phase 1.1 expects it "
-            "alongside any internal-compute `obi`"
-        )
-    if 'cvd_cumulative' not in df.columns:
-        errors.append(
-            "canonical alias `cvd_cumulative` missing — Phase 1.1 expects it"
+            "canonical column `cvd` missing — Phase 1.4 CVD features derive from it"
         )
 
     if strict:
