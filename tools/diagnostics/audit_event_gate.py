@@ -391,7 +391,10 @@ def write_report(
     for k, v in diag.items():
         lines.append(f"  {k}: {v}")
     lines.append("═" * 70)
-    path.write_text("\n".join(lines) + "\n")
+    # utf-8: the report contains non-ASCII (═, Arabic). Without explicit
+    # encoding Path.write_text uses the OS default (cp1252 on Windows) and
+    # raises UnicodeEncodeError — the audit was silently skipped on Windows.
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def run_audit(features_path: Path, output_dir: Path) -> dict:
@@ -439,7 +442,7 @@ def run_audit(features_path: Path, output_dir: Path) -> dict:
         "event_score_weights": EVENT_SCORE_WEIGHTS,
     }
     (output_dir / "event_gate_summary.json").write_text(
-        json.dumps(summary, indent=2, default=str)
+        json.dumps(summary, indent=2, default=str), encoding="utf-8",
     )
 
     comp_rows = []
@@ -449,7 +452,7 @@ def run_audit(features_path: Path, output_dir: Path) -> dict:
         else:
             comp_rows.append({"component": comp, **info})
     pd.DataFrame(comp_rows).to_csv(
-        output_dir / "component_failures.csv", index=False
+        output_dir / "component_failures.csv", index=False, encoding="utf-8",
     )
 
     write_report(
