@@ -191,20 +191,49 @@ def _threshold_stats(
     }
 
 
-def _compute_stats(detected: pd.DataFrame, bar_freq: str = "5min") -> dict:
-    settled = detected.iloc[WARMUP_TICKS:].reset_index(drop=True)
+def _bar_tick_counts(settled: pd.DataFrame, bar_freq: str) -> pd.Series:
+    """Ticks per bar at bar_freq, indexed by bar timestamp."""
+    bar_id = pd.to_datetime(settled["ts_event"], utc=True).dt.floor(bar_freq)
+    return bar_id.value_counts().sort_index()
+
+
+def _thin_tick_mask(settled: pd.DataFrame, min_ticks: int, bar_freq: str) -> np.ndarray:
+    """Boolean mask: True iff the tick belongs to a bar with >= min_ticks ticks.
+    min_ticks <= 0 returns an all-True mask (no filter — preserves v2 behaviour)."""
+    n = len(settled)
+    if min_ticks <= 0 or n == 0:
+        return np.ones(n, dtype=bool)
+    bar_id = pd.to_datetime(settled["ts_event"], utc=True).dt.floor(bar_freq)
+    counts = bar_id.value_counts()
+    keep_bars = counts[counts >= min_ticks].index
+    return bar_id.isin(keep_bars).to_numpy()
+
+
+def _compute_stats_from_settled(settled: pd.DataFrame, bar_freq: str = "5min") -> dict:
+    """Stat computation on already-settled (warmup-dropped) detector output.
+    Used by _compute_stats (which drops warmup first) and by the filtered path
+    in run_breathing_test (which filters AFTER warmup drop)."""
+    n = len(settled)
+    if n == 0:
+        return {"n_settled_ticks": 0, "absorb_z_percentiles": {}, "sweep": []}
     z = pd.to_numeric(settled["absorb_z"], errors="coerce").to_numpy(np.float64)
     ts = pd.to_datetime(settled["ts_event"], utc=True)
     ts_ns = ts.astype("int64").to_numpy()
     hours = ts.dt.hour.to_numpy()
     sess_labels = np.array([_exclusive_session(int(h)) for h in hours])
     bar_id = ts.dt.floor(bar_freq).astype("int64").to_numpy()
-
     sweep = [_threshold_stats(z, ts_ns, hours, sess_labels, bar_id, t)
              for t in SWEEP_THRESHOLDS]
     pct = {f"p{p}": float(np.percentile(z, p)) for p in PERCENTILES}
-    pct["max"] = float(z.max()) if len(z) else float("nan")
-    return {"n_settled_ticks": int(len(z)), "absorb_z_percentiles": pct, "sweep": sweep}
+    pct["max"] = float(z.max())
+    return {"n_settled_ticks": int(n), "absorb_z_percentiles": pct, "sweep": sweep}
+
+
+def _compute_stats(detected: pd.DataFrame, bar_freq: str = "5min") -> dict:
+    """v2 entry point: drop warmup, then compute stats. Kept for back-compat
+    with the existing test suite."""
+    settled = detected.iloc[WARMUP_TICKS:].reset_index(drop=True)
+    return _compute_stats_from_settled(settled, bar_freq=bar_freq)
 
 
 def _overall_verdict(stats: dict) -> dict:
@@ -247,20 +276,33 @@ def _overall_verdict(stats: dict) -> dict:
     }
 
 
-def run_breathing_test(
-    mbo_path: Path, output_dir: Path, *, bar_freq: str = "5min",
-    config: AbsorptionConfig | None = None,
+def _run_pipeline(
+    detected: pd.DataFrame, bar_freq: str, min_ticks_per_bar: int,
 ) -> dict:
-    trades = _load_trades_mbo(mbo_path)
-    out = AbsorptionDetector(config).compute(trades)
-    stats = _compute_stats(out, bar_freq=bar_freq)
-    overall = _overall_verdict(stats)
-    summary = {
-        "mbo_path": str(mbo_path),
-        "n_input_trades": int(len(trades)),
+    """Core pipeline (file-I/O free, so tests can call it directly).
+
+    Always produces the unfiltered v2 result. If min_ticks_per_bar > 0, ALSO
+    produces a filtered result (thin bars dropped) side-by-side — the report
+    shows both so nothing is hidden (R10: visual diff, no silent filtering)."""
+    settled = detected.iloc[WARMUP_TICKS:].reset_index(drop=True)
+    # ── always: unfiltered (v2 baseline)
+    stats_unfilt = _compute_stats_from_settled(settled, bar_freq=bar_freq)
+    overall_unfilt = _overall_verdict(stats_unfilt)
+    # ── tick-density distribution + p25 suggestion (R10: derived, not targeted)
+    bar_counts = _bar_tick_counts(settled, bar_freq)
+    tpb_dist: dict[str, float] = {}
+    suggested_p25 = None
+    if len(bar_counts) > 0:
+        tpb_dist = {f"p{p}": float(np.percentile(bar_counts.to_numpy(), p))
+                    for p in (10, 25, 50, 75, 90)}
+        suggested_p25 = int(round(tpb_dist["p25"]))
+    out: dict = {
         "warmup_dropped": WARMUP_TICKS,
-        "overall": overall,
-        "stats": stats,
+        "bar_freq": bar_freq,
+        "min_ticks_per_bar": int(min_ticks_per_bar),
+        "ticks_per_bar_distribution": tpb_dist,
+        "ticks_per_bar_suggested_n_p25": suggested_p25,
+        "unfiltered": {"overall": overall_unfilt, "stats": stats_unfilt},
         "params": {
             "sweep_thresholds": list(SWEEP_THRESHOLDS),
             "excess_tail_anchor": EXCESS_TAIL_ANCHOR,
@@ -268,6 +310,38 @@ def run_breathing_test(
             "cv2_clustered": CV2_CLUSTERED,
             "gap_seconds": GAP_SECONDS,
         },
+    }
+    # ── optional: filtered (only when user requests, default 0 == v2 byte-equal)
+    if min_ticks_per_bar > 0 and len(settled) > 0:
+        mask = _thin_tick_mask(settled, min_ticks_per_bar, bar_freq)
+        kept = settled.loc[mask].reset_index(drop=True)
+        n_bars_total = int(len(bar_counts))
+        n_bars_kept = int((bar_counts >= min_ticks_per_bar).sum())
+        stats_filt = _compute_stats_from_settled(kept, bar_freq=bar_freq)
+        overall_filt = _overall_verdict(stats_filt)
+        out["filtered"] = {
+            "n_bars_total": n_bars_total,
+            "n_bars_kept": n_bars_kept,
+            "fraction_bars_kept": float(n_bars_kept / max(n_bars_total, 1)),
+            "n_ticks_kept": int(mask.sum()),
+            "overall": overall_filt,
+            "stats": stats_filt,
+        }
+    return out
+
+
+def run_breathing_test(
+    mbo_path: Path, output_dir: Path, *, bar_freq: str = "5min",
+    min_ticks_per_bar: int = 0, config: AbsorptionConfig | None = None,
+) -> dict:
+    trades = _load_trades_mbo(mbo_path)
+    detected = AbsorptionDetector(config).compute(trades)
+    pipeline = _run_pipeline(detected, bar_freq=bar_freq,
+                             min_ticks_per_bar=min_ticks_per_bar)
+    summary = {
+        "mbo_path": str(mbo_path),
+        "n_input_trades": int(len(trades)),
+        **pipeline,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "breathing_test_summary.json").write_text(
@@ -277,34 +351,13 @@ def run_breathing_test(
     return summary
 
 
-def _write_report(path: Path, summary: dict) -> None:
-    st = summary["stats"]
-    ov = summary["overall"]
-    L: list[str] = []
-    L.append("═" * 92)
-    L.append("Absorption breathing test v2 — is the absorb_z TAIL structured on YOUR data?")
-    L.append("═" * 92)
-    L.append(f"mbo            : {summary['mbo_path']}")
-    L.append(f"input trades   : {summary['n_input_trades']:,}   settled: {st['n_settled_ticks']:,}")
-    L.append("")
-    pct = st["absorb_z_percentiles"]
-    L.append("absorb_z distribution: " + "  ".join(f"{k}={v:.2f}" for k, v in pct.items()))
-    L.append("")
-    L.append(f"OVERALL: {ov['verdict']}")
-    if ov.get("anchor_threshold") is not None:
-        L.append(f"  tail anchored at z>{ov['anchor_threshold']:.1f} "
-                 f"(excess={ov['anchor_excess']:.1f}× normal) → "
-                 f"session_concentrated={ov['session_concentrated']} "
-                 f"time_clustered={ov['time_clustered']}")
-    else:
-        L.append(f"  {ov.get('reason','')}")
-    L.append("")
-    L.append("THRESHOLD SWEEP (firing rate is context — verdict reads STRUCTURE):")
-    L.append("  z>t  | firing% | excess× | sess a/q | hour(cnt) | hour(rate) | CV²raw  | CV²gap | bar_frac | n_fire")
-    L.append("  " + "-" * 104)
-    for s in st["sweep"]:
-        def _f(x, w=7, p=2):
-            return (f"{x:{w}.{p}f}" if isinstance(x, (int, float)) and np.isfinite(x) else f"{'n/a':>{w}}")
+def _sweep_table(stats: dict) -> list[str]:
+    """Render the per-threshold sweep table rows + key."""
+    def _f(x, w=7, p=2):
+        return (f"{x:{w}.{p}f}" if isinstance(x, (int, float)) and np.isfinite(x) else f"{'n/a':>{w}}")
+    L = ["  z>t  | firing% | excess× | sess a/q | hour(cnt) | hour(rate) | CV²raw  | CV²gap | bar_frac | n_fire",
+         "  " + "-" * 104]
+    for s in stats["sweep"]:
         L.append(
             f"  {s['threshold']:.1f}  |"
             f"{s['firing_rate']*100:7.2f}% |"
@@ -318,6 +371,64 @@ def _write_report(path: Path, summary: dict) -> None:
             f"{s['n_firings']:>7,}"
         )
     L.append("  " + "-" * 104)
+    return L
+
+
+def _section(title: str, stats: dict, overall: dict) -> list[str]:
+    L = [title]
+    pct = stats.get("absorb_z_percentiles", {})
+    L.append("  absorb_z distribution: " + "  ".join(f"{k}={v:.2f}" for k, v in pct.items()))
+    L.append(f"  OVERALL: {overall['verdict']}")
+    if overall.get("anchor_threshold") is not None:
+        L.append(f"    tail anchored at z>{overall['anchor_threshold']:.1f} "
+                 f"(excess={overall['anchor_excess']:.1f}× normal) → "
+                 f"session_concentrated={overall['session_concentrated']} "
+                 f"time_clustered={overall['time_clustered']}")
+    else:
+        L.append(f"    {overall.get('reason','')}")
+    L.extend(_sweep_table(stats))
+    return L
+
+
+def _write_report(path: Path, summary: dict) -> None:
+    L: list[str] = []
+    L.append("═" * 92)
+    L.append("Absorption breathing test v2 — TAIL structure + thin-bar artifact diagnostic")
+    L.append("═" * 92)
+    L.append(f"mbo            : {summary['mbo_path']}")
+    unfilt = summary["unfiltered"]
+    L.append(f"input trades   : {summary['n_input_trades']:,}   "
+             f"settled: {unfilt['stats']['n_settled_ticks']:,}")
+    tpb = summary.get("ticks_per_bar_distribution") or {}
+    if tpb:
+        L.append("ticks-per-bar  : " + "  ".join(f"{k}={int(round(v))}" for k, v in tpb.items()))
+        sug = summary.get("ticks_per_bar_suggested_n_p25")
+        L.append(f"suggested min-ticks-per-bar (= p25, R10-derived): {sug}")
+    L.append(f"filter applied : min_ticks_per_bar = {summary['min_ticks_per_bar']}")
+    L.append("")
+    L.extend(_section("ABSORB_Z TAIL (full data, no filter):",
+                      unfilt["stats"], unfilt["overall"]))
+    if "filtered" in summary:
+        f = summary["filtered"]
+        L.append("")
+        L.append(f"FILTERED (min_ticks_per_bar = {summary['min_ticks_per_bar']}):  "
+                 f"kept {f['n_bars_kept']:,}/{f['n_bars_total']:,} bars "
+                 f"({100*f['fraction_bars_kept']:.1f}%)   "
+                 f"ticks kept: {f['n_ticks_kept']:,}")
+        L.extend(_section("ABSORB_Z TAIL (thin bars dropped):",
+                          f["stats"], f["overall"]))
+        L.append("")
+        L.append("DIAGNOSTIC (R10: visual diff, no silent filtering):")
+        unfilt_sess = unfilt["overall"].get("anchor_session_ratio")
+        filt_sess = f["overall"].get("anchor_session_ratio")
+        if isinstance(unfilt_sess, (int, float)) and isinstance(filt_sess, (int, float)):
+            L.append(f"  anchor sess a/q : unfiltered={unfilt_sess:.2f}   filtered={filt_sess:.2f}")
+            if filt_sess >= SESSION_STRUCT_RATIO and unfilt_sess < SESSION_STRUCT_RATIO:
+                L.append("  → tail-structure REVEALED by thin-bar filter: institutional signal was "
+                         "masked by thin-bar AII artifacts.")
+            elif filt_sess < SESSION_STRUCT_RATIO and unfilt_sess < SESSION_STRUCT_RATIO:
+                L.append("  → no jump after filter: tail is genuinely diffuse, NOT a thin-bar artifact.")
+    L.append("")
     L.append("KEY: excess× = P_observed(z>t) / P_normal(z>t); ≈1 = no fatter than noise, ≫1 = real tail.")
     L.append("     sess a/q = active(london/overlap/ny)/quiet(asia/off) firing-rate ratio (concentration).")
     L.append("     CV²gap = inter-event clustering with overnight/session gaps removed (Poisson=1).")
@@ -328,18 +439,38 @@ def _write_report(path: Path, summary: dict) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="Breathing v2: is the absorb_z tail structured (concentrated+clustered)?"
+        description="Breathing v2: tail structure + thin-bar artifact diagnostic."
     )
     p.add_argument("--mbo", required=True, type=Path)
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--bar-freq", default="5min")
+    p.add_argument("--min-ticks-per-bar", type=int, default=0,
+                   help="If > 0, also compute a FILTERED result where bars with "
+                        "fewer than this many ticks are dropped. The unfiltered "
+                        "result is always reported. The report prints the "
+                        "ticks-per-bar distribution and a p25 suggestion. "
+                        "Default 0 = no filter (byte-equal to v2).")
     args = p.parse_args()
-    summary = run_breathing_test(args.mbo, args.output, bar_freq=args.bar_freq)
-    ov = summary["overall"]
-    print(f"\n  OVERALL: {ov['verdict']}   (n_input_trades={summary['n_input_trades']:,})")
-    if ov.get("anchor_threshold") is not None:
-        print(f"  tail anchored at z>{ov['anchor_threshold']:.1f} (excess={ov['anchor_excess']:.1f}×): "
-              f"concentrated={ov['session_concentrated']} clustered={ov['time_clustered']}")
+    summary = run_breathing_test(
+        args.mbo, args.output, bar_freq=args.bar_freq,
+        min_ticks_per_bar=args.min_ticks_per_bar,
+    )
+
+    def _print_ov(label: str, ov: dict) -> None:
+        print(f"  {label}: {ov['verdict']}")
+        if ov.get("anchor_threshold") is not None:
+            print(f"    z>{ov['anchor_threshold']:.1f} (excess={ov['anchor_excess']:.1f}×) "
+                  f"concentrated={ov['session_concentrated']} "
+                  f"clustered={ov['time_clustered']}")
+
+    print(f"\n  n_input_trades={summary['n_input_trades']:,}   "
+          f"min_ticks_per_bar={summary['min_ticks_per_bar']}")
+    sug = summary.get("ticks_per_bar_suggested_n_p25")
+    if sug is not None:
+        print(f"  suggested min_ticks_per_bar (p25 of ticks/bar): {sug}")
+    _print_ov("OVERALL (unfiltered)", summary["unfiltered"]["overall"])
+    if "filtered" in summary:
+        _print_ov("OVERALL (filtered)  ", summary["filtered"]["overall"])
     print(f"  report: {args.output}/breathing_test_report.txt")
     return 0
 
