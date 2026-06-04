@@ -67,6 +67,13 @@ LEAKAGE_PATTERNS = [
     # target. Substring match below catches `exec_label/path/valid` and
     # `next_price_delta(_valid)` plus any future siblings.
     'exec_', 'next_price_',
+    # Gap fix (leakage sweep): two forward-looking columns the patterns above
+    # missed — `fwd_ret_clean` (close[t+N]/close[t]-1, a forward return) and
+    # `effective_horizon` (= trade_duration, the bars-until-barrier-touch that
+    # is only known after the fact). The substring 'fwd_ret' also fail-closes
+    # any future fwd_ret_* sibling. NOT added: market_state_code (causal —
+    # derived from the causal regime_label; redundant at most, not a leak).
+    'fwd_ret', 'effective_horizon',
 ]
 
 
