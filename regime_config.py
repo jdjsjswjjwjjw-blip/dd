@@ -166,8 +166,14 @@ EVENT_ZSCORE_MIN_PERIODS: int = 20
 # عند التفعيل: يُستبدل REGIME_TP_SL و REGIME_MAX_BARS لكل صف حدث بثلاث شرائح من event_score
 DAYTRADE_EVENT_SCORE_TIER_LABELS: bool = True
 
-EVENT_LABEL_SCORE_STRONG_MIN: float = 0.70   # >= → شريحة قوية
-EVENT_LABEL_SCORE_MID_MIN: float = 0.50      # >= وبحد أدنى أقل من strong → وسط؛ وإلا ضعيف
+# المعايرة (#1): العتبات القديمة 0.70/0.50 كانت لصيغة microstructure (sum-of-binaries،
+# المدى [0,1]). في وضع structure_compass الحالي، event_score = active × level_prox ×
+# compass_mag (PRODUCT)، فالمدى الفعلي أصغر بكثير: على 6B June 2025 (صفوف الحدث)
+# p33=0.105, p66=0.263, max=0.651 — فعتبة 0.70 فوق الـmax → strong=0 دائماً، ونظام
+# الـtier معطّل فعلياً (628/684 = weak). أُعيدت المعايرة كثوابت مُجمّدة (لا percentile
+# وقت-تشغيل، لتفادي تسرّب R1) من التوزيع الإمبيريقي: STRONG≈p66، MID≈p33.
+EVENT_LABEL_SCORE_STRONG_MIN: float = 0.25   # >= → شريحة قوية (≈p66 على 6B compass)
+EVENT_LABEL_SCORE_MID_MIN: float = 0.10      # >= وبحد أدنى أقل من strong → وسط؛ وإلا ضعيف (≈p33)
 
 EVENT_LABEL_TIER_STRONG: tuple[float, float, int] = (2.0, 1.0, 24)   # tp_mult, sl_mult, max_bars
 EVENT_LABEL_TIER_MID: tuple[float, float, int] = (1.5, 1.0, 12)
