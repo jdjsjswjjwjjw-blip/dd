@@ -1,10 +1,18 @@
-"""Teeth tests for tools/diagnostics/breathing_test.py.
+"""Teeth tests for tools/diagnostics/breathing_test.py (v2).
 
-Four tests prove the harness behaves correctly under known conditions:
-  1. PASS — planted absorption (from the Phase-1.12 simulator) → HEALTHY-ish
-  2. DEAD — baseline-only trade stream → SIGNAL_LIKELY_ABSENT
-  3. SESSION-AWARE — firings concentrated at NY hour → NY peak detected
-  4. CV² — Poisson-spaced firings vs clustered → CV² verdict differs
+v2 judges the absorb_z TAIL via excess-over-normal (objective anchor), then
+asks whether tail firings are STRUCTURED (session-concentrated + clustered with
+overnight/session gaps removed). Firing rate is context only (it is a
+mechanical function of the threshold = circular if used as a verdict).
+
+Tests build synthetic detector outputs (absorb_z + ts) directly and exercise
+the stat/verdict functions:
+  1. EXCESS detects a planted fat tail; ≈1 on pure N(0,1) noise.
+  2. pure-noise z → SIGNAL_LIKELY_ABSENT (tail no fatter than normal).
+  3. gap-aware CV² < raw CV² when overnight gaps are present (the v1 1633 fix).
+  4. planted fat tail concentrated in NY hours + clustered → STRUCTURED;
+     planted fat tail spread flat across hours + unclustered → DIFFUSE_TAIL.
+  5. per-bar metric uses fire FRACTION (not any()) — does not saturate.
 """
 from __future__ import annotations
 
@@ -13,141 +21,145 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from modules.features_v2.absorption_simulator import (
-    AbsorptionGroundTruthSimulator, AbsorptionSimConfig,
-)
 from tools.diagnostics.breathing_test import (
-    run_breathing_test, _compute_stats, _overall_verdict, _verdict_ratio,
-    CV2_PASS, CV2_SUSPECT,
+    _compute_stats, _overall_verdict, _threshold_stats, _gap_aware_cv2,
+    EXCESS_TAIL_ANCHOR,
 )
 
 
-def _mock_mbo(tmp_path: Path, trades: pd.DataFrame) -> Path:
-    """Write a parquet matching the raw-MBO schema the harness reads."""
-    df = trades.copy()
-    df["action"] = "T"
-    # ensure 'side' is in the harness's BUY/SELL vocab
-    df["side"] = df["side"].astype(str)
-    path = tmp_path / "mock_mbo.parquet"
-    df[["ts_event", "action", "side", "price", "size"]].to_parquet(path, index=False)
-    return path
+def _detector_out(z: np.ndarray, ts: pd.DatetimeIndex) -> pd.DataFrame:
+    """Minimal AbsorptionDetector.compute() output for the stats functions."""
+    n = len(z)
+    return pd.DataFrame({
+        "ts_event": ts,
+        "price": np.full(n, 1.25),
+        "cvd": np.zeros(n),
+        "absorption_intensity": np.zeros(n),
+        "absorb_z": z.astype(np.float64),
+        "fired": z > 1.0,
+    })
 
 
-# ── (1) HEALTHY: planted absorption → breathing-positive ───────────────────
-def test_planted_absorption_is_healthy(tmp_path):
-    """The simulator produces a trade stream with planted absorption.
-    Running the harness on it must NOT verdict SIGNAL_LIKELY_ABSENT or
-    DETECTOR_BROKEN — the detector is supposed to fire here."""
-    sim = AbsorptionGroundTruthSimulator(AbsorptionSimConfig(seed=42))
-    trades, _ = sim.generate(n_absorptions=40)
-    # shift trades into UTC so the session lookup is meaningful
-    trades = trades.copy()
-    trades["ts_event"] = pd.to_datetime(trades["ts_event"], utc=True)
-    mbo = _mock_mbo(tmp_path, trades)
-    summary = run_breathing_test(mbo, tmp_path / "out")
-    overall = summary["overall_verdict"]
-    assert overall != "SIGNAL_LIKELY_ABSENT", (
-        f"planted absorption should breathe; got {overall} with stats: "
-        f"{summary['stats']['firing_rate']}, p99={summary['stats']['absorb_z_distribution']['p99']:.2f}"
-    )
-    assert overall != "DETECTOR_BROKEN", (
-        f"healthy planted data should not look broken; got {overall}"
-    )
-    # Material firing rate and material p99
-    assert summary["stats"]["firing_rate"]["value"] > 0.001
-    assert summary["stats"]["absorb_z_distribution"]["p99"] > 1.0
+def _excess_at(stats: dict, t: float) -> float:
+    for s in stats["sweep"]:
+        if abs(s["threshold"] - t) < 1e-9:
+            return s["excess_over_normal"]
+    raise KeyError(t)
 
 
-# ── (2) DEAD: baseline only → SIGNAL_LIKELY_ABSENT ─────────────────────────
-def test_baseline_only_is_signal_absent(tmp_path):
-    """Balanced two-sided baseline chop has no absorption to detect.
-    Firing rate should be near zero → SIGNAL_LIKELY_ABSENT or SUSPECT."""
-    n = 6000
-    rng = np.random.RandomState(0)
-    ts = pd.date_range("2025-06-02 08:00", periods=n, freq="100ms", tz="UTC")
-    price = 1.25 + np.cumsum(rng.randn(n) * 1e-5)         # quiet random walk
-    side = np.where(rng.rand(n) < 0.5, "A", "B")          # balanced two-sided
-    size = rng.uniform(2.0, 12.0, n)
-    trades = pd.DataFrame({"ts_event": ts, "price": price, "side": side, "size": size})
-    mbo = _mock_mbo(tmp_path, trades)
-    summary = run_breathing_test(mbo, tmp_path / "out")
-    overall = summary["overall_verdict"]
-    assert overall in {"SIGNAL_LIKELY_ABSENT", "SUSPECT"}, (
-        f"baseline-only should not look healthy; got {overall} with "
-        f"firing_rate={summary['stats']['firing_rate']['value']:.4%}"
-    )
-    # Crucially NOT HEALTHY
-    assert overall != "HEALTHY"
+# ── (1) excess-over-normal: detects fat tail, ≈1 on noise ──────────────────
+class TestExcessOverNormal:
+    def test_pure_noise_excess_near_one(self):
+        rng = np.random.RandomState(0)
+        n = 200_000
+        z = rng.randn(n)                       # pure N(0,1)
+        ts = pd.date_range("2025-06-01", periods=n, freq="1s", tz="UTC")
+        stats = _compute_stats(_detector_out(z, ts))
+        # at z>2.0 and z>2.5 the excess must be close to 1 (no fat tail)
+        assert _excess_at(stats, 2.0) < 1.6, stats["sweep"]
+        assert _excess_at(stats, 2.5) < 1.8
+
+    def test_planted_fat_tail_excess_large(self):
+        rng = np.random.RandomState(1)
+        n = 200_000
+        z = rng.randn(n)
+        # plant a heavy tail: 3% of points drawn from N(5,1)
+        k = int(0.03 * n)
+        idx = rng.choice(n, k, replace=False)
+        z[idx] = rng.randn(k) + 5.0
+        ts = pd.date_range("2025-06-01", periods=n, freq="1s", tz="UTC")
+        stats = _compute_stats(_detector_out(z, ts))
+        assert _excess_at(stats, 3.0) >= EXCESS_TAIL_ANCHOR, (
+            f"excess at z>3 should be >= anchor on a planted fat tail; {stats['sweep']}"
+        )
 
 
-# ── (3) SESSION-aware: firings at 14:00 UTC only → NY peak detected ────────
-def test_session_distribution_picks_up_ny_peak(tmp_path):
-    """Plant absorption only inside the 13:00–15:59 UTC NY/overlap window
-    surrounded by quiet baseline. The session-distribution stat must show
-    active sessions dominating the quiet ones."""
-    cfg = AbsorptionSimConfig(seed=7)
-    sim = AbsorptionGroundTruthSimulator(cfg)
-    trades, _ = sim.generate(n_absorptions=40, start="2025-06-02 14:00:00")
-    # All trades cluster around the 14:00 start → 100% NY/overlap.
-    trades = trades.copy()
-    trades["ts_event"] = pd.to_datetime(trades["ts_event"], utc=True)
-    mbo = _mock_mbo(tmp_path, trades)
-    summary = run_breathing_test(mbo, tmp_path / "out")
-    rates = summary["stats"]["session_distribution"]["rates_per_session"]
-    n_per = summary["stats"]["session_distribution"]["n_per_session"]
-    # all trades planted at 14:00 → only `overlap` (13-16) gets ticks; quiet
-    # sessions have n=0 → rate is NaN. The session-detection succeeded iff the
-    # active-window session has a material firing rate.
-    overlap_rate = rates.get("overlap", float("nan"))
-    assert np.isfinite(overlap_rate) and overlap_rate > 0.001, (
-        f"overlap (13-16 UTC) should show firings; got rates={rates}, n={n_per}"
-    )
-    # And the quiet sessions must have NO ticks at all (sanity on session map).
-    assert n_per["asia"] == 0 and n_per["off"] == 0, (
-        f"all data was at 14:00 — quiet sessions should be empty; got n={n_per}"
-    )
+# ── (2) pure noise → SIGNAL_LIKELY_ABSENT ──────────────────────────────────
+class TestNoiseIsAbsent:
+    def test_pure_noise_overall_absent(self):
+        rng = np.random.RandomState(2)
+        n = 200_000
+        z = rng.randn(n)
+        ts = pd.date_range("2025-06-01", periods=n, freq="1s", tz="UTC")
+        ov = _overall_verdict(_compute_stats(_detector_out(z, ts)))
+        assert ov["verdict"] == "SIGNAL_LIKELY_ABSENT", ov
 
 
-# ── (4) CV²: clustered firings score higher than Poisson-like ──────────────
-def test_cv2_detects_clustered_vs_poisson():
-    """Build two synthetic detector outputs:
-      A: firings strictly clustered into 3 dense bursts → high CV²
-      B: firings uniformly spaced (regular) → CV² ≪ 1
-    The CV² stat must rank A > B."""
-    n = 6000
-    base_ts = pd.date_range("2025-06-02 08:00", periods=n, freq="100ms", tz="UTC")
+# ── (3) gap-aware CV² < raw CV² with overnight gaps ────────────────────────
+class TestGapAwareCV2:
+    def test_gap_removal_reduces_cv2(self):
+        # firings: tight bursts within each of 3 days, huge overnight gaps between
+        base = pd.Timestamp("2025-06-02 08:00", tz="UTC")
+        ts_list = []
+        for day in range(3):
+            day0 = base + pd.Timedelta(days=day)
+            # a burst of 80 firings ~1s apart
+            ts_list += [day0 + pd.Timedelta(seconds=i) for i in range(80)]
+        fire_ns = np.array([t.value for t in ts_list], dtype=np.int64)
+        cv2_raw, cv2_gap, n_within = _gap_aware_cv2(fire_ns, gap_seconds=3600.0)
+        assert np.isfinite(cv2_raw) and np.isfinite(cv2_gap)
+        assert cv2_gap < cv2_raw, (
+            f"gap-aware CV² ({cv2_gap:.2f}) must drop below raw ({cv2_raw:.2f}) "
+            f"once overnight gaps are removed"
+        )
 
-    def _frame(fired: np.ndarray) -> pd.DataFrame:
-        return pd.DataFrame({
-            "ts_event": base_ts,
-            "price": np.full(n, 1.25),
-            "cvd": np.zeros(n),
-            "absorption_intensity": np.zeros(n),
-            "absorb_z": np.where(fired, 2.5, 0.0).astype(np.float64),
-            "fired": fired.astype(bool),
-        })
 
-    # CLUSTERED: three dense bursts at i in [1000,1100), [3000,3100), [5000,5100)
-    fired_clustered = np.zeros(n, dtype=bool)
-    for start in (1000, 3000, 5000):
-        fired_clustered[start:start + 100] = True
+# ── (4) STRUCTURED vs DIFFUSE on planted fat tails ─────────────────────────
+def _frame_with_tail(hours_for_tail, seed, n_days=8):
+    """Build z over n_days of 24h 1-min ticks. Background N(0,1); a fat tail
+    (z~N(5,1)) planted only in the given UTC hours, in tight clusters."""
+    rng = np.random.RandomState(seed)
+    n = n_days * 24 * 60
+    ts = pd.date_range("2025-06-02 00:00", periods=n, freq="1min", tz="UTC")
+    z = rng.randn(n)
+    hours = ts.hour.to_numpy()
+    in_hours = np.isin(hours, hours_for_tail)
+    # cluster: only fire on a subset (every other minute) within those hours
+    cluster = in_hours & (np.arange(n) % 2 == 0)
+    z[cluster] = rng.randn(int(cluster.sum())) + 5.0
+    return z, ts
 
-    # REGULAR: one firing every 30 ticks (very regular spacing)
-    fired_regular = np.zeros(n, dtype=bool)
-    fired_regular[::30] = True
 
-    stats_c = _compute_stats(_frame(fired_clustered), bar_freq="5min")
-    stats_r = _compute_stats(_frame(fired_regular), bar_freq="5min")
+class TestStructuredVsDiffuse:
+    def test_ny_concentrated_clustered_is_structured(self):
+        # fat tail only in NY/overlap hours (13-19 UTC), clustered
+        z, ts = _frame_with_tail([13, 14, 15, 16, 17, 18, 19], seed=3)
+        ov = _overall_verdict(_compute_stats(_detector_out(z, ts)))
+        assert ov["verdict"] in {"STRUCTURED", "PARTIAL_STRUCTURE"}, ov
+        assert ov["session_concentrated"] is True, ov
 
-    cv2_c = stats_c["inter_event_clustering"]["cv2"]
-    cv2_r = stats_r["inter_event_clustering"]["cv2"]
-    assert cv2_c > cv2_r, (
-        f"clustered CV² ({cv2_c:.2f}) must exceed regular CV² ({cv2_r:.2f})"
-    )
-    # Clustered should PASS; regular should DEAD (very sub-Poisson)
-    assert stats_c["inter_event_clustering"]["verdict"] == "PASS"
-    assert stats_r["inter_event_clustering"]["verdict"] == "DEAD"
+    def test_flat_uniform_tail_is_diffuse(self):
+        # fat tail spread across ALL 24 hours (no session preference)
+        z, ts = _frame_with_tail(list(range(24)), seed=4)
+        ov = _overall_verdict(_compute_stats(_detector_out(z, ts)))
+        # tail IS fat (anchor found) but not concentrated → not STRUCTURED
+        assert ov["anchor_threshold"] is not None
+        assert ov["verdict"] != "STRUCTURED", ov
+        assert ov["session_concentrated"] is False, ov
+
+
+# ── (5) per-bar uses fire FRACTION, not any() ──────────────────────────────
+class TestPerBarFraction:
+    def test_per_bar_is_fraction_not_saturated(self):
+        """At a HIGH per-tick rate, the old any()-per-bar saturated to ~1.0.
+        The fraction metric must report the actual within-bar fire fraction,
+        well below 1.0 when only part of each bar fires."""
+        rng = np.random.RandomState(5)
+        n = 60_000
+        ts = pd.date_range("2025-06-02 08:00", periods=n, freq="1s", tz="UTC")
+        z = rng.randn(n)
+        # make ~30% of ticks strong (z>2) — any()-per-bar would saturate near 1
+        idx = rng.choice(n, int(0.30 * n), replace=False)
+        z[idx] = 3.0
+        stats = _compute_stats(_detector_out(z, ts))
+        s2 = next(s for s in stats["sweep"] if abs(s["threshold"] - 2.0) < 1e-9)
+        frac = s2["per_bar_median_fire_frac"]
+        assert 0.0 < frac < 0.9, (
+            f"per-bar median fire fraction should reflect the ~30% rate, "
+            f"not saturate; got {frac}"
+        )
