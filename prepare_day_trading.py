@@ -4487,6 +4487,7 @@ def run_day_trading_refinery(
     add_multitask_diagnostics: bool = True,
     feature_selection: FeatureSelectionMode = 'drop_noise',
     warmup_drop_bars: int = DEFAULT_WARMUP_DROP_BARS,
+    export_depth_features: bool = False,
 ) -> str:
     """
     Pipeline كاملة: MBO → Day Trading Dataset
@@ -4512,6 +4513,8 @@ def run_day_trading_refinery(
     split_fn = f"refinery_split{suffix}.json"
     lob_fn = f"lob_tensors{suffix}.npy"
     lob_ts_fn = f"lob_tensor_timestamps{suffix}.npy"
+    depth_fn = f"depth_features{suffix}.parquet"
+    _depth_capture = None     # (B) set after enrich_mbp iff export_depth_features
     artifact_filenames = {
         "features_parquet": features_fn,
         "day_trading_manifest": manifest_fn,
@@ -4618,6 +4621,19 @@ def run_day_trading_refinery(
             mbp_spread = pd.to_numeric(df_bars.get('mbp_spread_mean', np.nan), errors='coerce')
             if float(spread_bar.abs().sum()) <= 1e-12 and mbp_spread.notna().any():
                 df_bars['spread_bar'] = mbp_spread.fillna(0.0).astype(np.float32)
+            # (B) Depth-features export: the mbp_* book features (queue imbalance,
+            # walls, depth, spread) are computed here but dropped by finalize
+            # (not in ORIGINAL_FEATURES — D1 keeps day_trade depth-free). Capture
+            # them now, keyed by the causal bar ts_event, to write a SEPARATE
+            # depth_features parquet that respects D1's separation while exposing
+            # depth for a decoder probe. Aligned later by ts_event to df_out (so
+            # row-dropping sanitizers can't misalign it).
+            if export_depth_features:
+                _depth_cols = [c for c in df_bars.columns
+                               if c.startswith('mbp_')
+                               and c not in ('mbp_bar_coverage', 'mbp_roll_lob_coverage')]
+                if _depth_cols:
+                    _depth_capture = df_bars[['ts_event'] + _depth_cols].copy()
         print("\n📈 Kalman Trend Filter...")
         df_bars = add_kalman_trend(df_bars)
         print("\n🧭 Regime assignment...")
@@ -4990,6 +5006,25 @@ def run_day_trading_refinery(
     df_out.to_parquet(out_path, index=False)
     print(f"\n💾 Dataset محفوظ: {out_path}")
     print(f"   Rows: {len(df_out):,} | Columns: {len(df_out.columns)}")
+
+    # ── (B) Depth-features parquet (separate file; respects D1's day_trade
+    #        separation). Aligned to the FINAL df_out by ts_event via a left
+    #        merge, so any row-dropping sanitizer upstream can't misalign it —
+    #        the depth parquet has exactly df_out's bars, same order. ──
+    if export_depth_features and _depth_capture is not None:
+        depth_path = os.path.join(output_dir, depth_fn)
+        cap = _depth_capture.copy()
+        cap['ts_event'] = pd.to_datetime(cap['ts_event'], utc=True, errors='coerce')
+        keys = pd.to_datetime(df_out['ts_event'], utc=True, errors='coerce')
+        depth_out = pd.DataFrame({'ts_event': keys.to_numpy()}).merge(
+            cap.drop_duplicates(subset='ts_event'), on='ts_event', how='left',
+        )
+        depth_out.to_parquet(depth_path, index=False)
+        n_depth_cols = depth_out.shape[1] - 1
+        print(f"   📊 Depth features (separate, D1-respecting): {depth_path}")
+        print(f"      {len(depth_out):,} bars × {n_depth_cols} mbp_* depth features")
+    elif export_depth_features and df_mbp is None:
+        print("   ⚠️  --export-depth-features set but no MBP provided → no depth parquet")
 
     # ── C2 + Phase 1.1: dataset_meta.json sidecar + schema validation ──
     # Sidecar lets external consumers introspect the parquet's label-side
@@ -5545,6 +5580,17 @@ if __name__ == '__main__':
         ),
     )
     p.add_argument(
+        '--export-depth-features',
+        action='store_true',
+        help=(
+            '(B) يكتب ملف depth_features<tag>.parquet منفصلاً يحوي ميزات العمق '
+            'من MBP-10 (mbp_imbalance/wall/depth/spread/slopes — محسوبة بـ'
+            'enrich_bars_with_intrabar_mbp لكن finalize يُسقطها من day_trade '
+            'احتراماً لفصل D1). محاذٍ لـday_trading_features بـts_event. يتطلّب '
+            '--mbp. افتراضي: معطّل.'
+        ),
+    )
+    p.add_argument(
         '--no-seasonal',
         action='store_true',
         help=(
@@ -5640,4 +5686,5 @@ if __name__ == '__main__':
         add_multitask_diagnostics=(not args.no_multitask_diagnostics),
         feature_selection=args.feature_selection,
         warmup_drop_bars=args.warmup_drop_bars,
+        export_depth_features=args.export_depth_features,
     )
