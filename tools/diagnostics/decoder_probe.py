@@ -473,7 +473,9 @@ def stage_3_logistic_bias(
 # Top-level orchestrator
 # ══════════════════════════════════════════════════════════════════════════
 def run_probe(
-    features_parquet: Path, output_dir: Path,
+    features_parquet: Path | None, output_dir: Path,
+    *,
+    df: pd.DataFrame | None = None,
     feature_names: tuple[str, ...] = DEFAULT_FEATURES,
     horizons: tuple[int, ...] = DEFAULT_HORIZONS,
     k_folds: int = DEFAULT_K_FOLDS,
@@ -482,7 +484,13 @@ def run_probe(
     run_stage_2: bool = True,
     run_stage_3: bool = True,
 ) -> dict[str, Any]:
-    df = pd.read_parquet(features_parquet)
+    """Run the probe. Either pass `features_parquet` (read from disk) or `df`
+    directly (used by sequence_probe to avoid temp parquet I/O). Both back-
+    compatible: existing callers pass features_parquet positionally."""
+    if df is None:
+        if features_parquet is None:
+            raise ValueError("decoder_probe.run_probe requires either features_parquet or df")
+        df = pd.read_parquet(features_parquet)
     embargo = max(horizons)
 
     s1 = stage_1_univariate(df, feature_names, horizons, k_folds, n_null, seed)
@@ -497,7 +505,7 @@ def run_probe(
           if run_stage_3 else {"skipped": True, "reason": "disabled"})
 
     summary = {
-        "features_parquet": str(features_parquet),
+        "features_parquet": str(features_parquet) if features_parquet is not None else "(in-memory df)",
         "n_rows": int(len(df)),
         "feature_names": list(feature_names),
         "horizons": list(horizons),
