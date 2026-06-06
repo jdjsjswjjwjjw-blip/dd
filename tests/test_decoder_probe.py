@@ -45,6 +45,14 @@ from tools.diagnostics.decoder_probe import (
 )
 
 
+def _best_ic(summary: dict, feature: str) -> tuple[float, str]:
+    """(best |IC| across horizons, feature-level verdict) for one Stage-1 feature."""
+    r = next(x for x in summary["stage_1_univariate"] if x.get("feature") == feature)
+    ph = r["per_horizon"]
+    vals = [ph[h]["ic_mean_abs"] for h in ph if np.isfinite(ph[h]["ic_mean_abs"])]
+    return (max(vals) if vals else 0.0), r["verdict"]
+
+
 # ── T1: a priori thresholds locked ────────────────────────────────────────
 class TestThresholdsAprioriLocked:
     def test_ic_thresholds_match_design_doc(self):
@@ -288,3 +296,105 @@ class TestOutputContract:
         for k in ("stage_1_univariate", "stage_2_lasso", "stage_3_logistic_bias",
                   "thresholds_a_priori", "embargo_bars"):
             assert k in summary
+
+
+# ── T10/T11/T12: DIRECTION vs VOLATILITY (target_mode) ────────────────────
+def _vol_only_df(n: int, seed: int) -> pd.DataFrame:
+    """A WHITE volatility feature w[i] drives the MAGNITUDE of the next bar's
+    move (additive, with idiosyncratic noise → |IC| stays MODERATE, not a leak),
+    while the SIGN of every move is independent of w. So w predicts |fwd return|
+    but NOT its direction. w is white → the causality probe does not false-flag."""
+    rng = np.random.RandomState(seed)
+    w = rng.rand(n)                                   # volatility driver, known at i
+    sign = rng.choice([-1.0, 1.0], size=n)
+    idio = np.abs(rng.randn(n))                       # baseline magnitude noise
+    base, gain = 5e-4, 0.4                             # gain tuned so |IC|≈0.2 (MODERATE, not SUSPECT)
+    step = np.zeros(n)
+    # bar j's move magnitude is driven by the PREVIOUS bar's w (so w[i] predicts
+    # step[i+1] = the next forward move); sign independent → no directional edge.
+    step[1:] = sign[1:] * base * (idio[1:] + gain * w[:-1])
+    close = 1.25 + np.cumsum(step)
+    ts = pd.date_range("2025-04-01", periods=n, freq="5min", tz="UTC")
+    df = pd.DataFrame({"ts_event": ts, "close": close,
+                       "is_session_break": np.zeros(n, dtype=bool)})
+    df["mbp_depth_sum_max"] = w.astype(np.float32)   # the volatility feature
+    df["bias_label"] = rng.choice([0, 1, 2], size=n, p=[0.4, 0.4, 0.2]).astype(np.int8)
+    return df
+
+
+def _direction_only_df(n: int, seed: int) -> pd.DataFrame:
+    """A feature predicts the SIGN of the next bar's return; the magnitude is
+    independent. So the feature has a directional IC but ~zero |return| IC
+    (signed feature vs |return| is V-shaped → no monotone rank correlation)."""
+    rng = np.random.RandomState(seed)
+    fstep = rng.randn(n)                              # next-bar signed return driver
+    base = 5e-4
+    step = np.zeros(n)
+    step[1:] = base * fstep[:-1]                      # bar i's move = previous driver
+    close = 1.25 + np.cumsum(step)
+    ts = pd.date_range("2025-04-01", periods=n, freq="5min", tz="UTC")
+    df = pd.DataFrame({"ts_event": ts, "close": close,
+                       "is_session_break": np.zeros(n, dtype=bool)})
+    snr, k = 1.0, 4.0
+    df["mbp_imbalance_peak"] = (fstep * snr + rng.randn(n) * k).astype(np.float32)
+    df["bias_label"] = rng.choice([0, 1, 2], size=n, p=[0.4, 0.4, 0.2]).astype(np.int8)
+    return df
+
+
+class TestDirectionVsVolatility:
+    def test_volatility_only_caught_by_abs_not_signed(self, tmp_path):
+        df = _vol_only_df(9000, seed=71)
+        path = tmp_path / "vol.parquet"
+        df.to_parquet(path, index=False)
+        common = dict(feature_names=("mbp_depth_sum_max",), horizons=(1, 3, 6),
+                      k_folds=3, n_null=30, seed=0, run_stage_2=False, run_stage_3=False)
+        s_signed = run_probe(path, tmp_path / "sgn", target_mode="signed", **common)
+        s_abs = run_probe(path, tmp_path / "abs", target_mode="abs", **common)
+        ic_signed, v_signed = _best_ic(s_signed, "mbp_depth_sum_max")
+        ic_abs, v_abs = _best_ic(s_abs, "mbp_depth_sum_max")
+        # |return| is predicted; direction is not, and not a perfect-leak SUSPECT
+        assert ic_abs >= IC_MODERATE, (ic_abs, ic_signed)
+        assert ic_abs < IC_SUSPECT, ic_abs
+        assert ic_abs > ic_signed * 1.5, (ic_abs, ic_signed)
+        assert v_signed in {"NOISE", "WEAK"}, (v_signed, ic_signed)
+        assert v_abs not in {"NOISE", "SUSPECT_LEAKAGE"}, (v_abs, ic_abs)
+
+    def test_directional_caught_by_signed_not_abs(self, tmp_path):
+        df = _direction_only_df(9000, seed=81)
+        path = tmp_path / "dir.parquet"
+        df.to_parquet(path, index=False)
+        common = dict(feature_names=("mbp_imbalance_peak",), horizons=(1, 3, 6),
+                      k_folds=3, n_null=30, seed=0, run_stage_2=False, run_stage_3=False)
+        s_signed = run_probe(path, tmp_path / "sgn", target_mode="signed", **common)
+        s_abs = run_probe(path, tmp_path / "abs", target_mode="abs", **common)
+        ic_signed, v_signed = _best_ic(s_signed, "mbp_imbalance_peak")
+        ic_abs, v_abs = _best_ic(s_abs, "mbp_imbalance_peak")
+        # direction is predicted; |return| is not
+        assert ic_signed >= IC_MODERATE, (ic_signed, ic_abs)
+        assert ic_signed > ic_abs * 1.5, (ic_signed, ic_abs)
+        assert v_abs in {"NOISE", "WEAK"}, (v_abs, ic_abs)
+
+    def test_abs_mode_skips_stage_3_and_validates_mode(self, tmp_path):
+        df = _vol_only_df(4000, seed=72)
+        path = tmp_path / "v.parquet"
+        df.to_parquet(path, index=False)
+        s = run_probe(path, tmp_path / "o", feature_names=("mbp_depth_sum_max",),
+                      horizons=(1, 3), k_folds=3, n_null=10, target_mode="abs")
+        assert s["target_mode"] == "abs"
+        assert s["stage_3_logistic_bias"].get("skipped") is True
+        assert "directional" in s["stage_3_logistic_bias"].get("reason", "")
+        # invalid mode must raise (a priori contract)
+        with pytest.raises(ValueError):
+            stage_1_univariate(df, ("mbp_depth_sum_max",), (1,), 3, 5, 0,
+                               target_mode="nope")
+
+    def test_signed_default_is_backward_compatible(self, tmp_path):
+        """Default target_mode is 'signed' and the summary records it."""
+        df = _vol_only_df(3000, seed=73)
+        path = tmp_path / "bc.parquet"
+        df.to_parquet(path, index=False)
+        s = run_probe(path, tmp_path / "o", feature_names=("mbp_depth_sum_max",),
+                      horizons=(1, 3), k_folds=3, n_null=10)
+        assert s["target_mode"] == "signed"
+        # signed mode keeps Stage 3 (not skipped for the abs reason)
+        assert "directional" not in s["stage_3_logistic_bias"].get("reason", "")

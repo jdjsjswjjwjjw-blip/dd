@@ -17,6 +17,15 @@ each with a priori acceptance thresholds (R10 — written BEFORE any result):
 Stages 4/5 (CNN, SSL) are intentionally OUT of scope — added only if 1-3 show
 SIGNAL_PRESENT. R4: simple first, complexity only after the simple model fails.
 
+DIRECTION vs VOLATILITY (target_mode):
+  target_mode="signed" tests whether a feature predicts the DIRECTION of the
+  forward return (alpha — required to decay across horizons). target_mode="abs"
+  tests whether it predicts |forward return| (VOLATILITY — which clusters and
+  persists, so decay is NOT required there). Running both separates a true
+  directional edge from a volatility-only signal — the exact distinction behind
+  the 6B result (hawkes_intrabar_sum ≡ tick_count: IC(|ret|)=0.35, IC(dir)≈0).
+  In abs mode Stage 3 (LONG vs SHORT) is skipped — it is inherently directional.
+
 R10 SAFEGUARDS:
   - Null-test on every stage: shuffled labels → expected IC ≈ 0; observed IC
     must significantly exceed the null 95th percentile to count as signal.
@@ -244,12 +253,23 @@ def _smooth_decay_ok(ic_at_h: dict[int, float], horizons: tuple[int, ...]) -> bo
 def stage_1_univariate(
     df: pd.DataFrame, feature_names: tuple[str, ...],
     horizons: tuple[int, ...], k_folds: int, n_null: int, seed: int,
+    target_mode: str = "signed",
 ) -> list[dict]:
     if "close" not in df.columns:
         return [{"error": "close column missing"}]
     close = pd.to_numeric(df["close"], errors="coerce")
     breaks = df["is_session_break"] if "is_session_break" in df.columns else None
     fwd_by_h = compute_forward_returns(close, horizons, session_breaks=breaks)
+    # target_mode: "signed" → directional IC (alpha — must DECAY across horizons).
+    # "abs"    → IC vs |return| (volatility). Volatility CLUSTERS/persists, so a
+    #            non-decaying |IC| is EXPECTED, not disqualifying → decay is not
+    #            required in abs mode (documented R7 difference). This separation
+    #            isolates exactly the 6B finding: signal=volatility, not direction.
+    if target_mode not in ("signed", "abs"):
+        raise ValueError(f"target_mode must be 'signed' or 'abs'; got {target_mode!r}")
+    if target_mode == "abs":
+        fwd_by_h = {h: np.abs(v) for h, v in fwd_by_h.items()}
+    require_decay = (target_mode != "abs")
     embargo = max(horizons)
 
     results: list[dict] = []
@@ -308,9 +328,9 @@ def stage_1_univariate(
 
         if any_suspect or any_future_leak:
             verdict = "SUSPECT_LEAKAGE"
-        elif any_strong and decay_ok and any_above_null:
+        elif any_strong and (decay_ok or not require_decay) and any_above_null:
             verdict = "STRONG"
-        elif any_moderate and decay_ok and any_above_null:
+        elif any_moderate and (decay_ok or not require_decay) and any_above_null:
             verdict = "MODERATE"
         elif any_moderate or any_strong:
             verdict = "WEAK_OR_UNSTABLE"
@@ -333,6 +353,7 @@ def stage_1_univariate(
 def stage_2_lasso(
     df: pd.DataFrame, feature_names: tuple[str, ...],
     horizons: tuple[int, ...], k_folds: int, seed: int,
+    target_mode: str = "signed",
 ) -> dict[str, Any]:
     try:
         from sklearn.linear_model import Lasso
@@ -343,6 +364,8 @@ def stage_2_lasso(
     close = pd.to_numeric(df["close"], errors="coerce")
     breaks = df["is_session_break"] if "is_session_break" in df.columns else None
     fwd_by_h = compute_forward_returns(close, horizons, session_breaks=breaks)
+    if target_mode == "abs":                       # |return| target (volatility)
+        fwd_by_h = {h: np.abs(v) for h, v in fwd_by_h.items()}
     embargo = max(horizons)
 
     cols = [c for c in feature_names if c in df.columns]
@@ -483,30 +506,42 @@ def run_probe(
     seed: int = 42,
     run_stage_2: bool = True,
     run_stage_3: bool = True,
+    target_mode: str = "signed",
 ) -> dict[str, Any]:
     """Run the probe. Either pass `features_parquet` (read from disk) or `df`
     directly (used by sequence_probe to avoid temp parquet I/O). Both back-
-    compatible: existing callers pass features_parquet positionally."""
+    compatible: existing callers pass features_parquet positionally.
+
+    target_mode: "signed" tests DIRECTION (IC vs signed forward return);
+    "abs" tests VOLATILITY (IC vs |forward return|). Run both and compare to
+    separate a directional edge from a volatility-only signal."""
     if df is None:
         if features_parquet is None:
             raise ValueError("decoder_probe.run_probe requires either features_parquet or df")
         df = pd.read_parquet(features_parquet)
     embargo = max(horizons)
 
-    s1 = stage_1_univariate(df, feature_names, horizons, k_folds, n_null, seed)
+    s1 = stage_1_univariate(df, feature_names, horizons, k_folds, n_null, seed,
+                            target_mode=target_mode)
     # Stage 2 runs only if Stage 1 shows any reachable signal (R4 — don't pile
     # complexity when the simple model says NOISE everywhere)
     any_s1_signal = any(r.get("verdict") in {"WEAK_OR_UNSTABLE", "MODERATE", "STRONG"}
                         for r in s1 if isinstance(r, dict) and not r.get("missing"))
-    s2 = (stage_2_lasso(df, feature_names, horizons, k_folds, seed)
+    s2 = (stage_2_lasso(df, feature_names, horizons, k_folds, seed, target_mode=target_mode)
           if run_stage_2 and any_s1_signal
           else {"skipped": True, "reason": "no Stage 1 signal" if not any_s1_signal else "disabled"})
-    s3 = (stage_3_logistic_bias(df, feature_names, k_folds, seed, embargo)
-          if run_stage_3 else {"skipped": True, "reason": "disabled"})
+    # Stage 3 classifies LONG vs SHORT — inherently DIRECTIONAL, so it is
+    # meaningless under target_mode="abs" (a volatility target). Skip it there.
+    if target_mode == "abs":
+        s3 = {"skipped": True, "reason": "target_mode=abs — Stage 3 is directional (LONG vs SHORT)"}
+    else:
+        s3 = (stage_3_logistic_bias(df, feature_names, k_folds, seed, embargo)
+              if run_stage_3 else {"skipped": True, "reason": "disabled"})
 
     summary = {
         "features_parquet": str(features_parquet) if features_parquet is not None else "(in-memory df)",
         "n_rows": int(len(df)),
+        "target_mode": target_mode,
         "feature_names": list(feature_names),
         "horizons": list(horizons),
         "k_folds": k_folds, "embargo_bars": embargo,
@@ -538,6 +573,8 @@ def _write_report(path: Path, s: dict) -> None:
     L.append("Decoder probe — feature predictivity audit (R10: a priori thresholds, R6: reused IC primitives)")
     L.append("═" * 96)
     L.append(f"features parquet : {s['features_parquet']}")
+    _tm = s.get('target_mode', 'signed')
+    L.append(f"target_mode      : {_tm}   ({'DIRECTION — IC vs signed return' if _tm == 'signed' else 'VOLATILITY — IC vs |return| (decay not required)'})")
     L.append(f"n_rows           : {s['n_rows']:,}    feature_names: {s['feature_names']}")
     L.append(f"horizons         : {s['horizons']}   k_folds: {s['k_folds']}   embargo: {s['embargo_bars']}   null_reps: {s['n_null_reps']}")
     L.append("")
@@ -601,6 +638,9 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--skip-stage-2", action="store_true")
     p.add_argument("--skip-stage-3", action="store_true")
+    p.add_argument("--target-mode", choices=("signed", "abs"), default="signed",
+                   help="signed=direction (IC vs signed return); abs=volatility "
+                        "(IC vs |return|). Run both to separate edge from vol.")
     args = p.parse_args()
     feature_names = tuple(args.feature) if args.feature else DEFAULT_FEATURES
     summary = run_probe(
@@ -608,10 +648,13 @@ def main() -> int:
         feature_names=feature_names, horizons=tuple(args.horizons),
         k_folds=args.k_folds, n_null=args.n_null, seed=args.seed,
         run_stage_2=not args.skip_stage_2, run_stage_3=not args.skip_stage_3,
+        target_mode=args.target_mode,
     )
     s1_pass = sum(1 for r in summary["stage_1_univariate"]
                   if isinstance(r, dict) and r.get("verdict") in {"MODERATE", "STRONG"})
-    print(f"\n  Stage 1 (univariate): {s1_pass}/{len(summary['stage_1_univariate'])} features MODERATE+")
+    print(f"\n  target_mode         : {summary.get('target_mode', 'signed')} "
+          f"({'direction' if summary.get('target_mode', 'signed') == 'signed' else 'volatility / |return|'})")
+    print(f"  Stage 1 (univariate): {s1_pass}/{len(summary['stage_1_univariate'])} features MODERATE+")
     print(f"  Stage 2 (Lasso)     : {summary['stage_2_lasso'].get('verdict', 'skipped')}")
     print(f"  Stage 3 (logistic)  : {summary['stage_3_logistic_bias'].get('verdict', 'skipped')}")
     print(f"  report: {args.output}/decoder_probe_report.txt")
