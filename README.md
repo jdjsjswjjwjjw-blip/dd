@@ -828,6 +828,7 @@ tag points to the exact state before any cleanup.
 | [`modules/trading_intel/README.md`](modules/trading_intel/README.md) | trading_intel package detail + data-flow diagram |
 | [`docs/RESEARCH_SYNTHESIS.md`](docs/RESEARCH_SYNTHESIS.md) | Seven SSL failure mechanisms → fourteen proposed solutions (Western / Chinese / Russian schools) |
 | [`docs/PIPELINE_ISSUES_AUDIT.md`](docs/PIPELINE_ISSUES_AUDIT.md) | Six pipeline failure modes + the code-level mitigation for each |
+| [`docs/MBO_SIMULATION_SSL_FOUNDATION_BLUEPRINT.md`](docs/MBO_SIMULATION_SSL_FOUNDATION_BLUEPRINT.md) | End-to-end MBO simulation-layer blueprint and SSL foundation contract |
 | [`docs/PIPELINE_GUIDE.pdf`](docs/PIPELINE_GUIDE.pdf) | Bilingual operational guide (17 pages, EN + AR) |
 | [`docs/VERIFICATION_PIPELINE.pdf`](docs/VERIFICATION_PIPELINE.pdf) | Bilingual walkthrough of every audit + verdict + feedback loop (11 pages, EN + AR) |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release notes |
